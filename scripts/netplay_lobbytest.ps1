@@ -22,7 +22,10 @@ param(
     [int]$Stage = 0,
     [switch]$ForceRelay,
     [string]$BuildDir = "$PSScriptRoot\..\build\us\Release",
-    [int]$AddrJitter = 0,       # client shifts its heap layout like a different PC would
+    [int]$ExtraHold = 0,        # client holds this many extra frames at match start
+    [switch]$NoRandRestore,     # disable the hold RNG fix (to reproduce the bug)
+    [int]$ArenaPoison = 0,      # client fills each scene arena with this byte (uninitialized-read probe)
+    [int]$AddrJitter = 0,      # client shifts its heap layout like a different PC would
     [string]$HostDir = "",      # run the host from another install (its own cfg + save)
     [string]$OutDir = "$PSScriptRoot\..\build\us\lobby-test"
 )
@@ -64,6 +67,9 @@ function Start-Peer([string]$role, [int]$fighter, [int]$fuzz) {
     } else {
         $vars['SSB64_LOBBY_JOIN'] = $Server
         if ($AddrJitter) { $vars['SSB64_ADDR_JITTER'] = "$AddrJitter" }
+        if ($ExtraHold) { $vars['SSB64_NETPLAY_EXTRA_HOLD'] = "$ExtraHold" }
+        if ($NoRandRestore) { $vars['SSB64_NETPLAY_NO_RAND_RESTORE'] = "1" }
+        if ($ArenaPoison) { $vars['SSB64_ARENA_POISON'] = "$ArenaPoison" }
     }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $own = ($role -eq 'host' -and $HostDir)
