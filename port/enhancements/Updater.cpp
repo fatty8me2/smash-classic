@@ -113,7 +113,18 @@ $backup = Join-Path $stage "backup"
 $required = @("BattleShip.exe", "torch.exe", "f3d.o2r", "config.yml")
 $installed = @()
 try {
-    try { Wait-Process -Id $WaitForPid -Timeout 60 -ErrorAction Stop } catch { }
+    try { Wait-Process -Id $WaitForPid -Timeout 20 -ErrorAction Stop } catch { }
+    # Any copy of the game still running from this folder (a second window, or
+    # one stuck shutting down) keeps BattleShip.exe locked. Give it a few
+    # seconds, then close it - the player already chose to update.
+    $exe = [System.IO.Path]::GetFullPath($GamePath)
+    for ($i = 0; $i -lt 40; $i++) {
+        $running = @(Get-Process -Name "BattleShip" -ErrorAction SilentlyContinue | Where-Object {
+            try { [System.IO.Path]::GetFullPath($_.Path) -ieq $exe } catch { $false } })
+        if ($running.Count -eq 0) { break }
+        if ($i -ge 10) { $running | Stop-Process -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 500
+    }
     New-Item -ItemType Directory -Path $unpacked -Force | Out-Null
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $unpacked -Force
     foreach ($name in $required) {
@@ -133,7 +144,11 @@ try {
                 Copy-Item -LiteralPath $destination -Destination $saved -Force
             }
             New-Item -ItemType Directory -Path (Split-Path $destination) -Force | Out-Null
-            Copy-Item -LiteralPath (Join-Path $unpacked $rel) -Destination $destination -Force
+            # Antivirus scans can hold a just-released file for a moment.
+            for ($try = 1; ; $try++) {
+                try { Copy-Item -LiteralPath (Join-Path $unpacked $rel) -Destination $destination -Force; break }
+                catch { if ($try -ge 10) { throw } Start-Sleep -Milliseconds 500 }
+            }
             $installed += $rel
         }
     } catch {
