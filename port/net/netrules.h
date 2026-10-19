@@ -29,6 +29,9 @@ void port_netrules_clear(void);
 /* 1 and *out set when an online match overrides the rule, else 0. */
 int port_netrules_override(int rule, int player, int *out);
 
+/* 1 while an online match is running (its rules are in force). */
+int port_netrules_active(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -22,6 +22,8 @@ param(
     [int]$Stage = 0,
     [switch]$ForceRelay,
     [string]$BuildDir = "$PSScriptRoot\..\build\us\Release",
+    [int]$PreRand = 0,          # client burns this many RNG calls before the battle loads
+    [switch]$NoReseed,          # disable the stage-load reseed (to reproduce the bug)
     [int]$ExtraHold = 0,        # client holds this many extra frames at match start
     [switch]$NoRandRestore,     # disable the hold RNG fix (to reproduce the bug)
     [int]$ArenaPoison = 0,      # client fills each scene arena with this byte (uninitialized-read probe)
@@ -67,6 +69,8 @@ function Start-Peer([string]$role, [int]$fighter, [int]$fuzz) {
     } else {
         $vars['SSB64_LOBBY_JOIN'] = $Server
         if ($AddrJitter) { $vars['SSB64_ADDR_JITTER'] = "$AddrJitter" }
+        if ($PreRand) { $vars['SSB64_NETPLAY_PRE_RAND'] = "$PreRand" }
+        if ($NoReseed) { $vars['SSB64_NETPLAY_NO_RESEED'] = "1" }
         if ($ExtraHold) { $vars['SSB64_NETPLAY_EXTRA_HOLD'] = "$ExtraHold" }
         if ($NoRandRestore) { $vars['SSB64_NETPLAY_NO_RAND_RESTORE'] = "1" }
         if ($ArenaPoison) { $vars['SSB64_ARENA_POISON'] = "$ArenaPoison" }
@@ -100,8 +104,13 @@ if (-not (Test-Path $ta) -or -not (Test-Path $tb)) { Write-Output "no trace (mat
 $la = Get-Content $ta; $lb = Get-Content $tb
 $n = [Math]::Min($la.Count, $lb.Count)
 Write-Output "host traced=$($la.Count) client traced=$($lb.Count)"
+# Compare tick + the gated gameplay columns (full rng battle fighters items
+# weapons stage objman). The trailing input/joints/camera/vars columns are
+# diagnostic: `input` folds in predicted frames, so it legitimately differs
+# between peers once a rollback has corrected a misprediction.
+function Gated([string]$line) { ($line -split ' ')[0..8] -join ' ' }
 for ($i = 0; $i -lt $n; $i++) {
-    if ($la[$i] -ne $lb[$i]) {
+    if ((Gated $la[$i]) -ne (Gated $lb[$i])) {
         Write-Output "DESYNC at line $i`n  host:   $($la[$i])`n  client: $($lb[$i])"
         exit 1
     }

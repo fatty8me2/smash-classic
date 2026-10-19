@@ -28,6 +28,11 @@ extern "C" void port_netrules_clear(void)
     sActive = false;
 }
 
+extern "C" int port_netrules_active(void)
+{
+    return sActive ? 1 : 0;
+}
+
 extern "C" int port_netrules_override(int rule, int player, int *out)
 {
     if (!sActive || rule < 0 || rule >= PORT_NETRULE_COUNT || out == nullptr) {
