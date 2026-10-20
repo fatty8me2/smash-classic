@@ -222,6 +222,63 @@ Get-ChildItem -Path $ExeBuildDir -Filter "*.dll" | ForEach-Object {
     Copy-Item $_.FullName $StageDir
 }
 
+# Classic Hub (the launcher BattleShip.exe hands off to) + n64run + the
+# mupen64plus emulator files for the non-native games. Built from the sibling
+# ..\Hub checkout; skipped with a warning if it isn't there.
+$HubRoot = Join-Path (Split-Path $Root -Parent) "Hub"
+if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
+    Write-Step "Building Classic Hub"
+    $HubBuild = Join-Path $HubRoot "build"
+    cmake -S $HubRoot -B $HubBuild | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail "Classic Hub configure failed" }
+    cmake --build $HubBuild --config Release --target ClassicHub n64run
+    if ($LASTEXITCODE -ne 0) { Fail "Classic Hub build failed" }
+    $HubBin = Join-Path $HubBuild "bin\Release"
+    Copy-Item (Join-Path $HubBin "ClassicHub.exe") $StageDir
+    Copy-Item (Join-Path $HubBin "n64run.exe") $StageDir
+    Copy-Item (Join-Path $HubBin "SDL2.dll") $StageDir -Force
+
+    $EmuSrc = Join-Path $HubRoot "deps\emu"
+    if (-not (Test-Path (Join-Path $EmuSrc "mupen64plus.dll"))) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $HubRoot "scripts\fetch-emu.ps1")
+    }
+    $EmuDst = Join-Path $StageDir "emu"
+    New-Item -ItemType Directory -Path $EmuDst -Force | Out-Null
+    # Files only (skip the _downloads/_m64p/_gliden64 extraction dirs). SDL2.dll
+    # is shared with the copy next to n64run.exe, so it isn't duplicated here.
+    Get-ChildItem -Path $EmuSrc -File | Where-Object { $_.Name -ne "SDL2.dll" } | ForEach-Object {
+        Copy-Item $_.FullName $EmuDst
+    }
+    # The hub exes and the official mupen64plus DLLs use the shared MSVC
+    # runtime; ship it app-local (redistributable) so no VC++ installer is needed.
+    $CrtDir = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Redist\MSVC" -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | ForEach-Object { Get-ChildItem (Join-Path $_.FullName "x64") -Directory -Filter "Microsoft.VC*.CRT" -ErrorAction SilentlyContinue } |
+        Select-Object -First 1
+    if ($CrtDir) {
+        foreach ($dll in @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+            Copy-Item (Join-Path $CrtDir.FullName $dll) $StageDir -Force
+            Copy-Item (Join-Path $CrtDir.FullName $dll) $EmuDst -Force
+        }
+    } else {
+        Write-Host "WARNING: MSVC redist CRT not found - players may need the VC++ runtime" -ForegroundColor Yellow
+    }
+    $M64pLicenses = Join-Path $HubBuild "_deps\m64p_core-src\LICENSES"
+    if (Test-Path $M64pLicenses) { Copy-Item $M64pLicenses (Join-Path $LicensesDir "mupen64plus-LICENSES.txt") }
+    @'
+emu\ contains unmodified official binaries of:
+
+  - mupen64plus 2.6.0 (core, rsp-hle, audio-sdl)  GPL-2.0-or-later
+      source: https://github.com/mupen64plus  (tag 2.6.0)
+  - GLideN64 (mupen64plus video plugin, build a04081a)  GPL-2.0-or-later
+      source: https://github.com/gonetz/GLideN64
+
+They are loaded at runtime by n64run.exe through the mupen64plus plugin API.
+The full license text is in mupen64plus-LICENSES.txt.
+'@ | Set-Content -Path (Join-Path $LicensesDir "emulator-README.txt") -Encoding UTF8
+} else {
+    Write-Host "WARNING: ..\Hub not found - packaging without Classic Hub" -ForegroundColor Yellow
+}
+
 if ($EnableScripting) {
     Write-Step "Staging TCC scripting runtime"
     $TccDir = Join-Path $ExeBuildDir ".tcc"
