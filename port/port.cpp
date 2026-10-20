@@ -1264,8 +1264,8 @@ int PortIsRunning(void) {
 } // extern "C"
 
 #ifdef _WIN32
-/* Classic Hub is the front door: started normally, BattleShip.exe hands off
- * to ClassicHub.exe (next to it) and exits. The hub starts Smash with
+/* RetroHub is the front door: started normally, BattleShip.exe hands off
+ * to RetroHub.exe (next to it) and exits. The hub starts Smash with
  * --from-hub. Automation (netplay tests, rollback rigs) and SSB64_NO_HUB=1
  * skip the hand-off. Returns true if the hub was launched. */
 static bool PortHandOffToHub(int argc, char* argv[]) {
@@ -1289,7 +1289,7 @@ static bool PortHandOffToHub(int argc, char* argv[]) {
 	}
 	std::wstring dir(self, n);
 	dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
-	std::wstring hub = dir + L"ClassicHub.exe";
+	std::wstring hub = dir + L"RetroHub.exe";
 	if (GetFileAttributesW(hub.c_str()) == INVALID_FILE_ATTRIBUTES) {
 		return false;
 	}

@@ -23,7 +23,7 @@ bool AfterMatch() {
     return port_netlobby_after_match() != 0 && port_netlobby_state() == PORT_NETLOBBY_CONNECTED;
 }
 
-/* Started from Classic Hub: the room is joined automatically, so the
+/* Started from RetroHub: the room is joined automatically, so the
  * pre-match picks live here instead of in the Esc menu's Netplay panel. */
 bool HubPreMatch() {
     if (port_netlobby_auto_active() == 0 || port_netlobby_after_match() != 0) {

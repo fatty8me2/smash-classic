@@ -95,7 +95,7 @@ std::mt19937 sRng{ std::random_device{}() };
  *   SSB64_LOBBY_FKIND / SSB64_LOBBY_STAGE / SSB64_LOBBY_AUTOSTART=1
  *   SSB64_LOBBY_AUTOREMATCH=<n>   host starts n rematches, each a few seconds after a match ends
  *   SSB64_LOBBY_FORCE_RELAY=1      skip the direct path (tests the relay)
- *   SSB64_LOBBY_CODE=<code>        use this room code (Classic Hub passes the code its own
+ *   SSB64_LOBBY_CODE=<code>        use this room code (RetroHub passes the code its own
  *                                  lobby agreed on); joiners retry until the host's room exists
  * Without SSB64_LOBBY_FKIND/STAGE the player's Netplay menu choices are used. */
 struct LobbyAuto {
@@ -588,7 +588,7 @@ void update_auto(void)
         }
     }
     if (sAuto.join && !sAuto.fixed_code.empty()) {
-        /* Classic Hub launch: everyone starts at once, so the host's room may
+        /* RetroHub launch: everyone starts at once, so the host's room may
          * not exist yet - retry "no such room" until the deadline. */
         bool retry = (sLobby.state == PORT_NETLOBBY_IDLE) ||
                      (sLobby.state == PORT_NETLOBBY_FAILED && !elapsed(sAuto.join_deadline_ms, 0));

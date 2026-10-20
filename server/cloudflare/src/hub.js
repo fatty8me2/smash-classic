@@ -1,4 +1,4 @@
-// Classic Hub lobby: GET /hub?room=CODE[-N]&role=host|join&name=NAME[&slot=K]
+// RetroHub lobby: GET /hub?room=CODE[-N]&role=host|join&name=NAME[&slot=K]
 //
 // One Durable Object (HubRoom) per room code, up to 4 members, slot 0 = host.
 // See Hub/docs/ARCHITECTURE.md ("Lobby server: /hub endpoint").

@@ -222,19 +222,19 @@ Get-ChildItem -Path $ExeBuildDir -Filter "*.dll" | ForEach-Object {
     Copy-Item $_.FullName $StageDir
 }
 
-# Classic Hub (the launcher BattleShip.exe hands off to) + n64run + the
+# RetroHub (the launcher BattleShip.exe hands off to) + n64run + the
 # mupen64plus emulator files for the non-native games. Built from the sibling
-# ..\Hub checkout; skipped with a warning if it isn't there.
-$HubRoot = Join-Path (Split-Path $Root -Parent) "Hub"
+# ..\RetroHub checkout; skipped with a warning if it isn't there.
+$HubRoot = Join-Path (Split-Path $Root -Parent) "RetroHub"
 if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
-    Write-Step "Building Classic Hub"
+    Write-Step "Building RetroHub"
     $HubBuild = Join-Path $HubRoot "build"
     cmake -S $HubRoot -B $HubBuild | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail "Classic Hub configure failed" }
-    cmake --build $HubBuild --config Release --target ClassicHub n64run retrorun
-    if ($LASTEXITCODE -ne 0) { Fail "Classic Hub build failed" }
+    if ($LASTEXITCODE -ne 0) { Fail "RetroHub configure failed" }
+    cmake --build $HubBuild --config Release --target RetroHub n64run retrorun
+    if ($LASTEXITCODE -ne 0) { Fail "RetroHub build failed" }
     $HubBin = Join-Path $HubBuild "bin\Release"
-    Copy-Item (Join-Path $HubBin "ClassicHub.exe") $StageDir
+    Copy-Item (Join-Path $HubBin "RetroHub.exe") $StageDir
     Copy-Item (Join-Path $HubBin "n64run.exe") $StageDir
     Copy-Item (Join-Path $HubBin "retrorun.exe") $StageDir
     # libretro cores for GBA / GB / GBC (mGBA MPL-2.0, SameBoy MIT, Gambatte GPL-2.0)
@@ -286,7 +286,7 @@ They are loaded at runtime by n64run.exe through the mupen64plus plugin API.
 The full license text is in mupen64plus-LICENSES.txt.
 '@ | Set-Content -Path (Join-Path $LicensesDir "emulator-README.txt") -Encoding UTF8
 } else {
-    Write-Host "WARNING: ..\Hub not found - packaging without Classic Hub" -ForegroundColor Yellow
+    Write-Host "WARNING: ..\RetroHub not found - packaging without RetroHub" -ForegroundColor Yellow
 }
 
 if ($EnableScripting) {

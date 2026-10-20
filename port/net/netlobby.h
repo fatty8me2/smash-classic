@@ -53,7 +53,7 @@ int port_netlobby_my_fkind(void);
 int port_netlobby_stage(void);
 /* Host only, before the match starts. */
 void port_netlobby_set_stage(int stage);
-/* 1 when this session was started by Classic Hub / test automation (env). */
+/* 1 when this session was started by RetroHub / test automation (env). */
 int port_netlobby_auto_active(void);
 
 /* Called by sys/netpeer.c when an online match's VS session ends. */
