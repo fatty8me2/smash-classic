@@ -1263,7 +1263,54 @@ int PortIsRunning(void) {
 
 } // extern "C"
 
+#ifdef _WIN32
+/* Classic Hub is the front door: started normally, BattleShip.exe hands off
+ * to ClassicHub.exe (next to it) and exits. The hub starts Smash with
+ * --from-hub. Automation (netplay tests, rollback rigs) and SSB64_NO_HUB=1
+ * skip the hand-off. Returns true if the hub was launched. */
+static bool PortHandOffToHub(int argc, char* argv[]) {
+	for (int i = 1; i < argc; i++) {
+		if (std::strcmp(argv[i], "--from-hub") == 0 || std::strcmp(argv[i], "--no-hub") == 0) {
+			return false;
+		}
+	}
+	static const char* const kSkipEnv[] = { "SSB64_NO_HUB", "SSB64_LOBBY_HOST", "SSB64_LOBBY_JOIN",
+	                                        "SSB64_ROLLBACK_SYNCTEST", "SSB64_ROLLBACK_AUTOVS", "SSB64_NETPLAY" };
+	for (const char* name : kSkipEnv) {
+		const char* v = std::getenv(name);
+		if (v != nullptr && v[0] != '\0') {
+			return false;
+		}
+	}
+	wchar_t self[MAX_PATH];
+	DWORD n = GetModuleFileNameW(NULL, self, MAX_PATH);
+	if (n == 0 || n >= MAX_PATH) {
+		return false;
+	}
+	std::wstring dir(self, n);
+	dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
+	std::wstring hub = dir + L"ClassicHub.exe";
+	if (GetFileAttributesW(hub.c_str()) == INVALID_FILE_ATTRIBUTES) {
+		return false;
+	}
+	STARTUPINFOW si = { sizeof(si) };
+	PROCESS_INFORMATION pi = {};
+	std::wstring cmd = L"\"" + hub + L"\"";
+	if (!CreateProcessW(hub.c_str(), cmd.data(), NULL, NULL, FALSE, 0, NULL, dir.c_str(), &si, &pi)) {
+		return false;
+	}
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return true;
+}
+#endif
+
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+	if (PortHandOffToHub(argc, argv)) {
+		return 0;
+	}
+#endif
 #if defined(_MSC_VER) && defined(_M_X64)
 	/* Netplay determinism: the MSVC CRT picks FMA3 or SSE2 implementations of
 	 * sinf/cosf/atan2f/... by CPU, and the two round differently. Two peers

@@ -22,6 +22,9 @@
 // peer-to-peer over UDP and never touches the Worker.
 
 import { DurableObject } from "cloudflare:workers";
+import { hubFetch, HubRoom } from "./hub.js";
+
+export { HubRoom };
 
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;
@@ -33,6 +36,9 @@ export default {
 
     if (url.pathname === "/health") {
       return Response.json({ ok: true, service: "smash-netplay" });
+    }
+    if (url.pathname === "/hub") {
+      return hubFetch(request, env);
     }
     if (url.pathname !== "/ws") {
       return new Response("not found", { status: 404 });

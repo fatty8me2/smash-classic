@@ -94,7 +94,10 @@ std::mt19937 sRng{ std::random_device{}() };
  *   SSB64_LOBBY_JOIN=<server url>  join the code read from SSB64_LOBBY_CODE_FILE
  *   SSB64_LOBBY_FKIND / SSB64_LOBBY_STAGE / SSB64_LOBBY_AUTOSTART=1
  *   SSB64_LOBBY_AUTOREMATCH=<n>   host starts n rematches, each a few seconds after a match ends
- *   SSB64_LOBBY_FORCE_RELAY=1      skip the direct path (tests the relay) */
+ *   SSB64_LOBBY_FORCE_RELAY=1      skip the direct path (tests the relay)
+ *   SSB64_LOBBY_CODE=<code>        use this room code (Classic Hub passes the code its own
+ *                                  lobby agreed on); joiners retry until the host's room exists
+ * Without SSB64_LOBBY_FKIND/STAGE the player's Netplay menu choices are used. */
 struct LobbyAuto {
     bool checked = false;
     bool host = false;
@@ -106,6 +109,9 @@ struct LobbyAuto {
     unsigned int start_after_ms = 0;
     int rematches_left = 0;
     unsigned int rematch_after_ms = 0;
+    std::string fixed_code;          // SSB64_LOBBY_CODE
+    unsigned int join_deadline_ms = 0;
+    unsigned int join_retry_ms = 0;
 };
 LobbyAuto sAuto;
 
@@ -559,8 +565,14 @@ void update_auto(void)
         sAuto.code_file = env("SSB64_LOBBY_CODE_FILE") ? env("SSB64_LOBBY_CODE_FILE") : "lobby_code.txt";
         sAuto.autostart = env("SSB64_LOBBY_AUTOSTART") != nullptr;
         sAuto.rematches_left = env("SSB64_LOBBY_AUTOREMATCH") ? std::atoi(env("SSB64_LOBBY_AUTOREMATCH")) : 0;
-        int fkind = env("SSB64_LOBBY_FKIND") ? std::atoi(env("SSB64_LOBBY_FKIND")) : 0;
-        int stage = env("SSB64_LOBBY_STAGE") ? std::atoi(env("SSB64_LOBBY_STAGE")) : 0;
+        int fkind = env("SSB64_LOBBY_FKIND") ? std::atoi(env("SSB64_LOBBY_FKIND"))
+                                             : CVarGetInteger("gNetplay.Fighter", 0);
+        int stage = env("SSB64_LOBBY_STAGE") ? std::atoi(env("SSB64_LOBBY_STAGE"))
+                                             : CVarGetInteger("gNetplay.Stage", 0);
+        if (const char *code = env("SSB64_LOBBY_CODE")) {
+            sAuto.fixed_code = code;
+            sAuto.join_deadline_ms = port_udp_now_ms() + 30000;
+        }
 
         if (sAuto.host) {
             std::remove(sAuto.code_file.c_str());
@@ -575,7 +587,20 @@ void update_auto(void)
             sAuto.code_written = true;
         }
     }
-    if (sAuto.join && sLobby.state == PORT_NETLOBBY_IDLE) {
+    if (sAuto.join && !sAuto.fixed_code.empty()) {
+        /* Classic Hub launch: everyone starts at once, so the host's room may
+         * not exist yet - retry "no such room" until the deadline. */
+        bool retry = (sLobby.state == PORT_NETLOBBY_IDLE) ||
+                     (sLobby.state == PORT_NETLOBBY_FAILED && !elapsed(sAuto.join_deadline_ms, 0));
+        if (retry && elapsed(sAuto.join_retry_ms, 0)) {
+            port_netlobby_join(sAuto.server.c_str(), sAuto.fixed_code.c_str(), sLobby.my_fkind);
+            sAuto.join_retry_ms = port_udp_now_ms() + 1500;
+        }
+        if (sLobby.state != PORT_NETLOBBY_IDLE && sLobby.state != PORT_NETLOBBY_FAILED &&
+            sLobby.state != PORT_NETLOBBY_JOINING) {
+            sAuto.join = false;   // connected (or past the server introduction)
+        }
+    } else if (sAuto.join && sLobby.state == PORT_NETLOBBY_IDLE) {
         if (FILE *f = std::fopen(sAuto.code_file.c_str(), "r")) {
             char code[16] = {};
             if (std::fgets(code, sizeof(code), f) != nullptr && std::strlen(code) >= 6) {
@@ -694,7 +719,7 @@ extern "C" void port_netlobby_host(const char *server, int fkind, int stage, int
     sLobby.stocks = stocks;
     sLobby.items = items;
     sLobby.delay = delay;
-    sLobby.code = new_code();
+    sLobby.code = (!sAuto.fixed_code.empty()) ? sAuto.fixed_code : new_code();
     set_state(PORT_NETLOBBY_CREATING, "Creating room...");
     begin(true, server);
 }
@@ -756,3 +781,12 @@ extern "C" int port_netlobby_is_host(void) { return sLobby.is_host ? 1 : 0; }
 extern "C" int port_netlobby_is_relay(void) { return port_udp_is_relay(); }
 extern "C" int port_netlobby_ping_ms(void) { return sLobby.ping_ms; }
 extern "C" int port_netlobby_after_match(void) { return sLobby.after_match ? 1 : 0; }
+extern "C" int port_netlobby_my_fkind(void) { return sLobby.my_fkind; }
+extern "C" int port_netlobby_stage(void) { return sLobby.stage; }
+extern "C" void port_netlobby_set_stage(int stage)
+{
+    if (sLobby.is_host && sLobby.state != PORT_NETLOBBY_IN_MATCH && sLobby.state != PORT_NETLOBBY_STARTING) {
+        sLobby.stage = stage;
+    }
+}
+extern "C" int port_netlobby_auto_active(void) { return (sAuto.host || !sAuto.fixed_code.empty()) ? 1 : 0; }

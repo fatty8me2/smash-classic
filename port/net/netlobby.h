@@ -49,6 +49,13 @@ int port_netlobby_ping_ms(void);
  * (each is back in their own local menus; the host can start a rematch). */
 int port_netlobby_after_match(void);
 
+int port_netlobby_my_fkind(void);
+int port_netlobby_stage(void);
+/* Host only, before the match starts. */
+void port_netlobby_set_stage(int stage);
+/* 1 when this session was started by Classic Hub / test automation (env). */
+int port_netlobby_auto_active(void);
+
 /* Called by sys/netpeer.c when an online match's VS session ends. */
 void port_netlobby_on_match_end(void);
 

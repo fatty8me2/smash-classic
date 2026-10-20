@@ -7,7 +7,13 @@
   "compatibility_date": "2026-09-23",
   "workers_dev": true,
   "durable_objects": {
-    "bindings": [{ "name": "ROOMS", "class_name": "NetplayRoom" }]
+    "bindings": [
+      { "name": "ROOMS", "class_name": "NetplayRoom" },
+      { "name": "HUB_ROOMS", "class_name": "HubRoom" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NetplayRoom"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["NetplayRoom"] },
+    { "tag": "v2", "new_sqlite_classes": ["HubRoom"] }
+  ]
 }
