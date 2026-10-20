@@ -229,6 +229,9 @@ $HubRoot = Join-Path (Split-Path $Root -Parent) "RetroHub"
 if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     Write-Step "Building RetroHub"
     $HubBuild = Join-Path $HubRoot "build"
+    # RetroHub reports (and its updater compares) the release version, not its own dev number.
+    $RelVer = (Get-Content (Join-Path $Root "VERSION") -Raw).Trim()
+    Set-Content -Path (Join-Path $HubRoot "VERSION") -Value $RelVer -NoNewline -Encoding ascii
     cmake -S $HubRoot -B $HubBuild | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "RetroHub configure failed" }
     cmake --build $HubBuild --config Release --target RetroHub n64run retrorun
