@@ -231,11 +231,21 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     $HubBuild = Join-Path $HubRoot "build"
     cmake -S $HubRoot -B $HubBuild | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "Classic Hub configure failed" }
-    cmake --build $HubBuild --config Release --target ClassicHub n64run
+    cmake --build $HubBuild --config Release --target ClassicHub n64run retrorun
     if ($LASTEXITCODE -ne 0) { Fail "Classic Hub build failed" }
     $HubBin = Join-Path $HubBuild "bin\Release"
     Copy-Item (Join-Path $HubBin "ClassicHub.exe") $StageDir
     Copy-Item (Join-Path $HubBin "n64run.exe") $StageDir
+    Copy-Item (Join-Path $HubBin "retrorun.exe") $StageDir
+    # libretro cores for GBA / GB / GBC (mGBA MPL-2.0, SameBoy MIT, Gambatte GPL-2.0)
+    $CoreSrc = Join-Path $HubRoot "deps\cores"
+    if (-not (Test-Path (Join-Path $CoreSrc "mgba_libretro.dll"))) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $HubRoot "scripts\fetch-cores.ps1")
+    }
+    $CoreDst = Join-Path $StageDir "cores"
+    New-Item -ItemType Directory -Path (Join-Path $CoreDst "info") -Force | Out-Null
+    Get-ChildItem -Path $CoreSrc -File -Filter "*_libretro.dll" | ForEach-Object { Copy-Item $_.FullName $CoreDst }
+    Get-ChildItem -Path (Join-Path $CoreSrc "info") -File -Filter "*.info" -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName (Join-Path $CoreDst "info") }
     Copy-Item (Join-Path $HubBin "SDL2.dll") $StageDir -Force
 
     $EmuSrc = Join-Path $HubRoot "deps\emu"
