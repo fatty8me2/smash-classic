@@ -93,6 +93,7 @@ std::mt19937 sRng{ std::random_device{}() };
  *   SSB64_LOBBY_HOST=<server url>  host a room; writes the code to SSB64_LOBBY_CODE_FILE
  *   SSB64_LOBBY_JOIN=<server url>  join the code read from SSB64_LOBBY_CODE_FILE
  *   SSB64_LOBBY_FKIND / SSB64_LOBBY_STAGE / SSB64_LOBBY_AUTOSTART=1
+ *   SSB64_LOBBY_AUTOREMATCH=<n>   host starts n rematches, each a few seconds after a match ends
  *   SSB64_LOBBY_FORCE_RELAY=1      skip the direct path (tests the relay) */
 struct LobbyAuto {
     bool checked = false;
@@ -103,6 +104,8 @@ struct LobbyAuto {
     std::string server;
     std::string code_file;
     unsigned int start_after_ms = 0;
+    int rematches_left = 0;
+    unsigned int rematch_after_ms = 0;
 };
 LobbyAuto sAuto;
 
@@ -555,6 +558,7 @@ void update_auto(void)
         }
         sAuto.code_file = env("SSB64_LOBBY_CODE_FILE") ? env("SSB64_LOBBY_CODE_FILE") : "lobby_code.txt";
         sAuto.autostart = env("SSB64_LOBBY_AUTOSTART") != nullptr;
+        sAuto.rematches_left = env("SSB64_LOBBY_AUTOREMATCH") ? std::atoi(env("SSB64_LOBBY_AUTOREMATCH")) : 0;
         int fkind = env("SSB64_LOBBY_FKIND") ? std::atoi(env("SSB64_LOBBY_FKIND")) : 0;
         int stage = env("SSB64_LOBBY_STAGE") ? std::atoi(env("SSB64_LOBBY_STAGE")) : 0;
 
@@ -588,6 +592,15 @@ void update_auto(void)
         } else if (elapsed(sAuto.start_after_ms, 0)) {
             port_netlobby_start_match();
             sAuto.autostart = false;
+        }
+    }
+    if (sAuto.host && sAuto.rematches_left > 0 && sLobby.after_match && sLobby.state == PORT_NETLOBBY_CONNECTED) {
+        if (sAuto.rematch_after_ms == 0) {
+            sAuto.rematch_after_ms = port_udp_now_ms() + 4000;
+        } else if (elapsed(sAuto.rematch_after_ms, 0)) {
+            port_netlobby_start_match();
+            sAuto.rematches_left--;
+            sAuto.rematch_after_ms = 0;
         }
     }
 }

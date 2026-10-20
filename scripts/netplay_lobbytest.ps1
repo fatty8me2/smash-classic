@@ -22,6 +22,8 @@ param(
     [int]$Stage = 0,
     [switch]$ForceRelay,
     [string]$BuildDir = "$PSScriptRoot\..\build\us\Release",
+    [int]$Rematches = 0,        # host starts this many rematches after the first match
+    [string]$ClientShots = "",  # client SSB64_SCREENSHOT_FRAMES list (saved under the out dir)
     [int]$PreRand = 0,          # client burns this many RNG calls before the battle loads
     [switch]$NoReseed,          # disable the stage-load reseed (to reproduce the bug)
     [int]$ExtraHold = 0,        # client holds this many extra frames at match start
@@ -66,9 +68,11 @@ function Start-Peer([string]$role, [int]$fighter, [int]$fuzz) {
     }
     if ($role -eq 'host') {
         $vars['SSB64_LOBBY_HOST'] = $Server; $vars['SSB64_LOBBY_AUTOSTART'] = '1'
+        if ($Rematches) { $vars['SSB64_LOBBY_AUTOREMATCH'] = "$Rematches" }
     } else {
         $vars['SSB64_LOBBY_JOIN'] = $Server
         if ($AddrJitter) { $vars['SSB64_ADDR_JITTER'] = "$AddrJitter" }
+        if ($ClientShots) { $vars['SSB64_SCREENSHOT_FRAMES'] = $ClientShots; $vars['SSB64_SCREENSHOT_DIR'] = "$out\client_shots" }
         if ($PreRand) { $vars['SSB64_NETPLAY_PRE_RAND'] = "$PreRand" }
         if ($NoReseed) { $vars['SSB64_NETPLAY_NO_RESEED'] = "1" }
         if ($ExtraHold) { $vars['SSB64_NETPLAY_EXTRA_HOLD'] = "$ExtraHold" }
