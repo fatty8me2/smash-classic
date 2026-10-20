@@ -332,6 +332,18 @@ export class UserHub extends DurableObject {
         this.push({ type: "request_update", uid: from, result });
         return { r: "ok" };
       }
+      case "admin_link": {
+        // Only the configured admin's own UserHub accepts automatic links.
+        if (!this.env.ADMIN_UID || p.uid !== this.env.ADMIN_UID) return { r: "none" };
+        if (this.isBlocked(from)) return { r: "blocked" };
+        if (!this.isFriend(from)) {
+          if (this.count("friends") >= MAX_FRIENDS) return { r: "full" };
+          this.run("DELETE FROM requests WHERE uid=?", from);
+          const f = this.addFriendRow(from, cleanName(b.name) || "player", sanitizeStatus(b.status));
+          this.push({ type: "friend_added", friend: f });
+        }
+        return { r: "ok", friend: this.me() };
+      }
       case "friend_removed": {
         if (!this.isFriend(from)) return { r: "none" };
         this.run("DELETE FROM friends WHERE uid=?", from);
@@ -430,6 +442,7 @@ export class UserHub extends DurableObject {
       renamed = true;
     }
     ws.serializeAttachment({ uid, authed: true, status: { state: "online", updated: now() } });
+    await this.autoLinkAdmin(p);
 
     this.run("DELETE FROM inbox WHERE at < ?", now() - INBOX_TTL);
     const friends = this.all("SELECT * FROM friends ORDER BY name").map((r) => this.friendObj(r));
@@ -623,6 +636,32 @@ export class UserHub extends DurableObject {
       }
       default:
         break;
+    }
+  }
+
+  /* Every RetroHub user starts out friends with the admin (env ADMIN_UID), both
+   * ways. Done once per user: if either side removes or blocks the other later,
+   * it is not re-added. */
+  async autoLinkAdmin(p) {
+    const admin = this.env.ADMIN_UID;
+    if (!admin || !UID_RE.test(admin) || p.uid === admin) return;
+    if (this.one("SELECT 1 FROM kv WHERE k='admin_linked'")) return;
+    if (this.isFriend(admin) || this.isBlocked(admin)) {
+      this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('admin_linked', '1')");
+      return;
+    }
+    let r;
+    try {
+      r = await this.call(admin, "admin_link", { uid: p.uid, name: p.name, status: this.me().status });
+    } catch {
+      return; // try again next connect
+    }
+    if (r && r.r === "ok" && r.friend) {
+      this.run("DELETE FROM requests WHERE uid=?", admin);
+      this.addFriendRow(admin, r.friend.name, sanitizeStatus(r.friend.status));
+    }
+    if (r && (r.r === "ok" || r.r === "blocked")) {
+      this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('admin_linked', '1')");
     }
   }
 
