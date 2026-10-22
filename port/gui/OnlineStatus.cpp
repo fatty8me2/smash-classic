@@ -8,6 +8,8 @@
 
 extern "C" int syNetRollbackIsDesynced(void);
 extern "C" int syNetPeerGetSilentPlayer(unsigned int threshold_ms, unsigned int *out_silent_ms);
+extern "C" int syNetPeerGetDropNotice(unsigned int *out_pending_mask, unsigned int *out_gone_mask, unsigned int *out_age_ms);
+extern "C" int syNetPeerIsSelfDropped(void);
 
 namespace ssb64 {
 
@@ -27,6 +29,28 @@ int SilentPlayer(unsigned int* silent_ms) {
         return -1;
     }
     return syNetPeerGetSilentPlayer(3000, silent_ms);
+}
+
+/* Players who left mid-match: pending (the others are still agreeing on the tick) or gone.
+ * The notice for a finished drop fades after a few seconds. */
+constexpr unsigned int kDropNoticeMs = 8000;
+
+bool DropNotice(unsigned int* pending, unsigned int* gone) {
+    unsigned int ageMs = 0;
+    *pending = 0;
+    *gone = 0;
+    if (port_netlobby_state() != PORT_NETLOBBY_IN_MATCH || syNetPeerGetDropNotice(pending, gone, &ageMs) == 0) {
+        return false;
+    }
+    return *pending != 0 || syNetPeerIsSelfDropped() != 0 || ageMs < kDropNoticeMs;
+}
+
+void DrawPlayerList(unsigned int mask, const char* suffix) {
+    for (int slot = 0; slot < PORT_NETLOBBY_MAX_PLAYERS; slot++) {
+        if (mask & (1u << slot)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Player %d %s", slot + 1, suffix);
+        }
+    }
 }
 
 bool AfterMatch() {
@@ -116,7 +140,10 @@ void OnlineStatusWindow::UpdateElement() {
 
 void OnlineStatusWindow::Draw() {
     unsigned int silentMs = 0;
-    const bool wanted = InMatchDesynced() || SilentPlayer(&silentMs) >= 0 || AfterMatch() || HubPreMatch();
+    unsigned int dropPending = 0;
+    unsigned int dropGone = 0;
+    const bool wanted = InMatchDesynced() || DropNotice(&dropPending, &dropGone) ||
+                        SilentPlayer(&silentMs) >= 0 || AfterMatch() || HubPreMatch();
     if (wanted != IsVisible()) {
         if (wanted) {
             Show();
@@ -135,6 +162,18 @@ void OnlineStatusWindow::Draw() {
 
 void OnlineStatusWindow::DrawElement() {
     unsigned int silentMs = 0;
+    unsigned int dropPending = 0;
+    unsigned int dropGone = 0;
+    if (DropNotice(&dropPending, &dropGone)) {
+        if (syNetPeerIsSelfDropped() != 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "The other players dropped you from the match.");
+            ImGui::TextWrapped("They stopped hearing from you. Leave the match from the menu and rejoin the room.");
+            return;
+        }
+        DrawPlayerList(dropPending, "left - the match continues without them...");
+        DrawPlayerList(dropGone, "left the match");
+        return;
+    }
     const int silent = SilentPlayer(&silentMs);
     if (silent >= 0) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Waiting for Player %d...", silent + 1);

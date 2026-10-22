@@ -17,7 +17,7 @@ Two to four players, free-for-all stock battle, rollback netcode.
 
 Online matches use rollback netcode. Your input applies after a short **input delay** (2 frames by default). The other players' inputs are predicted, and the game silently rewinds and replays (up to 6 frames) when a prediction was wrong. Raise the input delay on high-ping connections for fewer visible corrections.
 
-If a player's data stops arriving mid-match (they quit, or lost their connection), everyone else's game waits for them and shows "Waiting for Player N...". There is no drop-out handling yet.
+If a player drops out mid-match (they quit, crash or lose their connection), the others keep playing. The lobby telling the room that they left, or 3 seconds without any data from them, starts a short agreement between the remaining players on the tick the player leaves (they wait for each other's reports, so this takes a fraction of a second on a good connection). From that tick the player's fighter is knocked out as if it had lost its last stock, the match goes on without them, and if only one player is left the match ends normally. The Online window says "Player N left". After the match the others can start a rematch (see Limitations for a host that dropped).
 
 ## The lobby server (Cloudflare)
 
@@ -78,6 +78,7 @@ Release builds default to the deployed Worker. Override it at configure time wit
 **During the match:**
 - Each player sends every other player one input packet per frame (the same bytes for everyone): its last 16 scheduled inputs, how many frames it runs ahead of each remote's confirmed input (the others' time sync), and the full-state hash of a recently confirmed tick.
 - A tick is **confirmed** once every remote's input for it has arrived; rollback happens when any remote's real input differs from the prediction. A peer may run at most 6 ticks past the confirmed tick of its slowest remote, and time sync slows it down when it leads the peer it is furthest ahead of.
+- A player who dropped out is removed from all of this from the agreed tick: their input is neutral and confirmed, and they no longer take part in pacing, time sync or the hash check. The agreement uses a separate control packet (`SSNP` type 6: report, decide, ack, request, forward), sent to the remaining players only.
 - A hash mismatch with any player is logged as `SSB64 Rollback: DESYNC detected ... (player N)` in `ssb64.log`.
 
 ## Testing
@@ -96,6 +97,8 @@ All test scripts launch the game with `SSB64_HIDDEN_WINDOW=1` (rendering, but no
 .\scripts\netplay_lobbytest.ps1 -Players 4 -RelayPeer 2                                # only lobby slot 2's paths relayed
 .\scripts\netplay_lobbytest.ps1 -Players 3 -MatchMinutes 1 -Rematches 1 -Seconds 190   # timed match + rematch
 .\scripts\netplay_lobbytest.ps1 -Players 3 -RestartLast                                # a client leaves and rejoins before the start
+.\scripts\netplay_lobbytest.ps1 -Players 4 -Seconds 90 -Kill "2@40"                 # kill one peer mid-match (use "0@40" for the host, "3@35,1@55" for two)
+.\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 80 -Kill "2@35" -Suspend         # freeze it instead (only the silence detects it)
 .\scripts\netplay_lobbytest.ps1 -Server wss://smash-netplay.jumpcircuit.workers.dev   # (needs a v2 Worker)
 
 # Rollback determinism without networking (7-frame rollback every tick).
@@ -107,7 +110,7 @@ Each script compares every peer's confirmed-state trace tick by tick. Exit code 
 ## Limitations
 
 - **Players.** Two to four humans, free-for-all. There are no CPUs and no team battle online.
-- **Drop-outs.** A player who disappears mid-match stalls everyone else (the Online window says who). Agreeing on a tick to drop them deterministically is not implemented.
+- **Drop-outs.** A player who leaves is knocked out and the others continue (`docs/bugs/netplay_mid_match_drop_2026-10-22.md`). Open edges: if the host drops, the room closes (the Worker closes it when slot 0 leaves), so the survivors finish the match but cannot rematch, and survivors that only reach each other through the relay lose that path. A link failure that only one survivor sees drops that player for everyone (there is no vote). A returning player cannot rejoin a running match.
 - **Peer identity.** `SSBL HELLO` is not authenticated: a peer that guesses a slot number and room address can claim to be that slot's path. Players are expected to be friends who share a room code. A real fix needs per-slot tokens issued by the lobby server.
 - **Lockstep moments.** The countdown, announcer and sudden-death intros run in lockstep: they wait for every other player's confirmed input instead of predicting. See "Not rollback-able yet" in `docs/rollback_design.md`.
 - **Rematches.** The fighter and rules carry over; the host changes them by leaving and hosting again.

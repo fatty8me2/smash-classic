@@ -43,6 +43,7 @@
 extern "C" void syNetPeerStartOnlineMatch(int is_host, int local_player, int player_count, const int *transports,
                                           unsigned int delay, unsigned int stage, unsigned int stocks, int is_items,
                                           unsigned int seed, const int *fkinds, const int *costumes);
+extern "C" void syNetPeerNotePlayerLeft(int transport);
 
 namespace {
 
@@ -655,6 +656,10 @@ void peer_gone(int slot)
         return;
     }
     port_log("SSB64 Lobby: player %d left the room\n", slot);
+    if (sLobby.state == PORT_NETLOBBY_IN_MATCH) {
+        /* The match goes on without them: the game agrees with the others on the tick they drop out. */
+        syNetPeerNotePlayerLeft(slot);
+    }
     p = Peer();
     port_udp_peer_clear(slot);
 
@@ -1269,6 +1274,10 @@ extern "C" void port_netlobby_on_match_end(void)
         set_state(PORT_NETLOBBY_CONNECTED, "Match over");
         sLobby.after_match = true;
         refresh_status();
+        if (!sLobby.is_host && !sLobby.peers[0].present) {
+            /* The host dropped out mid-match: the others finished without it, but nobody is left to start a rematch. */
+            fail("The host left the room");
+        }
     }
 }
 

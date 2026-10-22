@@ -9,6 +9,12 @@
 #   .\scripts\netplay_lobbytest.ps1 -Players 4 -Seconds 90       # host + 3 clients
 #   .\scripts\netplay_lobbytest.ps1 -Players 3 -LatencyMs 60 -LossPct 3
 #   .\scripts\netplay_lobbytest.ps1 -Server wss://smash-netplay.jumpcircuit.workers.dev
+#   .\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 90 -Kill "2@40"          # kill game slot 2, 40 s after the launch
+#   .\scripts\netplay_lobbytest.ps1 -Players 4 -Seconds 120 -Kill "3@40,1@60"    # two drop-outs (slot 0 is the host)
+#
+# With -Kill the survivors' traces are compared with each other tick for tick, a killed
+# peer's trace against the first survivor's up to where it stopped, and every survivor
+# must have agreed on the same drop tick for each killed player.
 #
 # Without -Server it uses `wrangler dev` on ws://127.0.0.1:8799, starting it
 # if nothing answers there. Every instance runs with SSB64_HIDDEN_WINDOW=1
@@ -42,6 +48,9 @@ param(
     [int]$StartDelayMs = 0,     # host waits this long after everyone is connected (SSB64_LOBBY_START_DELAY_MS)
     [switch]$RestartLast,       # kill the last client once everyone is connected and start it again (leave + rejoin before the match)
     [int]$MatchMinutes = 0,     # timed match of this many minutes (SSB64_NETPLAY_TEST_MINUTES) so it ends by itself
+    [string]$Kill = "",         # "slot@seconds,..." kill that peer's process this long after the last launch (drop-out test)
+    [switch]$Suspend,           # with -Kill: freeze the process instead (its lobby socket stays open: only the silence detects it)
+    [int]$MinPostDrop = 0,      # with -Kill: every survivor must trace at least this many ticks past the last drop tick
     [string]$OutDir = "$PSScriptRoot\..\build\us\lobby-test"
 )
 
@@ -122,7 +131,34 @@ for ($i = 1; $i -lt $Players; $i++) {
     $procs += Start-Peer $i
     Start-Sleep -Seconds 1
 }
-if ($RestartLast -and $Players -ge 3) {
+$killPlan = @()
+foreach ($item in ($Kill -split ',' | Where-Object { $_ })) {
+    $parts = $item -split '@'
+    $killPlan += [pscustomobject]@{ Slot = [int]$parts[0]; At = [int]$parts[1]; Done = $false }
+}
+$killed = @{}
+if ($killPlan.Count -gt 0) {
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($clock.Elapsed.TotalSeconds -lt $Seconds) {
+        foreach ($k in $killPlan) {
+            if (-not $k.Done -and $clock.Elapsed.TotalSeconds -ge $k.At) {
+                $k.Done = $true
+                $victim = $procs[$k.Slot]
+                if (-not $victim.HasExited) {
+                    Write-Output ("killing {0} (pid {1}) at {2:N0}s" -f $names[$k.Slot], $victim.Id, $clock.Elapsed.TotalSeconds)
+                    if ($Suspend) {
+                        Add-Type -Namespace Win32 -Name Nt -MemberDefinition '[DllImport("ntdll.dll")] public static extern int NtSuspendProcess(System.IntPtr h);' -ErrorAction SilentlyContinue
+                        [Win32.Nt]::NtSuspendProcess($victim.Handle) | Out-Null
+                    } else {
+                        Stop-Process -Id $victim.Id -Force
+                    }
+                }
+                $killed[$names[$k.Slot]] = $true
+            }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+} elseif ($RestartLast -and $Players -ge 3) {
     Start-Sleep -Seconds 12
     $last = $procs[$Players - 1]
     Write-Output "restarting client $($Players - 1) (pid $($last.Id))"
@@ -141,7 +177,7 @@ if ($wrangler) { & taskkill /PID $wrangler.Id /T /F | Out-Null }
 $used = $names[0..($Players - 1)]
 foreach ($f in $used) {
     Write-Output "--- $f"
-    Select-String -Path "$out\$f.log" -Pattern 'SSB64 Lobby:|SSB64 WS:|online match|netplay tick|DESYNC|rollback FAILED' |
+    Select-String -Path "$out\$f.log" -Pattern 'SSB64 Lobby:|SSB64 WS:|SSB64 Drop:|online match|netplay tick|DESYNC|rollback FAILED' |
         Select-Object -Last 8 | ForEach-Object { $_.Line }
 }
 $traces = @{}
@@ -163,19 +199,63 @@ Write-Output (($used | ForEach-Object { "$_ traced=$($traces[$_].Count)" }) -joi
 # diagnostic: `input` folds in predicted frames, so it legitimately differs
 # between peers once a rollback has corrected a misprediction.
 function Gated([string]$line) { ($line -split ' ')[0..8] -join ' ' }
-$host_lines = $traces['host']
+$survivors = @($used | Where-Object { -not $killed.ContainsKey($_) })
+$gone = @($used | Where-Object { $killed.ContainsKey($_) })
+if ($survivors.Count -eq 0) { Write-Output "no survivors"; exit 2 }
+$refName = $survivors[0]
+$ref_lines = $traces[$refName]
+# survivors: the whole traced length; a killed peer: as far as it got
+$n = ($survivors | ForEach-Object { $traces[$_].Count } | Measure-Object -Minimum).Minimum
 for ($i = 0; $i -lt $n; $i++) {
-    $ref = Gated $host_lines[$i]
-    foreach ($f in $used[1..($Players - 1)]) {
-        if ((Gated $traces[$f][$i]) -ne $ref) {
-            Write-Output "DESYNC at line $i ($f vs host)`n  host: $($host_lines[$i])`n  ${f}: $($traces[$f][$i])"
+    $ref = Gated $ref_lines[$i]
+    foreach ($f in $survivors[1..($survivors.Count)]) {
+        if ($f -and (Gated $traces[$f][$i]) -ne $ref) {
+            Write-Output "DESYNC at line $i ($f vs $refName)`n  ${refName}: $($ref_lines[$i])`n  ${f}: $($traces[$f][$i])"
             exit 1
         }
     }
 }
+foreach ($f in $gone) {
+    $m = [Math]::Min($traces[$f].Count, $ref_lines.Count)
+    for ($i = 0; $i -lt $m; $i++) {
+        if ((Gated $traces[$f][$i]) -ne (Gated $ref_lines[$i])) {
+            Write-Output "DESYNC at line $i (killed $f vs $refName)`n  ${refName}: $($ref_lines[$i])`n  ${f}: $($traces[$f][$i])"
+            exit 1
+        }
+    }
+    Write-Output "killed $f matched $refName for $m ticks"
+}
 if ($n -eq 0) { Write-Output "no ticks traced"; exit 2 }
 if ($MinTicks -gt 0 -and $n -lt $MinTicks) { Write-Output "only $n ticks compared (< $MinTicks)"; exit 2 }
-$bad = Select-String -Path ($used | ForEach-Object { "$out\$_.log" }) -Pattern 'DESYNC detected|rollback FAILED' -ErrorAction SilentlyContinue
+$bad = Select-String -Path ($used | ForEach-Object { "$out\$_.log" }) -Pattern 'DESYNC detected|rollback FAILED|SSB64 Drop: CONFLICT' -ErrorAction SilentlyContinue
 if ($bad) { Write-Output "in-band desync/rollback failure logged:"; $bad | Select-Object -First 4 | ForEach-Object { $_.Line }; exit 1 }
-Write-Output "IN SYNC for $n ticks ($Players players)"
+
+# Drop-outs: every survivor must have agreed on the same tick for each dropped player.
+if ($killPlan.Count -gt 0) {
+    $dropTicks = @{}
+    foreach ($f in $survivors) {
+        $mine = @{}
+        foreach ($l in (Select-String -Path "$out\$f.log" -Pattern 'SSB64 Drop: player (\d+) leaves the match at tick=(\d+)')) {
+            $mine[$l.Matches[0].Groups[1].Value] = [int]$l.Matches[0].Groups[2].Value
+        }
+        $dropTicks[$f] = $mine
+        Write-Output ("{0} drops: {1}" -f $f, (($mine.Keys | Sort-Object | ForEach-Object { "player $_ at tick $($mine[$_])" }) -join ", "))
+    }
+    $lastDrop = 0
+    foreach ($k in $killPlan) {
+        # The process index is not the game slot (the lobby hands out slots in join order): read it from its log.
+        $key = "$($k.Slot)"
+        $m = Select-String -Path "$out\$($names[$k.Slot]).log" -Pattern 'online match local=(\d+)' | Select-Object -First 1
+        if ($m) { $key = $m.Matches[0].Groups[1].Value }
+        foreach ($f in $survivors) {
+            if (-not $dropTicks[$f].ContainsKey($key)) { Write-Output "$f never agreed to drop player $key"; exit 1 }
+            if ($dropTicks[$f][$key] -ne $dropTicks[$refName][$key]) { Write-Output "drop tick of player $key differs: $f=$($dropTicks[$f][$key]) $refName=$($dropTicks[$refName][$key])"; exit 1 }
+        }
+        if ($dropTicks[$refName][$key] -gt $lastDrop) { $lastDrop = $dropTicks[$refName][$key] }
+    }
+    $after = $n - $lastDrop
+    Write-Output "survivors traced $after ticks past the last drop tick ($lastDrop)"
+    if ($after -lt $MinPostDrop) { Write-Output "fewer than $MinPostDrop ticks after the drop"; exit 2 }
+}
+Write-Output "IN SYNC for $n ticks ($($survivors.Count) survivors of $Players players)"
 exit 0
