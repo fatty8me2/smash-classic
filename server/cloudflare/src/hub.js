@@ -9,7 +9,17 @@
 // C->S JSON: msg{body}, endpoint{public,local}, keepalive (auto-answered)
 // Binary: byte0 = destination slot (0xFF = all others), rewritten to the
 //         sender's slot on delivery. Max 1200 bytes.
-// Host leaving closes every member with 4001.
+// Host migration (lobby rooms only, i.e. no "-N" game-room suffix):
+//   A client opts in with &caps=hostmig. When the host (slot 0) leaves, the
+//   lowest remaining slot among opted-in members is renumbered to slot 0 (the
+//   "host is slot 0" invariant the game session / port plan rely on stays true),
+//   everyone opted-in gets host_changed{from_slot,slot:0,name} then members, and
+//   the room stays open under the same code. Members that did not opt in (old
+//   RetroHub) are closed with 4001 as before. Game rooms keep the old behaviour:
+//   host leaving closes every member with 4001. State lives only in the socket
+//   attachments, so it is hibernation-safe; the DO is single-threaded so there
+//   is never more than one slot 0.
+// S->C extra: host_changed{from_slot,slot,name}
 
 import { DurableObject } from "cloudflare:workers";
 
@@ -19,6 +29,7 @@ const MAX_MEMBERS = 4;
 const MAX_NAME = 24;
 const MAX_TEXT_BYTES = 4096;
 const MAX_BINARY_BYTES = 1200;
+const isGameRoom = (room) => room.includes("-");
 
 function cleanName(raw) {
   let s = String(raw || "").replace(/[^\x20-\x7E]/g, "").trim();
@@ -57,8 +68,8 @@ export class HubRoom extends DurableObject {
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === except) continue;
       const a = ws.deserializeAttachment();
-      if (!a || typeof a.slot !== "number") continue;
-      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null });
+      if (!a || typeof a.slot !== "number" || a.slot < 0) continue;
+      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game });
     }
     return out;
   }
@@ -84,6 +95,10 @@ export class HubRoom extends DurableObject {
     this.broadcast({ type: "members", members: list }, except);
   }
 
+  attach(ws, m) {
+    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game });
+  }
+
   sendPeers() {
     const peers = this.members()
       .filter((m) => m.endpoint)
@@ -98,6 +113,7 @@ export class HubRoom extends DurableObject {
     const role = url.searchParams.get("role");
     const name = cleanName(url.searchParams.get("name"));
     const slotParam = url.searchParams.get("slot");
+    const mig = (url.searchParams.get("caps") || "").split(",").includes("hostmig");
 
     const members = this.members();
     const taken = new Set(members.map((m) => m.slot));
@@ -120,7 +136,7 @@ export class HubRoom extends DurableObject {
 
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
-    pair[1].serializeAttachment({ slot, name, endpoint: null });
+    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room) });
     pair[1].send(JSON.stringify({ type: "welcome", room, slot }));
     this.sendMembers();
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -167,6 +183,8 @@ export class HubRoom extends DurableObject {
           slot: me.slot,
           name: me.name,
           endpoint: { public: clean(msg.public), local: clean(msg.local) },
+          mig: !!me.mig,
+          game: !!me.game,
         });
         this.sendPeers();
         break;
@@ -183,14 +201,29 @@ export class HubRoom extends DurableObject {
     } catch {
       // already closed
     }
-    if (!me || typeof me.slot !== "number") return;
-    if (me.slot === 0) {
-      for (const m of this.members(ws)) {
-        try { m.ws.close(4001, "host-left"); } catch { /* closed */ }
-      }
-    } else {
+    if (!me || typeof me.slot !== "number" || me.slot < 0) return;
+    // Mark as departed so a second close/error event for this socket (or the
+    // late close of a socket we closed ourselves) is a no-op.
+    try { ws.serializeAttachment({ slot: -1 }); } catch { /* closed */ }
+    if (me.slot !== 0) {
       this.sendMembers(ws);
+      return;
     }
+    const rest = this.members(ws);
+    const keep = me.game ? [] : rest.filter((m) => m.mig);
+    for (const m of rest) {
+      if (keep.includes(m)) continue;
+      try { m.ws.close(4001, "host-left"); } catch { /* closed */ }
+      try { m.ws.serializeAttachment({ slot: -1 }); } catch { /* closed */ }
+    }
+    if (!keep.length) return;
+    keep.sort((a, b) => a.slot - b.slot);
+    const nh = keep[0];
+    const from = nh.slot;
+    this.attach(nh.ws, { ...nh, slot: 0 });
+    this.broadcast({ type: "host_changed", from_slot: from, slot: 0, name: nh.name });
+    this.sendMembers();
+    this.sendPeers();
   }
 
   async webSocketError(ws) {
