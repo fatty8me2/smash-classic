@@ -321,6 +321,7 @@ if (-not (Test-Path $ZipPath)) { Fail "zip was not created" }
 #   winget install --id JRSoftware.InnoSetup -e --silent
 # Set SKIP_INSTALLER=1 to skip.
 $SetupPath = $null
+$Iscc = $null
 if ($Ver -eq "us" -and $env:SKIP_INSTALLER -ne "1") {
     Write-Step "Building RetroHub-Setup.exe"
     $Iscc = @(
@@ -329,7 +330,11 @@ if ($Ver -eq "us" -and $env:SKIP_INSTALLER -ne "1") {
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
         "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
     ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-    if (-not $Iscc) { Fail "Inno Setup 6 not found (winget install --id JRSoftware.InnoSetup -e), or set SKIP_INSTALLER=1" }
+    if (-not $Iscc) {
+        Write-Host "WARNING: Inno Setup 6 not found - skipping RetroHub-Setup.exe (winget install --id JRSoftware.InnoSetup -e)" -ForegroundColor Yellow
+    }
+}
+if ($Iscc) {
     $AppVer = (Get-Content (Join-Path $Root "VERSION") -Raw).Trim().TrimStart('v','V')
     & $Iscc "/Qp" "/DSourceDir=$StageDir" "/DAppVersion=$AppVer" "/DOutputDir=$DistDir" (Join-Path $Root "installer\RetroHub.iss")
     if ($LASTEXITCODE -ne 0) { Fail "ISCC failed" }

@@ -52,7 +52,7 @@ Name: "startmenuicon"; Description: "Create a &Start menu shortcut"; GroupDescri
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "userdata,userdata\*,updates,updates\*,logs,logs\*,*.o2r.bak"
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "userdata,userdata\*,updates,updates\*,logs,logs\*,ssb64_save.bin,BattleShip.cfg.json,BattleShip.o2r,*.o2r.bak"
 
 [Icons]
 Name: "{autoprograms}\RetroHub"; Filename: "{app}\RetroHub.exe"; WorkingDir: "{app}"; Tasks: startmenuicon
@@ -141,14 +141,13 @@ begin
     Dir := ExpandConstant('{app}');
     if UninstallSilent then Exit;   { silent uninstall always keeps user data }
     if MsgBox('Also delete your saves, settings and friend identity?' + #13#10 +
-              'Choose No to keep them (recommended if you may reinstall).',
+              '(Your extracted game data, BattleShip.o2r, is kept either way.) Choose No to keep them (recommended if you may reinstall).',
               mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
     begin
       DelTree(Dir + '\userdata', True, True, True);
       DelTree(Dir + '\logs', True, True, True);
       DeleteFile(Dir + '\ssb64_save.bin');
       DeleteFile(Dir + '\BattleShip.cfg.json');
-      DeleteFile(Dir + '\BattleShip.o2r');
       RemoveDir(Dir);
     end;
   end;
