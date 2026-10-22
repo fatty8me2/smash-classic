@@ -12,6 +12,15 @@
 #   .\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 90 -Kill "2@40"          # kill game slot 2, 40 s after the launch
 #   .\scripts\netplay_lobbytest.ps1 -Players 4 -Seconds 120 -Kill "3@40,1@60"    # two drop-outs (slot 0 is the host)
 #
+# Host migration (the host leaving; the survivors carry on under the lowest remaining slot):
+#   .\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 130 -Kill "0@30" -Migrate -MigratePlayers 2 -Rematches 1 -ExpectMatches 2
+#   .\scripts\netplay_lobbytest.ps1 -Players 4 -Seconds 90 -Kill "0@8" -StartDelayMs 15000 -Migrate -MigratePlayers 3
+#   .\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 70 -HostDie start -Migrate -MigratePlayers 2     # host dies right after its first START
+#   .\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 70 -HostDie begin -Migrate -MigratePlayers 2     # ... right after its BEGIN
+# -Migrate gives every peer the scripted start / rematch settings, so whoever leads the room runs them;
+# -MigratePlayers is the player count the new host waits for before it starts. Every survivor must log
+# the host change, and -ExpectMatches N requires N started matches in every survivor's log.
+#
 # With -Kill the survivors' traces are compared with each other tick for tick, a killed
 # peer's trace against the first survivor's up to where it stopped, and every survivor
 # must have agreed on the same drop tick for each killed player.
@@ -52,6 +61,11 @@ param(
     [switch]$Suspend,           # with -Kill: freeze the process instead (its lobby socket stays open: only the silence detects it)
     [int]$ResumeAfter = 0,      # with -Suspend: resume the frozen peer this many seconds later (it must leave the match itself)
     [int]$MinPostDrop = 0,      # with -Kill: every survivor must trace at least this many ticks past the last drop tick
+    [switch]$Migrate,           # every peer runs the scripted start/rematch while it leads the room (host migration tests)
+    [int]$MigratePlayers = 0,   # players the new host waits for before its scripted start (SSB64_LOBBY_MIGRATE_PLAYERS)
+    [string]$HostDie = "",      # "start" or "begin": the host process kills itself right after its first START / BEGIN
+    [int]$LateLast = 0,         # with -Kill: launch the last client this many seconds after the others (it joins the migrated room)
+    [int]$ExpectMatches = 0,    # every survivor's log must show at least this many started matches
     [string]$OutDir = "$PSScriptRoot\..\build\us\lobby-test"
 )
 
@@ -89,6 +103,7 @@ function Start-Peer([int]$index) {
     $vars = @{
         SSB64_LOBBY_CODE_FILE = "$out\code.txt"; SSB64_LOBBY_FKIND = "$($fighters[$index])"; SSB64_LOBBY_STAGE = "$Stage"
         SSB64_LOBBY_PLAYERS = "$Players"
+        SSB64_LOBBY_MIGRATE_PLAYERS = $(if ($MigratePlayers) { "$MigratePlayers" } else { "" })
         SSB64_LOBBY_START_DELAY_MS = $(if ($RestartLast -and -not $StartDelayMs) { "22000" } elseif ($StartDelayMs) { "$StartDelayMs" } else { "" })
         SSB64_NETPLAY_FUZZ = "$(111 * ($index + 1))"; SSB64_MUTE = '1'; SSB64_NO_UPDATE_CHECK = '1'; SSB64_HIDDEN_WINDOW = '1'
         SSB64_NETPLAY_TEST_MINUTES = $(if ($MatchMinutes) { "$MatchMinutes" } else { "" })
@@ -101,9 +116,14 @@ function Start-Peer([int]$index) {
     if ($RelayPeer -ge 0 -and $index -eq $RelayPeer) { $vars['SSB64_LOBBY_FORCE_RELAY'] = "1" }
     if ($index -eq 0) {
         $vars['SSB64_LOBBY_HOST'] = $Server; $vars['SSB64_LOBBY_AUTOSTART'] = '1'
+        if ($HostDie) { $vars['SSB64_LOBBY_TEST_DIE'] = $HostDie }
         if ($Rematches) { $vars['SSB64_LOBBY_AUTOREMATCH'] = "$Rematches"; $vars['SSB64_LOBBY_REMATCH_DELAY_MS'] = "$RematchDelayMs" }
     } else {
         $vars['SSB64_LOBBY_JOIN'] = $Server
+        if ($Migrate) {
+            $vars['SSB64_LOBBY_AUTOSTART'] = '1'
+            if ($Rematches) { $vars['SSB64_LOBBY_AUTOREMATCH'] = "$Rematches"; $vars['SSB64_LOBBY_REMATCH_DELAY_MS'] = "$RematchDelayMs" }
+        }
         if ($index -eq 1 -and $ClientShots) { $vars['SSB64_SCREENSHOT_FRAMES'] = $ClientShots; $vars['SSB64_SCREENSHOT_DIR'] = "$out\client_shots" }
     }
     if ($isLast -and $index -ne 0) {
@@ -128,7 +148,9 @@ function Start-Peer([int]$index) {
 $procs = @()
 $procs += Start-Peer 0
 Start-Sleep -Seconds 2
+$lateIdx = $(if ($LateLast -gt 0) { $Players - 1 } else { -1 })
 for ($i = 1; $i -lt $Players; $i++) {
+    if ($i -eq $lateIdx) { $procs += $null; continue }
     $procs += Start-Peer $i
     Start-Sleep -Seconds 1
 }
@@ -142,6 +164,10 @@ $resumePlan = @()
 if ($killPlan.Count -gt 0) {
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     while ($clock.Elapsed.TotalSeconds -lt $Seconds) {
+        if ($lateIdx -ge 0 -and $null -eq $procs[$lateIdx] -and $clock.Elapsed.TotalSeconds -ge $LateLast) {
+            $procs[$lateIdx] = Start-Peer $lateIdx
+            Write-Output ("late client {0} launched at {1:N0}s" -f $names[$lateIdx], $clock.Elapsed.TotalSeconds)
+        }
         foreach ($k in $killPlan) {
             if (-not $k.Done -and $clock.Elapsed.TotalSeconds -ge $k.At) {
                 $k.Done = $true
@@ -180,6 +206,7 @@ if ($killPlan.Count -gt 0) {
 } else {
     Start-Sleep -Seconds $Seconds
 }
+if ($HostDie) { $killed[$names[0]] = $true; Write-Output ("host exited by itself: {0}" -f $procs[0].HasExited) }
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.CloseMainWindow() | Out-Null } }
 Start-Sleep -Seconds 3
 foreach ($p in $procs) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
@@ -194,7 +221,10 @@ foreach ($f in $used) {
 $traces = @{}
 foreach ($f in $used) {
     $t = "$out\$f.trace"
-    if (-not (Test-Path $t)) { Write-Output "no trace for $f (match did not start)"; exit 2 }
+    if (-not (Test-Path $t)) {
+        if ($killed.ContainsKey($f)) { Write-Output "$f left before any match started (no trace)"; $traces[$f] = @(); continue }
+        Write-Output "no trace for $f (match did not start)"; exit 2
+    }
     $lines = @(Get-Content $t)
     # The game is killed at the end of the run, so its last trace line can be torn
     # (partial write). Drop it when its field count differs from the line before.
@@ -219,7 +249,7 @@ foreach ($f in $used) {
     }
 }
 $survivors = @($used | Where-Object { -not $killed.ContainsKey($_) })
-$gone = @($used | Where-Object { $killed.ContainsKey($_) })
+$gone = @($used | Where-Object { $killed.ContainsKey($_) -and $traces[$_].Count -gt 0 })
 if ($survivors.Count -eq 0) { Write-Output "no survivors"; exit 2 }
 $refName = $survivors[0]
 $ref_lines = $traces[$refName]
@@ -268,6 +298,7 @@ if ($killPlan.Count -gt 0) {
     }
     $lastDrop = 0
     foreach ($k in $killPlan) {
+        if ($traces[$names[$k.Slot]].Count -eq 0) { continue }    # left before any match started: nothing to agree on
         # The process index is not the game slot (the lobby hands out slots in join order): read it from its log.
         $key = "$($k.Slot)"
         $m = Select-String -Path "$out\$($names[$k.Slot]).log" -Pattern 'online match local=(\d+)' | Select-Object -First 1
@@ -281,6 +312,25 @@ if ($killPlan.Count -gt 0) {
     $after = $n - $lastDrop
     Write-Output "survivors traced $after ticks past the last drop tick ($lastDrop)"
     if ($after -lt $MinPostDrop) { Write-Output "fewer than $MinPostDrop ticks after the drop"; exit 2 }
+}
+# Host migration: every survivor must have heard who leads the room now, and exactly one of them is it.
+if ($Migrate -or $HostDie) {
+    $leaders = 0
+    foreach ($f in $survivors) {
+        if ($lateIdx -ge 0 -and $f -eq $names[$lateIdx]) { Write-Output "$f joined after the host change (took a freed slot)"; continue }
+        $hits = @(Select-String -Path "$out\$f.log" -Pattern 'SSB64 Lobby: player (\d+) is now the host' -ErrorAction SilentlyContinue)
+        if ($hits.Count -eq 0) { Write-Output "$f never saw a host change"; exit 1 }
+        if (@(Select-String -Path "$out\$f.log" -Pattern 'is now the host \(that is us\)').Count -gt 0) { $leaders++ }
+        Write-Output ("{0}: {1}" -f $f, (($hits | ForEach-Object { $_.Line -replace '^.*SSB64 Lobby: ', '' }) -join "; "))
+    }
+    if ($leaders -lt 1) { Write-Output "no survivor took over as host"; exit 1 }
+}
+if ($ExpectMatches -gt 0) {
+    foreach ($f in $survivors) {
+        $m = @(Select-String -Path "$out\$f.log" -Pattern 'online match local=').Count
+        Write-Output "$f started $m matches"
+        if ($m -lt $ExpectMatches) { Write-Output "$f started fewer than $ExpectMatches matches"; exit 1 }
+    }
 }
 Write-Output "IN SYNC for $n ticks ($($survivors.Count) survivors of $Players players)"
 exit 0

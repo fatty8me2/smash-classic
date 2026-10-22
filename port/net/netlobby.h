@@ -3,8 +3,11 @@
 /* Online lobby: room codes through server/cloudflare (Worker + Durable
  * Object), UDP hole punching via Cloudflare STUN with WebSocket relay
  * fallback, character picks, and the hand-off into a rollback netplay match
- * (sys/netpeer.c). Up to 4 players: the host is lobby slot 0, joiners take
- * slots 1-3, and every player connects to every other (a full mesh).
+ * (sys/netpeer.c). Up to 4 players: the creator is lobby slot 0 and the host,
+ * joiners take the other slots, and every player connects to every other (a
+ * full mesh). If the host leaves, the server promotes the lowest remaining
+ * slot (host migration): the room code keeps working and the new host takes
+ * over starting matches, the stage and rematches.
  * Non-blocking; port_netlobby_update() runs once per frame from
  * PortPushFrame. */
 
@@ -36,7 +39,7 @@ enum PortNetLobbyState {
 
 /* One lobby slot, for the status window. */
 typedef struct PortNetLobbyPlayer {
-    int slot;           /* lobby slot 0-3 (0 = host) */
+    int slot;           /* lobby slot 0-3 */
     int is_self;
     int is_host;
     int connected;      /* link established (always 1 for yourself) */
@@ -57,6 +60,10 @@ int port_netlobby_state(void);
 const char *port_netlobby_status(void);
 const char *port_netlobby_code(void);
 int port_netlobby_is_host(void);
+/* Lobby slot that leads the room, -1 while the next host is being elected. */
+int port_netlobby_host_slot(void);
+/* "Player N is now the host" for a few seconds after a host migration, else "". */
+const char *port_netlobby_host_notice(void);
 int port_netlobby_is_relay(void);
 /* Worst ping among connected players, -1 when unknown. */
 int port_netlobby_ping_ms(void);
@@ -82,6 +89,8 @@ int port_netlobby_my_fkind(void);
 int port_netlobby_stage(void);
 /* Host only, before the match starts. */
 void port_netlobby_set_stage(int stage);
+/* Host only, before the match starts: stage, stocks (1-99), items on/off, input delay (0-16). */
+void port_netlobby_set_options(int stage, int stocks, int items, int delay);
 /* 1 when this session was started by RetroHub / test automation (env). */
 int port_netlobby_auto_active(void);
 

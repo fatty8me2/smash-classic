@@ -436,34 +436,46 @@ static void RenderNetplayLobby(WidgetInfo& /*widget*/) {
     ImGui::EndDisabled();
 
     ImGui::SeparatorText("Host a match");
-    ImGui::BeginDisabled(!idle);
+    /* The player who leads the room (the creator, or whoever took over when the host left) can still
+     * change the rules before starting the next match. */
+    const bool leadsRoom = port_netlobby_is_host() != 0 && state == PORT_NETLOBBY_CONNECTED;
+    ImGui::BeginDisabled(!idle && !leadsRoom);
     ImGui::TextUnformatted("Stage");
     ImGui::SetNextItemWidth(-FLT_MIN);
+    bool optionsChanged = false;
     if (ImGui::Combo("##NetplayStage", &stage, kNetplayStages, IM_ARRAYSIZE(kNetplayStages))) {
         CVarSetInteger("gNetplay.Stage", stage);
-        save();
+        optionsChanged = true;
     }
     ImGui::TextUnformatted("Stocks");
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::SliderInt("##NetplayStocks", &stocks, 1, 5)) {
         CVarSetInteger("gNetplay.Stocks", stocks);
-        save();
+        optionsChanged = true;
     }
     bool itemsOn = items != 0;
     if (ImGui::Checkbox("Items", &itemsOn)) {
         CVarSetInteger("gNetplay.Items", itemsOn ? 1 : 0);
-        save();
+        optionsChanged = true;
     }
     ImGui::TextUnformatted("Input delay (frames)");
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::SliderInt("##NetplayDelay", &delay, 0, 4)) {
         CVarSetInteger("gNetplay.Delay", delay);
-        save();
+        optionsChanged = true;
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Frames of input delay before rollback kicks in. 2 suits most connections;\n"
                           "raise it on high-ping links to reduce visible rollbacks.");
     }
+    if (optionsChanged) {
+        save();
+        if (leadsRoom) {
+            port_netlobby_set_options(stage, stocks, itemsOn ? 1 : 0, delay);
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::BeginDisabled(!idle);
     if (UIWidgets::Button("Host", UIWidgets::ButtonOptions().Color(UIWidgets::Colors::LightBlue))) {
         port_netlobby_host(serverBuf, fighter, stage, stocks, itemsOn ? 1 : 0, delay);
     }
@@ -497,6 +509,9 @@ static void RenderNetplayLobby(WidgetInfo& /*widget*/) {
 
     ImGui::SeparatorText("Status");
     ImGui::TextWrapped("%s", port_netlobby_status());
+    if (port_netlobby_host_notice()[0] != '\0') {
+        ImGui::TextColored(ImVec4(0.45f, 0.85f, 1.0f, 1.0f), "%s", port_netlobby_host_notice());
+    }
 
     if (port_netlobby_code()[0] != '\0' && port_netlobby_is_host() && !idle) {
         ImGui::Text("Room code: %s", port_netlobby_code());
