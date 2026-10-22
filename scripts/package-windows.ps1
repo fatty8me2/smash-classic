@@ -316,6 +316,28 @@ if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
 & (Join-Path $PSScriptRoot "zip-portable.ps1") -Source $StageDir -Destination $ZipPath
 if (-not (Test-Path $ZipPath)) { Fail "zip was not created" }
 
+# ── 6. Setup exe (Inno Setup 6) from the same staged files ──
+# US only: RetroHub-Setup.exe is the RetroHub installer. Requires Inno Setup 6:
+#   winget install --id JRSoftware.InnoSetup -e --silent
+# Set SKIP_INSTALLER=1 to skip.
+$SetupPath = $null
+if ($Ver -eq "us" -and $env:SKIP_INSTALLER -ne "1") {
+    Write-Step "Building RetroHub-Setup.exe"
+    $Iscc = @(
+        $env:ISCC,
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $Iscc) { Fail "Inno Setup 6 not found (winget install --id JRSoftware.InnoSetup -e), or set SKIP_INSTALLER=1" }
+    $AppVer = (Get-Content (Join-Path $Root "VERSION") -Raw).Trim().TrimStart('v','V')
+    & $Iscc "/Qp" "/DSourceDir=$StageDir" "/DAppVersion=$AppVer" "/DOutputDir=$DistDir" (Join-Path $Root "installer\RetroHub.iss")
+    if ($LASTEXITCODE -ne 0) { Fail "ISCC failed" }
+    $SetupPath = Join-Path $DistDir "RetroHub-Setup.exe"
+    if (-not (Test-Path $SetupPath)) { Fail "RetroHub-Setup.exe was not created" }
+    Write-Host "Setup ready: $SetupPath" -ForegroundColor Green
+}
+
 $ZipKB = [int]((Get-Item $ZipPath).Length / 1024)
 Write-Host "`nRelease zip ready: $ZipPath ($ZipKB KB)" -ForegroundColor Green
 Write-Host "   Portable: extract anywhere; save data lives next to BattleShip.exe."
