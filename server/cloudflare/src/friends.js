@@ -19,6 +19,11 @@ const CODE_RE = /^RH-?([A-Z2-7]{4})-?([A-Z2-7]{4})$/;
 
 const MAX_JSON = 8192;
 const MAX_FRIENDS = 200;
+// The admin account is auto-linked with every user, so its friend list may grow much
+// larger. To keep presence fan-out bounded, the admin only broadcasts its own presence
+// to its first ADMIN_FANOUT friends (oldest links first); the rest still see it on connect.
+const ADMIN_MAX_FRIENDS = 5000;
+const ADMIN_FANOUT = 200;
 const MAX_OUT_REQ = 50;
 const MAX_IN_REQ = 200;
 const MAX_BLOCKED = 500;
@@ -59,7 +64,7 @@ function sanitizeStatus(s) {
   if (s.game_id != null) out.game_id = clean(s.game_id, 64);
   if (s.game_title != null) out.game_title = clean(s.game_title, 64);
   if (s.system != null) out.system = clean(s.system, 32);
-  if (state === "in_lobby") {
+  if (state === "in_lobby" || state === "in_game") {
     const lc = String(s.lobby_code || "").toUpperCase();
     if (LOBBY_RE.test(lc)) out.lobby_code = lc;
     out.joinable = s.joinable === true;
@@ -242,7 +247,10 @@ export class UserHub extends DurableObject {
     if (!force && prev && prev.v === key) return;
     this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('pres', ?)", key);
     const payload = { uid: p.uid, name: p.name, status: eff };
-    const friends = this.all("SELECT uid FROM friends");
+    const isAdmin = !!this.env.ADMIN_UID && p.uid === this.env.ADMIN_UID;
+    const friends = isAdmin
+      ? this.all("SELECT uid FROM friends ORDER BY since ASC LIMIT ?", ADMIN_FANOUT)
+      : this.all("SELECT uid FROM friends");
     await Promise.allSettled(friends.map((f) => this.call(f.uid, "presence", payload)));
   }
 
@@ -337,7 +345,7 @@ export class UserHub extends DurableObject {
         if (!this.env.ADMIN_UID || p.uid !== this.env.ADMIN_UID) return { r: "none" };
         if (this.isBlocked(from)) return { r: "blocked" };
         if (!this.isFriend(from)) {
-          if (this.count("friends") >= MAX_FRIENDS) return { r: "full" };
+          if (this.count("friends") >= ADMIN_MAX_FRIENDS) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
           const f = this.addFriendRow(from, cleanName(b.name) || "player", sanitizeStatus(b.status));
           this.push({ type: "friend_added", friend: f });
@@ -660,7 +668,7 @@ export class UserHub extends DurableObject {
       this.run("DELETE FROM requests WHERE uid=?", admin);
       this.addFriendRow(admin, r.friend.name, sanitizeStatus(r.friend.status));
     }
-    if (r && (r.r === "ok" || r.r === "blocked")) {
+    if (r && (r.r === "ok" || r.r === "blocked" || r.r === "full")) {
       this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('admin_linked', '1')");
     }
   }

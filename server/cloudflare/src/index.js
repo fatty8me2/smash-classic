@@ -66,6 +66,11 @@ export class NetplayRoom extends DurableObject {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"keepalive"}', '{"type":"keepalive_ack"}'));
+    // In-memory copy of the relay flag (null = not loaded yet, e.g. after hibernation).
+    this.relay = null;
+    this.ctx.blockConcurrencyWhile(async () => {
+      this.relay = (await this.ctx.storage.get("relay")) === true;
+    });
   }
 
   socket(role) {
@@ -101,6 +106,7 @@ export class NetplayRoom extends DurableObject {
     if (role === "host") {
       // A new host starts a fresh room (relay off).
       await this.ctx.storage.deleteAll();
+      this.relay = false;
     }
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1], [role]);
@@ -127,7 +133,8 @@ export class NetplayRoom extends DurableObject {
     if (typeof message !== "string") {
       // Relayed game packet.
       if (message.byteLength > MAX_BINARY_BYTES) return;
-      if (await this.ctx.storage.get("relay")) {
+      if (this.relay === null) this.relay = (await this.ctx.storage.get("relay")) === true;
+      if (this.relay) {
         const other = this.other(ws);
         if (other) other.send(message);
       }
@@ -149,6 +156,7 @@ export class NetplayRoom extends DurableObject {
         this.introduce();
         break;
       case "relay": {
+        this.relay = true;
         await this.ctx.storage.put("relay", true);
         const text = JSON.stringify({ type: "relaying" });
         for (const s of this.ctx.getWebSockets()) s.send(text);
