@@ -148,7 +148,13 @@ $traces = @{}
 foreach ($f in $used) {
     $t = "$out\$f.trace"
     if (-not (Test-Path $t)) { Write-Output "no trace for $f (match did not start)"; exit 2 }
-    $traces[$f] = Get-Content $t
+    $lines = @(Get-Content $t)
+    # The game is killed at the end of the run, so its last trace line can be torn
+    # (partial write). Drop it when its field count differs from the line before.
+    if ($lines.Count -ge 2 -and (($lines[-1] -split ' ').Count -ne ($lines[-2] -split ' ').Count)) {
+        $lines = $lines[0..($lines.Count - 2)]
+    }
+    $traces[$f] = $lines
 }
 $n = ($used | ForEach-Object { $traces[$_].Count } | Measure-Object -Minimum).Minimum
 Write-Output (($used | ForEach-Object { "$_ traced=$($traces[$_].Count)" }) -join "  ")
