@@ -68,15 +68,17 @@ Output lands at `.claude/worktrees/<slug>` on branch `agent/<slug>`. The script:
 - **Normal git flow for submodule changes**:
   1. Edit and commit inside `<worktree>/decomp/`, `<worktree>/libultraship/`, or `<worktree>/torch/`.
   2. Push to the fork: `git -C <worktree>/<sm> push origin <branch>`.
-     - `decomp` → `port-patches` on `JRickey/ssb-decomp-re`
-     - `libultraship` → `ssb64` on `JRickey/libultraship`
-     - `torch` → `ssb64` on `JRickey/Torch`
+     - `decomp` → `smash-classic` on the `fatty` remote (`fatty8me2/ssb-decomp-re`): `git -C <worktree>/decomp push fatty HEAD:smash-classic`
+     - `libultraship` → `ssb64` on `JRickey/libultraship` (upstream; push only if you have access)
+     - `torch` → `ssb64` on `JRickey/Torch` (upstream; push only if you have access)
   3. In the outer worktree, bump the submodule pointer: `git add <sm> && git commit -m "Bump <sm>: <summary>"`.
   4. When the outer branch lands on main, the pointer update goes with it.
 
 ### Merging back to main
 
 The outer worktree is a normal branch (`agent/<slug>`). Merge or PR it into `main` like any other branch. Submodule pointer bumps ride along in the commits.
+
+**Pushing the outer repo (this fork):** the integration branch `rollback-synctest` goes to the `fatty` remote (`fatty8me2/smash-classic`) as `main`: `git push fatty rollback-synctest:main`. `origin` is upstream (`JRickey/BattleShip`), so do not push there from this fork.
 
 ### Cleanup
 
@@ -90,7 +92,7 @@ Stale worktrees under `.claude/worktrees/` from past sessions are fine to remove
 ### Gotchas
 
 - **Never use relative `build` paths in Bash tool calls** — Claude Code resets cwd between `Bash` calls. `cmake --build build` from the project root builds the main tree, not the worktree. Always use absolute paths: `cmake --build <worktree>/build ...`.
-- **Cap build parallelism at `-j 4` on the M1 16 GB machine.** Bare `-j` lets make spawn one clang per logical core; libultraship's Debug C++ TUs hold 1–2 GB resident each, so 8 in parallel push the laptop into swap and pin the fans for the whole compile. Always: `cmake --build <worktree>/build --target ssb64 -j 4`. Push to `-j 6` only when you know nothing else heavy is open. Worktree first-builds are full from-scratch (no shared cache with main tree), so this matters most the first time.
+- **Build parallelism (upstream-only note):** the upstream author's M1 16 GB laptop needed `-j 4` for libultraship Debug builds. This fork's machine is different, so size `--parallel` to your own RAM. Worktree first builds are full from-scratch, since they share no cache with the main tree.
 - The binary loads `BattleShip.o2r` (ROM-derived, user-extracted) and `f3d.o2r` (shaders) from its CWD at launch; without them it exits with `archive ... does not exist`. `new-worktree.sh` symlinks both from the main tree's `build/` into the worktree's `build/`. If the main tree has never been extracted, run `cmake --build <main-tree>/build --target ExtractAssets` there first so the symlinks resolve. (`ssb64.o2r` was an early-development port-asset archive; it is no longer produced or loaded — the build never contains ROM-derived data beyond the user's own first-run `BattleShip.o2r`.)
 
 ---

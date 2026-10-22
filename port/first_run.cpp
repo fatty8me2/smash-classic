@@ -321,6 +321,22 @@ std::string FindAssetConfigDir() {
 }
 
 std::string FindBaseRom() {
+    // SSB64_BASEROM: explicit full path to a ROM dump (.z64 / .n64 / .v64).
+    // Used when the file exists; otherwise the standard search below runs.
+    // Validation (SHA-1 and byte-order normalization) is done by torch during
+    // extraction, the same as for ROMs found by the search.
+    if (const char* envRom = std::getenv("SSB64_BASEROM"); envRom && *envRom) {
+        std::error_code ec;
+        const fs::path envPath(envRom);
+        if (fs::is_regular_file(envPath, ec)) {
+            const fs::path absolute = fs::absolute(envPath, ec);
+            const std::string chosen = ec ? envPath.string() : absolute.string();
+            port_log("first_run: using ROM from SSB64_BASEROM -> %s\n", chosen.c_str());
+            return chosen;
+        }
+        port_log("first_run: SSB64_BASEROM=%s is not a readable file; ignoring it\n", envRom);
+    }
+
     const std::string appData = Ship::Context::GetAppDirectoryPath();
     const std::string bundle = RealAppBundlePath();
     std::vector<std::string> candidates;

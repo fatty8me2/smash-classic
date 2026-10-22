@@ -19,6 +19,13 @@ const CODE_RE = /^RH-?([A-Z2-7]{4})-?([A-Z2-7]{4})$/;
 
 const MAX_JSON = 8192;
 const MAX_FRIENDS = 200;
+// The admin account is auto-linked with every user, so its friend list may grow much
+// larger. To keep presence fan-out bounded, the admin only broadcasts its own presence
+// to its first ADMIN_FANOUT friends (oldest links first); the rest still see it on connect.
+const ADMIN_MAX_FRIENDS = 5000;
+const ADMIN_FANOUT = 200;
+// Retry the automatic admin link this long after the admin's side reported full.
+const ADMIN_LINK_RETRY_MS = 24 * 60 * 60 * 1000;
 const MAX_OUT_REQ = 50;
 const MAX_IN_REQ = 200;
 const MAX_BLOCKED = 500;
@@ -59,7 +66,7 @@ function sanitizeStatus(s) {
   if (s.game_id != null) out.game_id = clean(s.game_id, 64);
   if (s.game_title != null) out.game_title = clean(s.game_title, 64);
   if (s.system != null) out.system = clean(s.system, 32);
-  if (state === "in_lobby") {
+  if (state === "in_lobby" || state === "in_game") {
     const lc = String(s.lobby_code || "").toUpperCase();
     if (LOBBY_RE.test(lc)) out.lobby_code = lc;
     out.joinable = s.joinable === true;
@@ -242,7 +249,10 @@ export class UserHub extends DurableObject {
     if (!force && prev && prev.v === key) return;
     this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('pres', ?)", key);
     const payload = { uid: p.uid, name: p.name, status: eff };
-    const friends = this.all("SELECT uid FROM friends");
+    const isAdmin = !!this.env.ADMIN_UID && p.uid === this.env.ADMIN_UID;
+    const friends = isAdmin
+      ? this.all("SELECT uid FROM friends ORDER BY since ASC LIMIT ?", ADMIN_FANOUT)
+      : this.all("SELECT uid FROM friends");
     await Promise.allSettled(friends.map((f) => this.call(f.uid, "presence", payload)));
   }
 
@@ -300,7 +310,7 @@ export class UserHub extends DurableObject {
         if (this.isBlocked(from)) return { r: "ok", name: "player", code: p.code };
         if (this.isFriend(from)) return { r: "already" };
         if (this.one("SELECT 1 FROM requests WHERE uid=? AND dir='out'", from)) {
-          if (this.count("friends") >= MAX_FRIENDS) return { r: "full" };
+          if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
           const f = this.addFriendRow(from, name, sanitizeStatus(b.status));
           this.push({ type: "request_update", uid: from, result: "accepted" });
@@ -319,7 +329,7 @@ export class UserHub extends DurableObject {
         const result = b.result;
         if (result === "accepted") {
           if (!this.one("SELECT 1 FROM requests WHERE uid=? AND dir='out'", from) || this.isBlocked(from)) return { r: "none" };
-          if (this.count("friends") >= MAX_FRIENDS) return { r: "full" };
+          if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
           const f = this.addFriendRow(from, b.name, sanitizeStatus(b.status));
           this.push({ type: "request_update", uid: from, result: "accepted" });
@@ -337,7 +347,7 @@ export class UserHub extends DurableObject {
         if (!this.env.ADMIN_UID || p.uid !== this.env.ADMIN_UID) return { r: "none" };
         if (this.isBlocked(from)) return { r: "blocked" };
         if (!this.isFriend(from)) {
-          if (this.count("friends") >= MAX_FRIENDS) return { r: "full" };
+          if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
           const f = this.addFriendRow(from, cleanName(b.name) || "player", sanitizeStatus(b.status));
           this.push({ type: "friend_added", friend: f });
@@ -501,7 +511,7 @@ export class UserHub extends DurableObject {
           return this.err(ws, "bad-request", type, "already-requested");
         }
         if (this.count("requests", "dir='out'") >= MAX_OUT_REQ) return this.err(ws, "bad-request", type, "too-many-requests");
-        if (this.count("friends") >= MAX_FRIENDS) return this.err(ws, "bad-request", type, "friends-full");
+        if (this.count("friends") >= this.friendCap(p)) return this.err(ws, "bad-request", type, "friends-full");
         const me = this.me();
         const r = await this.call(target, "request", { uid: p.uid, code: p.code, name: p.name, status: me.status, at: now() });
         if (r.r === "ok") {
@@ -639,13 +649,20 @@ export class UserHub extends DurableObject {
     }
   }
 
+  /* Friend-list cap for this account: the admin account gets the larger cap. */
+  friendCap(p) {
+    return this.env.ADMIN_UID && p.uid === this.env.ADMIN_UID ? ADMIN_MAX_FRIENDS : MAX_FRIENDS;
+  }
+
   /* Every RetroHub user starts out friends with the admin (env ADMIN_UID), both
    * ways. Done once per user: if either side removes or blocks the other later,
-   * it is not re-added. */
+   * it is not re-added. If the admin's side is full, retry after a day. */
   async autoLinkAdmin(p) {
     const admin = this.env.ADMIN_UID;
     if (!admin || !UID_RE.test(admin) || p.uid === admin) return;
     if (this.one("SELECT 1 FROM kv WHERE k='admin_linked'")) return;
+    const retry = this.one("SELECT v FROM kv WHERE k='admin_link_retry'");
+    if (retry && now() < Number(retry.v)) return;
     if (this.isFriend(admin) || this.isBlocked(admin)) {
       this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('admin_linked', '1')");
       return;
@@ -660,6 +677,10 @@ export class UserHub extends DurableObject {
       this.run("DELETE FROM requests WHERE uid=?", admin);
       this.addFriendRow(admin, r.friend.name, sanitizeStatus(r.friend.status));
     }
+    if (r && r.r === "full") {
+      this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('admin_link_retry', ?)", String(now() + ADMIN_LINK_RETRY_MS));
+      return;
+    }
     if (r && (r.r === "ok" || r.r === "blocked")) {
       this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('admin_linked', '1')");
     }
@@ -669,7 +690,7 @@ export class UserHub extends DurableObject {
     const p = this.profile();
     if (!this.one("SELECT 1 FROM requests WHERE uid=? AND dir='in'", uid)) return this.err(ws, "bad-request", "accept", "no-such-request");
     if (this.isBlocked(uid)) return this.err(ws, "blocked", "accept");
-    if (this.count("friends") >= MAX_FRIENDS) return this.err(ws, "bad-request", "accept", "friends-full");
+    if (this.count("friends") >= this.friendCap(p)) return this.err(ws, "bad-request", "accept", "friends-full");
     const me = this.me();
     const r = await this.call(uid, "request_update", { uid: p.uid, result: "accepted", name: p.name, status: me.status });
     if (r.r === "full") return this.err(ws, "bad-request", "accept", "target-full");
