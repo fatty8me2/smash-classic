@@ -108,6 +108,7 @@ Each script compares every peer's confirmed-state trace tick by tick. Exit code 
 
 - **Players.** Two to four humans, free-for-all. There are no CPUs and no team battle online.
 - **Drop-outs.** A player who disappears mid-match stalls everyone else (the Online window says who). Agreeing on a tick to drop them deterministically is not implemented.
+- **Peer identity.** `SSBL HELLO` is not authenticated: a peer that guesses a slot number and room address can claim to be that slot's path. Players are expected to be friends who share a room code. A real fix needs per-slot tokens issued by the lobby server.
 - **Lockstep moments.** The countdown, announcer and sudden-death intros run in lockstep: they wait for every other player's confirmed input instead of predicting. See "Not rollback-able yet" in `docs/rollback_design.md`.
 - **Rematches.** The fighter and rules carry over; the host changes them by leaving and hosting again.
 - **Audio.** Sounds started by a frame that later gets corrected still play once; rewound frames are silent.
