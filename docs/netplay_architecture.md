@@ -188,6 +188,10 @@ Playback verification compares the file checksum against `syNetInputGetPublished
 
 Gameplay-state trace (`sys/netsync.c`): `SSB64_SYNC_TRACE=<file>` writes, once per simulated tick from `scVSBattleFuncUpdate()` right after `ifCommonBattleUpdateInterfaceAll()`, a line of twelve FNV-1a hashes (`full rng battle fighters items weapons stage objman input joints camera vars`; the first eight are gated). `SSB64_SYNC_VERIFY=<file>` compares the running match against a recorded trace tick by tick and logs the first divergent tick per column; the verdict feeds the `SSB64_RIG_EXIT` code. Object identity in the hash is `syNetSyncObjectKey()`: player slot for fighters, per-match `spawn_serial` (stamped by `itManager`/`wpManager` at creation, PORT only) for items and weapons — never an address, and never `gobj->id`, which is only the kind. Design, column contents and results: `docs/state_trace.md`. See `docs/bugs/replay_verify_ring_window_2026-08-29.md`.
 
+## Online Netplay (2-4 players)
+
+`netpeer.c` also drives the lobby-started online matches (`docs/netplay_online.md`). The player count comes from the match metadata; each remote player has a transport peer index (its lobby slot), its own sequence/lead/barrier state, and the input packet (wire version 5) is identical for every remote: sender slot, 16 scheduled inputs, the sender's lead over each slot's confirmed input, and a confirmed-state hash. Pacing and time sync act on the slowest / furthest-ahead remote. `netpeer.h` exposes `syNetPeerGetConfirmedTick` (minimum over remotes) and `syNetPeerGetSilentPlayer` (who has stopped sending). Fresh-boot state that the sync hash reads (`gITManager*`, hit-refresh counters, item and weapon structs) is reset at the start of an online match so players with different histories agree.
+
 ## Debug P2P Netplay
 
 `src/sys/netpeer.c` adds a UDP-only debug transport for manual P2P testing. It is not a final lobby or NAT traversal layer; it exists to prove that two local game instances can share match setup and exchange per-tick input frames.
@@ -198,7 +202,7 @@ Current debug environment variables:
 - `SSB64_NETPLAY_LOCAL_PLAYER` selects the local slot index.
 - `SSB64_NETPLAY_REMOTE_PLAYER` selects the remote slot index.
 - `SSB64_NETPLAY_BIND` is the local IPv4 bind address in `host:port` form.
-- `SSB64_NETPLAY_PEER` is the remote IPv4 address in `host:port` form.
+- `SSB64_NETPLAY_PEER` is the remote IPv4 address in `host:port` form (this env-driven mode is always 2 players).
 - `SSB64_NETPLAY_DELAY` offsets sent input ticks by a fixed frame delay. It defaults to 2.
 - `SSB64_NETPLAY_SESSION` optionally overrides the packet session id. It defaults to 1.
 - `SSB64_NETPLAY_BOOTSTRAP=1` enables automatic VS match bootstrap.

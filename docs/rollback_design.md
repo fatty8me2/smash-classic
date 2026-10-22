@@ -10,6 +10,14 @@ Code:
 - `port/port_symbolize.cpp`
 - `scripts/rollback_synctest.ps1`
 
+## Players
+
+Online matches have 2-4 players. `netpeer.c` keeps one *remote* per other player (transport peer, sequence/advantage/start-barrier state) and `netinput.c` already keeps history per controller slot, so rollback itself is unchanged:
+- every remote slot is `RemotePredicted`, the local slot `Local`, all other slots `Saved` (neutral);
+- the **confirmed tick** is the minimum over remotes of the next unconfirmed input (`syNetPeerGetConfirmedTick`): the trace, the hash ring and the pacing cap (6 ticks) all use it;
+- any remote's confirmed input that differs from the prediction already simulated sets the misprediction tick, so the rollback goes back to the earliest one;
+- the sync check compares the confirmed hash a peer sends with ours, from every peer.
+
 ## Tick boundary
 
 VS runs `syTaskmanRunTask` → `syTaskmanCommonTaskUpdate`:
