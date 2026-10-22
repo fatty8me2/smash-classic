@@ -156,8 +156,8 @@ export class NetplayRoom extends DurableObject {
         this.introduce();
         break;
       case "relay": {
-        this.relay = true;
         await this.ctx.storage.put("relay", true);
+        this.relay = true;
         const text = JSON.stringify({ type: "relaying" });
         for (const s of this.ctx.getWebSockets()) s.send(text);
         break;
