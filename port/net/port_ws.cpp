@@ -3,6 +3,7 @@
 #include "port_log.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -31,6 +32,18 @@ std::deque<std::vector<unsigned char>> sBinaryQueue;
 Connection sConn;
 std::thread sThread;
 std::atomic<bool> sStop{ false };
+
+/* Relayed game packets are sent from a background thread: WinHTTP's send can
+ * block when the server (or the network) is slow, and the game thread must
+ * never wait on it. The queue is bounded; when it is full the oldest packet
+ * is dropped, like a congested network would. */
+constexpr size_t kSendQueueMax = 256;
+std::deque<std::vector<unsigned char>> sSendQueue;
+std::condition_variable sSendCv;
+std::thread sSendThread;
+unsigned int sSendDropped = 0;
+
+void send_loop(void);
 
 std::wstring widen(const std::string &s)
 {
@@ -127,6 +140,7 @@ void run(std::string url)
         sConn.socket = socket;
     }
     sState = PORT_WS_OPEN;
+    sSendThread = std::thread(send_loop);
 
     std::vector<unsigned char> message;
     unsigned char buffer[4096];
@@ -164,6 +178,33 @@ void run(std::string url)
     }
 }
 
+HINTERNET current_socket(void)
+{
+    std::lock_guard<std::mutex> lock(sMutex);
+    return sConn.socket;
+}
+
+void send_loop(void)
+{
+    for (;;) {
+        std::vector<unsigned char> packet;
+        {
+            std::unique_lock<std::mutex> lock(sMutex);
+            sSendCv.wait(lock, [] { return sStop.load() || !sSendQueue.empty(); });
+            if (sStop) {
+                return;
+            }
+            packet = std::move(sSendQueue.front());
+            sSendQueue.pop_front();
+        }
+        HINTERNET socket = current_socket();
+        if (socket) {
+            WinHttpWebSocketSend(socket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE, packet.data(),
+                                 static_cast<DWORD>(packet.size()));
+        }
+    }
+}
+
 int send_frame(const void *data, DWORD size, WINHTTP_WEB_SOCKET_BUFFER_TYPE type)
 {
     if (sState != PORT_WS_OPEN) {
@@ -191,6 +232,8 @@ extern "C" int port_ws_connect(const char *url)
         sError.clear();
         sTextQueue.clear();
         sBinaryQueue.clear();
+        sSendQueue.clear();
+        sSendDropped = 0;
     }
     sState = PORT_WS_CONNECTING;
     sThread = std::thread(run, std::string(url ? url : ""));
@@ -200,15 +243,19 @@ extern "C" int port_ws_connect(const char *url)
 extern "C" void port_ws_close(void)
 {
     sStop = true;
+    sSendCv.notify_all();
     {
         std::lock_guard<std::mutex> lock(sMutex);
         if (sConn.socket) {
             WinHttpWebSocketClose(sConn.socket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
         }
     }
-    close_handles();    // unblocks a pending receive / connect
+    close_handles();    // unblocks a pending receive / send / connect
     if (sThread.joinable()) {
         sThread.join();
+    }
+    if (sSendThread.joinable()) {
+        sSendThread.join();
     }
     sState = PORT_WS_CLOSED;
 }
@@ -233,7 +280,20 @@ extern "C" int port_ws_send_text(const char *text)
 
 extern "C" int port_ws_send_binary(const void *data, int size)
 {
-    return send_frame(data, static_cast<DWORD>(size), WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE);
+    if (sState != PORT_WS_OPEN || data == nullptr || size <= 0) {
+        return 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(sMutex);
+        if (sSendQueue.size() >= kSendQueueMax) {
+            sSendQueue.pop_front();
+            sSendDropped++;
+        }
+        const unsigned char *bytes = static_cast<const unsigned char *>(data);
+        sSendQueue.emplace_back(bytes, bytes + size);
+    }
+    sSendCv.notify_one();
+    return 1;
 }
 
 extern "C" int port_ws_poll_text(char *out, int capacity)

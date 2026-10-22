@@ -49,7 +49,8 @@ constexpr unsigned int kDirectFreshMs = 2000;
 
 struct PendingPacket {
     unsigned int release_ms;
-    int peer;
+    int peer;                   /* destination peer, or -1 for a relay frame */
+    unsigned int relay_mask;    /* relay frames: destination peers */
     std::vector<uint8_t> bytes;
 };
 
@@ -174,16 +175,22 @@ int raw_send_to(const sockaddr_in &to, const uint8_t *data, int size)
     return (sent == size) ? size : -1;
 }
 
+/* One relay frame, [destination mask][payload], to every peer in the mask. */
+int raw_send_relay(unsigned int mask, const uint8_t *data, int size)
+{
+    std::vector<uint8_t> frame(static_cast<size_t>(size) + 1);
+    frame[0] = static_cast<uint8_t>(mask);
+    std::memcpy(frame.data() + 1, data, size);
+    return sRelaySend(frame.data(), size + 1) ? size : -1;
+}
+
 /* Game traffic to one peer: direct UDP, or through the relay hook. */
 int raw_send_peer(int peer, const uint8_t *data, int size)
 {
     Peer &p = sPeers[peer];
 
     if (p.relay && sRelaySend != nullptr) {
-        std::vector<uint8_t> frame(static_cast<size_t>(size) + 1);
-        frame[0] = static_cast<uint8_t>(peer);
-        std::memcpy(frame.data() + 1, data, size);
-        return sRelaySend(frame.data(), size + 1) ? size : -1;
+        return raw_send_relay(1u << peer, data, size);
     }
     if (p.has_chosen) {
         return raw_send_to(p.chosen, data, size);
@@ -287,10 +294,29 @@ void flush_sim_queue(void)
 {
     unsigned int now = port_udp_now_ms();
     while (!sSimQueue.empty() && static_cast<int>(now - sSimQueue.front().release_ms) >= 0) {
-        raw_send_peer(sSimQueue.front().peer, sSimQueue.front().bytes.data(),
-                      static_cast<int>(sSimQueue.front().bytes.size()));
+        const PendingPacket &packet = sSimQueue.front();
+        if (packet.peer >= 0) {
+            raw_send_peer(packet.peer, packet.bytes.data(), static_cast<int>(packet.bytes.size()));
+        } else if (sRelaySend != nullptr) {
+            raw_send_relay(packet.relay_mask, packet.bytes.data(), static_cast<int>(packet.bytes.size()));
+        }
         sSimQueue.pop_front();
     }
+}
+
+/* Queues a packet for the simulator with this packet's latency and jitter. */
+void sim_enqueue(int peer, unsigned int relay_mask, const uint8_t *bytes, int size)
+{
+    unsigned int delay = sSimLatencyMs + ((sSimJitterMs != 0) ? (sSimRng() % (sSimJitterMs + 1)) : 0);
+    PendingPacket packet{ port_udp_now_ms() + delay, peer, relay_mask, std::vector<uint8_t>(bytes, bytes + size) };
+
+    /* Jitter may reorder packets, exactly like a real network. */
+    auto it = sSimQueue.end();
+    while (it != sSimQueue.begin() && static_cast<int>((it - 1)->release_ms - packet.release_ms) > 0) {
+        --it;
+    }
+    sSimQueue.insert(it, std::move(packet));
+    flush_sim_queue();
 }
 
 void text_of(const sockaddr_in &addr, char *out, int capacity)
@@ -456,17 +482,52 @@ extern "C" int port_udp_peer_send(int peer, const void *data, int size)
     if (sSimLatencyMs == 0 && sSimJitterMs == 0) {
         return raw_send_peer(peer, bytes, size);
     }
-    unsigned int delay = sSimLatencyMs + ((sSimJitterMs != 0) ? (sSimRng() % (sSimJitterMs + 1)) : 0);
-    PendingPacket packet{ port_udp_now_ms() + delay, peer, std::vector<uint8_t>(bytes, bytes + size) };
-
-    /* Jitter may reorder packets, exactly like a real network. */
-    auto it = sSimQueue.end();
-    while (it != sSimQueue.begin() && static_cast<int>((it - 1)->release_ms - packet.release_ms) > 0) {
-        --it;
-    }
-    sSimQueue.insert(it, std::move(packet));
-    flush_sim_queue();
+    sim_enqueue(peer, 0, bytes, size);
     return size;
+}
+
+extern "C" int port_udp_peers_send(const int *peers, int count, const void *data, int size)
+{
+    if (sSocket == kInvalidSocket || peers == nullptr || count <= 0 || data == nullptr || size <= 0) {
+        return -1;
+    }
+    int result = -1;
+
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    const bool simulated = (sSimLossPct != 0 || sSimLatencyMs != 0 || sSimJitterMs != 0);
+    unsigned int relay_mask = 0;
+
+    for (int i = 0; i < count; i++) {
+        const int peer = peers[i];
+        if (!valid_peer(peer)) {
+            continue;
+        }
+        const Peer &p = sPeers[peer];
+        if (p.relay && sRelaySend != nullptr) {
+            relay_mask |= 1u << peer;       /* one relay frame serves all of them */
+        } else if (simulated) {
+            /* Direct paths are independent: each destination gets its own loss and delay. */
+            if (port_udp_peer_send(peer, data, size) == size) {
+                result = size;
+            }
+        } else if (raw_send_peer(peer, bytes, size) == size) {
+            result = size;
+        }
+    }
+    if (relay_mask != 0) {
+        if (!simulated) {
+            if (raw_send_relay(relay_mask, bytes, size) == size) {
+                result = size;
+            }
+        } else {
+            /* Relayed peers share one connection to the server, so they share one loss and delay. */
+            if (sSimLossPct == 0 || (sSimRng() % 100u) >= sSimLossPct) {
+                sim_enqueue(-1, relay_mask, bytes, size);
+            }
+            result = size;
+        }
+    }
+    return result;
 }
 
 extern "C" int port_udp_peer_punch(int peer, const void *data, int size)

@@ -12,7 +12,8 @@
  * heard from one of them makes it that peer's direct path. Per peer, game
  * traffic goes either direct or through the lobby server's relay, which the
  * lobby selects when hole punching to that peer fails; a relayed frame is
- * [destination peer][payload] going out and [source peer][payload] coming in.
+ * [destination mask][payload] going out (bit n = peer n, so one frame reaches
+ * several peers) and [source peer][payload] coming in.
  *
  * Optional network simulation for testing (host-side only, never game state):
  *   SSB64_NETPLAY_SIM_LATENCY_MS  one-way delay added to every sent packet
@@ -52,6 +53,10 @@ int port_udp_peer_is_relay(int peer);
  * -1 on error. */
 int port_udp_peer_send(int peer, const void *data, int size);
 
+/* Sends one datagram to several peers; the ones on the relay share a single
+ * relay frame. Returns size if any copy was sent, -1 otherwise. */
+int port_udp_peers_send(const int *peers, int count, const void *data, int size);
+
 /* Hole punching: sends to every candidate address of the peer, unsimulated. */
 int port_udp_peer_punch(int peer, const void *data, int size);
 
@@ -68,7 +73,7 @@ int port_udp_recv_any(void *buffer, int capacity, int *peer, char *from, int fro
 int port_udp_send_to(const char *spec, const void *data, int size);
 
 /* Relay fallback: the lobby routes frames through its WebSocket to
- * server/cloudflare. `send` is handed [destination peer][payload]; `recv`
+ * server/cloudflare. `send` is handed [destination mask][payload]; `recv`
  * yields [source peer][payload]. NULL hooks disable the relay. */
 typedef int (*port_udp_relay_send_fn)(const void *data, int size);   /* 1 = sent */
 typedef int (*port_udp_relay_recv_fn)(void *buffer, int capacity);  /* size, 0 = none */
