@@ -1,44 +1,52 @@
 # End-to-end online test against the Cloudflare lobby (server/cloudflare):
-# a host creates a room and a client joins it by code. They hole-punch, pick
-# fighters, start a rollback match with fuzzed inputs, and their
-# confirmed-state traces are compared. -LatencyMs/-LossPct simulate a bad
-# network on the game traffic (the lobby handshake uses the same socket).
+# a host creates a room and 1-3 clients join it by code. They hole-punch (a
+# full mesh), pick fighters, start a rollback match with fuzzed inputs, and
+# every peer's confirmed-state trace is compared with the host's.
+# -LatencyMs/-LossPct simulate a bad network on the game traffic (the lobby
+# handshake uses the same socket).
 #
-#   .\scripts\netplay_lobbytest.ps1 -Seconds 60
+#   .\scripts\netplay_lobbytest.ps1 -Seconds 60                  # 2 players
+#   .\scripts\netplay_lobbytest.ps1 -Players 4 -Seconds 90       # host + 3 clients
+#   .\scripts\netplay_lobbytest.ps1 -Players 3 -LatencyMs 60 -LossPct 3
 #   .\scripts\netplay_lobbytest.ps1 -Server wss://smash-netplay.jumpcircuit.workers.dev
 #
 # Without -Server it uses `wrangler dev` on ws://127.0.0.1:8799, starting it
-# if nothing answers there.
+# if nothing answers there. Every instance runs with SSB64_HIDDEN_WINDOW=1
+# (rendering, but no window is ever shown) and muted.
 #
 # Exit code: 0 in sync, 1 desync, 2 no match / no trace.
 param(
     [int]$Seconds = 60,
+    [int]$Players = 2,          # 2-4 (host included)
     [int]$LatencyMs = 0,
     [int]$JitterMs = 0,
     [int]$LossPct = 0,
     [string]$Server = "",
     [int]$HostFighter = 0,
-    [int]$ClientFighter = 1,
+    [int]$ClientFighter = 1,    # first client; further clients use the next fighter ids
     [int]$Stage = 0,
     [switch]$ForceRelay,
+    [int]$RelayPeer = -1,       # lobby slot whose paths all go through the relay (others stay direct)
     [string]$BuildDir = "$PSScriptRoot\..\build\us\Release",
     [int]$Rematches = 0,        # host starts this many rematches after the first match
     [int]$RematchDelayMs = 4000, # delay before each host rematch (SSB64_LOBBY_REMATCH_DELAY_MS)
-    [string]$ClientShots = "",  # client SSB64_SCREENSHOT_FRAMES list (saved under the out dir)
-    [int]$PreRand = 0,          # client burns this many RNG calls before the battle loads
+    [string]$ClientShots = "",  # first client SSB64_SCREENSHOT_FRAMES list (saved under the out dir)
+    [int]$PreRand = 0,          # last client burns this many RNG calls before the battle loads
     [switch]$NoReseed,          # disable the stage-load reseed (to reproduce the bug)
-    [int]$ExtraHold = 0,        # client holds this many extra frames at match start
+    [int]$ExtraHold = 0,        # last client holds this many extra frames at match start
     [switch]$NoRandRestore,     # disable the hold RNG fix (to reproduce the bug)
-    [int]$ArenaPoison = 0,      # client fills each scene arena with this byte (uninitialized-read probe)
-    [int]$AddrJitter = 0,      # client shifts its heap layout like a different PC would
+    [int]$ArenaPoison = 0,      # last client fills each scene arena with this byte (uninitialized-read probe)
+    [int]$AddrJitter = 0,      # last client shifts its heap layout like a different PC would
     [string]$HostDir = "",      # run the host from another install (its own cfg + save)
+    [int]$MinTicks = 0,         # fail (exit 2) when fewer ticks than this were compared
     [string]$OutDir = "$PSScriptRoot\..\build\us\lobby-test"
 )
 
+if ($Players -lt 2 -or $Players -gt 4) { Write-Output "-Players must be 2-4"; exit 2 }
 $build = Resolve-Path $BuildDir
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $out = Resolve-Path $OutDir
-Remove-Item "$out\*" -ErrorAction SilentlyContinue
+Remove-Item "$out\*" -Recurse -ErrorAction SilentlyContinue
 
 $wrangler = $null
 if (-not $Server) {
@@ -56,24 +64,35 @@ if (-not $Server) {
         if (-not $up) { Write-Output "wrangler dev did not start"; exit 2 }
     }
 }
-Write-Output "lobby server: $Server"
+Write-Output "lobby server: $Server  players: $Players"
 
-function Start-Peer([string]$role, [int]$fighter, [int]$fuzz) {
+$names = @('host', 'client', 'client2', 'client3')
+$fighters = @($HostFighter)
+for ($i = 1; $i -lt $Players; $i++) { $fighters += (($ClientFighter + $i - 1) % 12) }
+
+function Start-Peer([int]$index) {
+    $role = $names[$index]
+    $isLast = ($index -eq ($Players - 1))
     $vars = @{
-        SSB64_LOBBY_CODE_FILE = "$out\code.txt"; SSB64_LOBBY_FKIND = "$fighter"; SSB64_LOBBY_STAGE = "$Stage"
-        SSB64_NETPLAY_FUZZ = "$fuzz"; SSB64_MUTE = '1'; SSB64_NO_UPDATE_CHECK = '1'
+        SSB64_LOBBY_CODE_FILE = "$out\code.txt"; SSB64_LOBBY_FKIND = "$($fighters[$index])"; SSB64_LOBBY_STAGE = "$Stage"
+        SSB64_LOBBY_PLAYERS = "$Players"
+        SSB64_NETPLAY_FUZZ = "$(111 * ($index + 1))"; SSB64_MUTE = '1'; SSB64_NO_UPDATE_CHECK = '1'; SSB64_HIDDEN_WINDOW = '1'
         SSB64_NETPLAY_SIM_LATENCY_MS = "$LatencyMs"; SSB64_NETPLAY_SIM_JITTER_MS = "$JitterMs"
-        SSB64_NETPLAY_SIM_LOSS_PCT = "$LossPct"; SSB64_NETPLAY_SIM_SEED = "$fuzz"
+        SSB64_NETPLAY_SIM_LOSS_PCT = "$LossPct"; SSB64_NETPLAY_SIM_SEED = "$(111 * ($index + 1))"
         SSB64_NETPLAY_CONFIRMED_TRACE = "$out\$role.trace"; SSB64_LOG_PATH = "$out\$role.log"
         SSB64_LOBBY_FORCE_RELAY = $(if ($ForceRelay) { "1" } else { "" })
+        SSB64_LOBBY_RELAY_PEER = $(if ($RelayPeer -ge 0 -and $index -ne $RelayPeer) { "$RelayPeer" } else { "" })
     }
-    if ($role -eq 'host') {
+    if ($RelayPeer -ge 0 -and $index -eq $RelayPeer) { $vars['SSB64_LOBBY_FORCE_RELAY'] = "1" }
+    if ($index -eq 0) {
         $vars['SSB64_LOBBY_HOST'] = $Server; $vars['SSB64_LOBBY_AUTOSTART'] = '1'
         if ($Rematches) { $vars['SSB64_LOBBY_AUTOREMATCH'] = "$Rematches"; $vars['SSB64_LOBBY_REMATCH_DELAY_MS'] = "$RematchDelayMs" }
     } else {
         $vars['SSB64_LOBBY_JOIN'] = $Server
+        if ($index -eq 1 -and $ClientShots) { $vars['SSB64_SCREENSHOT_FRAMES'] = $ClientShots; $vars['SSB64_SCREENSHOT_DIR'] = "$out\client_shots" }
+    }
+    if ($isLast -and $index -ne 0) {
         if ($AddrJitter) { $vars['SSB64_ADDR_JITTER'] = "$AddrJitter" }
-        if ($ClientShots) { $vars['SSB64_SCREENSHOT_FRAMES'] = $ClientShots; $vars['SSB64_SCREENSHOT_DIR'] = "$out\client_shots" }
         if ($PreRand) { $vars['SSB64_NETPLAY_PRE_RAND'] = "$PreRand" }
         if ($NoReseed) { $vars['SSB64_NETPLAY_NO_RESEED'] = "1" }
         if ($ExtraHold) { $vars['SSB64_NETPLAY_EXTRA_HOLD'] = "$ExtraHold" }
@@ -81,7 +100,7 @@ function Start-Peer([string]$role, [int]$fighter, [int]$fuzz) {
         if ($ArenaPoison) { $vars['SSB64_ARENA_POISON'] = "$ArenaPoison" }
     }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $own = ($role -eq 'host' -and $HostDir)
+    $own = ($index -eq 0 -and $HostDir)
     $dir = $(if ($own) { $HostDir } else { $build })
     if (-not $own) { $vars['SSB64_SAVE_PATH'] = "$out\$role.sav" }
     $psi.FileName = Join-Path $dir 'BattleShip.exe'
@@ -91,35 +110,51 @@ function Start-Peer([string]$role, [int]$fighter, [int]$fuzz) {
     return [System.Diagnostics.Process]::Start($psi)
 }
 
-$a = Start-Peer 'host' $HostFighter 111
+$procs = @()
+$procs += Start-Peer 0
 Start-Sleep -Seconds 2
-$b = Start-Peer 'client' $ClientFighter 222
+for ($i = 1; $i -lt $Players; $i++) {
+    $procs += Start-Peer $i
+    Start-Sleep -Seconds 1
+}
 Start-Sleep -Seconds $Seconds
-foreach ($p in @($a, $b)) { if (-not $p.HasExited) { $p.CloseMainWindow() | Out-Null } }
+foreach ($p in $procs) { if (-not $p.HasExited) { $p.CloseMainWindow() | Out-Null } }
 Start-Sleep -Seconds 3
-foreach ($p in @($a, $b)) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
+foreach ($p in $procs) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
 if ($wrangler) { & taskkill /PID $wrangler.Id /T /F | Out-Null }
-foreach ($f in @('host', 'client')) {
+
+$used = $names[0..($Players - 1)]
+foreach ($f in $used) {
     Write-Output "--- $f"
     Select-String -Path "$out\$f.log" -Pattern 'SSB64 Lobby:|SSB64 WS:|online match|netplay tick|DESYNC|rollback FAILED' |
         Select-Object -Last 8 | ForEach-Object { $_.Line }
 }
-$ta = "$out\host.trace"; $tb = "$out\client.trace"
-if (-not (Test-Path $ta) -or -not (Test-Path $tb)) { Write-Output "no trace (match did not start)"; exit 2 }
-$la = Get-Content $ta; $lb = Get-Content $tb
-$n = [Math]::Min($la.Count, $lb.Count)
-Write-Output "host traced=$($la.Count) client traced=$($lb.Count)"
+$traces = @{}
+foreach ($f in $used) {
+    $t = "$out\$f.trace"
+    if (-not (Test-Path $t)) { Write-Output "no trace for $f (match did not start)"; exit 2 }
+    $traces[$f] = Get-Content $t
+}
+$n = ($used | ForEach-Object { $traces[$_].Count } | Measure-Object -Minimum).Minimum
+Write-Output (($used | ForEach-Object { "$_ traced=$($traces[$_].Count)" }) -join "  ")
 # Compare tick + the gated gameplay columns (full rng battle fighters items
 # weapons stage objman). The trailing input/joints/camera/vars columns are
 # diagnostic: `input` folds in predicted frames, so it legitimately differs
 # between peers once a rollback has corrected a misprediction.
 function Gated([string]$line) { ($line -split ' ')[0..8] -join ' ' }
+$host_lines = $traces['host']
 for ($i = 0; $i -lt $n; $i++) {
-    if ((Gated $la[$i]) -ne (Gated $lb[$i])) {
-        Write-Output "DESYNC at line $i`n  host:   $($la[$i])`n  client: $($lb[$i])"
-        exit 1
+    $ref = Gated $host_lines[$i]
+    foreach ($f in $used[1..($Players - 1)]) {
+        if ((Gated $traces[$f][$i]) -ne $ref) {
+            Write-Output "DESYNC at line $i ($f vs host)`n  host: $($host_lines[$i])`n  ${f}: $($traces[$f][$i])"
+            exit 1
+        }
     }
 }
 if ($n -eq 0) { Write-Output "no ticks traced"; exit 2 }
-Write-Output "IN SYNC for $n ticks"
+if ($MinTicks -gt 0 -and $n -lt $MinTicks) { Write-Output "only $n ticks compared (< $MinTicks)"; exit 2 }
+$bad = Select-String -Path ($used | ForEach-Object { "$out\$_.log" }) -Pattern 'DESYNC detected|rollback FAILED' -ErrorAction SilentlyContinue
+if ($bad) { Write-Output "in-band desync/rollback failure logged:"; $bad | Select-Object -First 4 | ForEach-Object { $_.Line }; exit 1 }
+Write-Output "IN SYNC for $n ticks ($Players players)"
 exit 0

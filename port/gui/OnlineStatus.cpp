@@ -3,6 +3,7 @@
 #include "../net/netlobby.h"
 
 #include <imgui.h>
+#include <cstdio>
 #include <libultraship/bridge/consolevariablebridge.h>
 
 extern "C" int syNetRollbackIsDesynced(void);
@@ -56,7 +57,7 @@ void DrawStartControls(const char* start_label) {
             CVarSetInteger("gNetplay.Stage", stage);
             port_netlobby_set_stage(stage);
         }
-        ImGui::BeginDisabled(port_netlobby_state() != PORT_NETLOBBY_CONNECTED || port_netlobby_peer_fkind() < 0);
+        ImGui::BeginDisabled(port_netlobby_state() != PORT_NETLOBBY_CONNECTED || port_netlobby_can_start() == 0);
         if (ImGui::Button(start_label, ImVec2(160, 0))) {
             port_netlobby_start_match();
         }
@@ -68,6 +69,28 @@ void DrawStartControls(const char* start_label) {
     }
 }
 } // namespace
+
+void DrawNetplayPlayers() {
+    for (int slot = 0; slot < PORT_NETLOBBY_MAX_PLAYERS; slot++) {
+        PortNetLobbyPlayer player;
+        if (port_netlobby_get_player(slot, &player) == 0) {
+            continue;
+        }
+        const char* fighter = (player.fkind >= 0 && player.fkind < IM_ARRAYSIZE(kFighters)) ? kFighters[player.fkind]
+                                                                                           : "choosing...";
+        char role[24] = {};
+        std::snprintf(role, sizeof(role), "%s%s", player.is_host ? "host" : "", player.is_self ? (player.is_host ? ", you" : "you") : "");
+        char line[160];
+        int n = std::snprintf(line, sizeof(line), "Player %d%s%s%s: %s", slot + 1, role[0] ? " (" : "", role,
+                              role[0] ? ")" : "", fighter);
+        if (!player.connected) {
+            std::snprintf(line + n, sizeof(line) - n, "  - connecting...");
+        } else if (player.ping_ms >= 0) {
+            std::snprintf(line + n, sizeof(line) - n, "  - %d ms%s", player.ping_ms, player.relay ? " (relayed)" : "");
+        }
+        ImGui::TextUnformatted(line);
+    }
+}
 
 OnlineStatusWindow::OnlineStatusWindow()
     : Ship::GuiWindow("gOnlineStatus.Visible", false, "Online", ImVec2(-1, -1),
@@ -102,21 +125,15 @@ void OnlineStatusWindow::Draw() {
 
 void OnlineStatusWindow::DrawElement() {
     if (InMatchDesynced()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "Out of sync with your opponent.");
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "Out of sync with the other players.");
         ImGui::TextWrapped("Your games no longer match - what you see may differ from what they see. "
                            "Finish or quit this match and start a rematch.");
         return;
     }
     ImGui::TextWrapped("%s", port_netlobby_status());
-    const int ping = port_netlobby_ping_ms();
-    if (ping >= 0) {
-        ImGui::Text("Ping: %d ms%s", ping, port_netlobby_is_relay() ? " (relayed)" : "");
-    }
+    ImGui::Spacing();
+    DrawNetplayPlayers();
     if (HubPreMatch()) {
-        const int peer = port_netlobby_peer_fkind();
-        if (peer >= 0 && peer < IM_ARRAYSIZE(kFighters)) {
-            ImGui::Text("Opponent: %s", kFighters[peer]);
-        }
         ImGui::Spacing();
         DrawFighterPicker();
         if (!port_netlobby_is_host()) {
@@ -126,7 +143,7 @@ void OnlineStatusWindow::DrawElement() {
         DrawStartControls("Start match");
         return;
     }
-    ImGui::TextDisabled("You're both back in your own menus. Use this window to play again.");
+    ImGui::TextDisabled("You're all back in your own menus. Use this window to play again.");
     ImGui::Spacing();
     DrawFighterPicker();
     ImGui::Spacing();

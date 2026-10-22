@@ -6,6 +6,7 @@
 // Licensed under the MIT License; see LICENSE at repository root.
 
 #include "PortMenu.h"
+#include "OnlineStatus.h"
 
 #include "Compat.h"
 #include "../enhancements/enhancements.h"
@@ -420,8 +421,8 @@ static void RenderNetplayLobby(WidgetInfo& /*widget*/) {
     const int state = port_netlobby_state();
     const bool idle = (state == PORT_NETLOBBY_IDLE || state == PORT_NETLOBBY_FAILED);
 
-    ImGui::TextWrapped("Play against someone online with rollback netcode. One player hosts and shares the "
-                       "room code; the other joins with it. No port forwarding needed.");
+    ImGui::TextWrapped("Play online with rollback netcode: 2 to 4 players. One player hosts and shares the "
+                       "room code; the others join with it. No port forwarding needed.");
     ImGui::Spacing();
 
     ImGui::BeginDisabled(state == PORT_NETLOBBY_STARTING || state == PORT_NETLOBBY_IN_MATCH);
@@ -505,16 +506,10 @@ static void RenderNetplayLobby(WidgetInfo& /*widget*/) {
         }
     }
     if (state == PORT_NETLOBBY_CONNECTED || state == PORT_NETLOBBY_STARTING || state == PORT_NETLOBBY_IN_MATCH) {
-        int peer = port_netlobby_peer_fkind();
-        ImGui::Text("Opponent: %s", (peer >= 0 && peer < IM_ARRAYSIZE(kNetplayFighters)) ? kNetplayFighters[peer]
-                                                                                         : "choosing...");
-        int ping = port_netlobby_ping_ms();
-        if (ping >= 0) {
-            ImGui::Text("Ping: %d ms%s", ping, port_netlobby_is_relay() ? " (relayed)" : "");
-        }
+        ssb64::DrawNetplayPlayers();
     }
     if (port_netlobby_is_host() && state == PORT_NETLOBBY_CONNECTED) {
-        ImGui::BeginDisabled(port_netlobby_peer_fkind() < 0);
+        ImGui::BeginDisabled(port_netlobby_can_start() == 0);
         if (UIWidgets::Button("Start match", UIWidgets::ButtonOptions().Color(UIWidgets::Colors::Green))) {
             port_netlobby_start_match();
         }

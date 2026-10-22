@@ -42,14 +42,28 @@ static void port_udp_close_socket(PortSocket s) { close(s); }
 
 namespace {
 
+/* A direct packet this recent keeps a peer on the direct path even if the
+ * other side relays to us (asymmetric NATs); older than this and a relayed
+ * frame from the peer flips us to the relay as well. */
+constexpr unsigned int kDirectFreshMs = 2000;
+
 struct PendingPacket {
     unsigned int release_ms;
+    int peer;
     std::vector<uint8_t> bytes;
 };
 
+struct Peer {
+    sockaddr_in candidates[PORT_UDP_MAX_CANDIDATES];
+    int candidate_count = 0;
+    sockaddr_in chosen;             /* where its datagrams last came from */
+    bool has_chosen = false;
+    bool relay = false;             /* send through the relay hooks */
+    unsigned int last_direct_ms = 0;
+};
+
 PortSocket sSocket = kInvalidSocket;
-sockaddr_in sPeer;
-bool sHasPeer = false;
+Peer sPeers[PORT_UDP_MAX_PEERS];
 
 /* Relay fallback: game packets travel through the lobby server instead of
  * UDP (port/net/netlobby.cpp installs WebSocket send/receive hooks). */
@@ -103,6 +117,11 @@ bool startup(void)
     return true;
 }
 
+bool valid_peer(int peer)
+{
+    return peer >= 0 && peer < PORT_UDP_MAX_PEERS;
+}
+
 /* "host:port" -> sockaddr_in. "*" / "0.0.0.0" -> INADDR_ANY. Hostnames resolve. */
 bool parse_address(const char *spec, sockaddr_in *out)
 {
@@ -143,6 +162,11 @@ bool parse_address(const char *spec, sockaddr_in *out)
     return true;
 }
 
+bool same_endpoint(const sockaddr_in &a, const sockaddr_in &b)
+{
+    return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+}
+
 int raw_send_to(const sockaddr_in &to, const uint8_t *data, int size)
 {
     int sent = sendto(sSocket, reinterpret_cast<const char *>(data), size, 0,
@@ -150,31 +174,79 @@ int raw_send_to(const sockaddr_in &to, const uint8_t *data, int size)
     return (sent == size) ? size : -1;
 }
 
-/* Game traffic to the peer: direct UDP, or through the relay hook. */
-int raw_send(const uint8_t *data, int size)
+/* Game traffic to one peer: direct UDP, or through the relay hook. */
+int raw_send_peer(int peer, const uint8_t *data, int size)
 {
-    if (sRelaySend != nullptr) {
-        return sRelaySend(data, size) ? size : -1;
+    Peer &p = sPeers[peer];
+
+    if (p.relay && sRelaySend != nullptr) {
+        std::vector<uint8_t> frame(static_cast<size_t>(size) + 1);
+        frame[0] = static_cast<uint8_t>(peer);
+        std::memcpy(frame.data() + 1, data, size);
+        return sRelaySend(frame.data(), size + 1) ? size : -1;
     }
-    return raw_send_to(sPeer, data, size);
+    if (p.has_chosen) {
+        return raw_send_to(p.chosen, data, size);
+    }
+    /* Not heard from yet: try every address we know. */
+    int result = -1;
+    for (int i = 0; i < p.candidate_count; i++) {
+        if (raw_send_to(p.candidates[i], data, size) == size) {
+            result = size;
+        }
+    }
+    return result;
 }
 
-bool same_endpoint(const sockaddr_in &a, const sockaddr_in &b)
+int find_peer(const sockaddr_in &from)
 {
-    return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+    for (int i = 0; i < PORT_UDP_MAX_PEERS; i++) {
+        const Peer &p = sPeers[i];
+
+        if (p.has_chosen && same_endpoint(from, p.chosen)) {
+            return i;
+        }
+    }
+    for (int i = 0; i < PORT_UDP_MAX_PEERS; i++) {
+        const Peer &p = sPeers[i];
+
+        for (int c = 0; c < p.candidate_count; c++) {
+            if (same_endpoint(from, p.candidates[c])) {
+                return i;
+            }
+        }
+    }
+    return -1;
 }
 
-/* Receives one datagram. kind: 0 peer/direct, 1 relayed from the peer,
- * 2 anyone else. Returns size, 0 none, -1 error. Relayed packets come
- * first so the relay can't be starved by stray UDP. */
-int raw_recv(void *buffer, int capacity, sockaddr_in *from, int *kind)
+/* Receives one datagram. *peer is the sender (-1 for strangers); *relayed is
+ * set for frames unwrapped from the server relay. Returns size, 0 none, -1
+ * error. Relayed packets come first so the relay can't be starved by stray
+ * UDP. */
+int raw_recv(void *buffer, int capacity, sockaddr_in *from, int *peer, bool *relayed)
 {
+    *relayed = false;
+    *peer = -1;
+    std::memset(from, 0, sizeof(*from));
+
     if (sRelayRecv != nullptr) {
-        int relayed = sRelayRecv(buffer, capacity);
-        if (relayed > 0) {
-            std::memset(from, 0, sizeof(*from));
-            *kind = 1;
-            return relayed;
+        uint8_t frame[2048];
+        int size = sRelayRecv(frame, sizeof(frame));
+
+        if (size > 1 && valid_peer(frame[0]) && size - 1 <= capacity) {
+            Peer &p = sPeers[frame[0]];
+
+            *relayed = true;
+            *peer = frame[0];
+            std::memcpy(buffer, frame + 1, size - 1);
+
+            /* The peer is sending through the relay. Unless a direct packet
+             * arrived from it a moment ago, answer the same way. */
+            if (!p.relay && static_cast<int>(port_udp_now_ms() - p.last_direct_ms) >= static_cast<int>(kDirectFreshMs)) {
+                p.relay = true;
+                port_log("SSB64 UDP: peer %d is using the relay; answering through it\n", frame[0]);
+            }
+            return size - 1;
         }
     }
 #if defined(_WIN32)
@@ -192,9 +264,20 @@ int raw_recv(void *buffer, int capacity, sockaddr_in *from, int *kind)
         int err = port_udp_last_error();
         return port_udp_would_block(err) ? 0 : -1;
     }
-    *kind = (sHasPeer && same_endpoint(*from, sPeer)) ? 0 : 2;
+    *peer = find_peer(*from);
     if (size > capacity) {
         return -1;  /* not one of ours: every protocol datagram fits its caller's buffer */
+    }
+    if (*peer >= 0) {
+        Peer &p = sPeers[*peer];
+
+        p.chosen = *from;
+        p.has_chosen = true;
+        p.last_direct_ms = port_udp_now_ms();
+        if (p.relay) {
+            p.relay = false;
+            port_log("SSB64 UDP: peer %d reachable directly again\n", *peer);
+        }
     }
     std::memcpy(buffer, bytes, size);
     return size;
@@ -204,9 +287,17 @@ void flush_sim_queue(void)
 {
     unsigned int now = port_udp_now_ms();
     while (!sSimQueue.empty() && static_cast<int>(now - sSimQueue.front().release_ms) >= 0) {
-        raw_send(sSimQueue.front().bytes.data(), static_cast<int>(sSimQueue.front().bytes.size()));
+        raw_send_peer(sSimQueue.front().peer, sSimQueue.front().bytes.data(),
+                      static_cast<int>(sSimQueue.front().bytes.size()));
         sSimQueue.pop_front();
     }
+}
+
+void text_of(const sockaddr_in &addr, char *out, int capacity)
+{
+    char ip[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+    std::snprintf(out, capacity, "%s:%u", ip, static_cast<unsigned>(ntohs(addr.sin_port)));
 }
 
 } // namespace
@@ -260,17 +351,6 @@ extern "C" int port_udp_open(const char *bind_spec)
     return 1;
 }
 
-extern "C" int port_udp_set_peer(const char *peer_spec)
-{
-    if (!startup() || !parse_address(peer_spec, &sPeer) || sPeer.sin_addr.s_addr == htonl(INADDR_ANY) || sPeer.sin_port == 0) {
-        port_log("SSB64 UDP: invalid peer address '%s' (expected host:port)\n", peer_spec ? peer_spec : "(null)");
-        sHasPeer = false;
-        return 0;
-    }
-    sHasPeer = true;
-    return 1;
-}
-
 extern "C" void port_udp_close(void)
 {
     if (sSocket != kInvalidSocket) {
@@ -280,7 +360,7 @@ extern "C" void port_udp_close(void)
     sSimQueue.clear();
     sRelaySend = nullptr;
     sRelayRecv = nullptr;
-    sHasPeer = false;
+    port_udp_peers_clear();
 }
 
 extern "C" int port_udp_is_open(void)
@@ -288,9 +368,84 @@ extern "C" int port_udp_is_open(void)
     return sSocket != kInvalidSocket;
 }
 
-extern "C" int port_udp_send(const void *data, int size)
+extern "C" void port_udp_peers_clear(void)
 {
-    if (sSocket == kInvalidSocket || (!sHasPeer && sRelaySend == nullptr) || data == nullptr || size <= 0) {
+    for (int i = 0; i < PORT_UDP_MAX_PEERS; i++) {
+        port_udp_peer_clear(i);
+    }
+}
+
+extern "C" void port_udp_peer_clear(int peer)
+{
+    if (!valid_peer(peer)) {
+        return;
+    }
+    sPeers[peer] = Peer();
+    /* Packets still queued by the simulator for it are moot. */
+    for (auto it = sSimQueue.begin(); it != sSimQueue.end();) {
+        it = (it->peer == peer) ? sSimQueue.erase(it) : it + 1;
+    }
+}
+
+extern "C" int port_udp_peer_add_candidate(int peer, const char *spec)
+{
+    sockaddr_in addr;
+
+    if (!valid_peer(peer) || !startup() || !parse_address(spec, &addr) || addr.sin_addr.s_addr == htonl(INADDR_ANY) ||
+        addr.sin_port == 0) {
+        port_log("SSB64 UDP: invalid peer address '%s' (expected host:port)\n", spec ? spec : "(null)");
+        return 0;
+    }
+    Peer &p = sPeers[peer];
+
+    for (int i = 0; i < p.candidate_count; i++) {
+        if (same_endpoint(p.candidates[i], addr)) {
+            return 1;
+        }
+    }
+    if (p.candidate_count >= PORT_UDP_MAX_CANDIDATES) {
+        return 0;
+    }
+    p.candidates[p.candidate_count++] = addr;
+    return 1;
+}
+
+extern "C" int port_udp_peer_set(int peer, const char *spec)
+{
+    port_udp_peer_clear(peer);
+    return port_udp_peer_add_candidate(peer, spec);
+}
+
+extern "C" int port_udp_peer_has_candidates(int peer)
+{
+    return valid_peer(peer) && sPeers[peer].candidate_count > 0;
+}
+
+extern "C" int port_udp_peer_is_direct(int peer)
+{
+    return valid_peer(peer) && sPeers[peer].has_chosen && !sPeers[peer].relay;
+}
+
+extern "C" void port_udp_peer_set_relay(int peer, int relay)
+{
+    if (valid_peer(peer)) {
+        sPeers[peer].relay = relay != 0;
+    }
+}
+
+extern "C" int port_udp_peer_is_relay(int peer)
+{
+    return valid_peer(peer) && sPeers[peer].relay && sRelaySend != nullptr;
+}
+
+extern "C" int port_udp_peer_send(int peer, const void *data, int size)
+{
+    if (sSocket == kInvalidSocket || !valid_peer(peer) || data == nullptr || size <= 0) {
+        return -1;
+    }
+    Peer &p = sPeers[peer];
+
+    if (p.candidate_count == 0 && !p.has_chosen && !(p.relay && sRelaySend != nullptr)) {
         return -1;
     }
     const uint8_t *bytes = static_cast<const uint8_t *>(data);
@@ -299,10 +454,10 @@ extern "C" int port_udp_send(const void *data, int size)
         return size;
     }
     if (sSimLatencyMs == 0 && sSimJitterMs == 0) {
-        return raw_send(bytes, size);
+        return raw_send_peer(peer, bytes, size);
     }
     unsigned int delay = sSimLatencyMs + ((sSimJitterMs != 0) ? (sSimRng() % (sSimJitterMs + 1)) : 0);
-    PendingPacket packet{ port_udp_now_ms() + delay, std::vector<uint8_t>(bytes, bytes + size) };
+    PendingPacket packet{ port_udp_now_ms() + delay, peer, std::vector<uint8_t>(bytes, bytes + size) };
 
     /* Jitter may reorder packets, exactly like a real network. */
     auto it = sSimQueue.end();
@@ -314,26 +469,67 @@ extern "C" int port_udp_send(const void *data, int size)
     return size;
 }
 
-extern "C" int port_udp_recv(void *buffer, int capacity)
+extern "C" int port_udp_peer_punch(int peer, const void *data, int size)
 {
-    if (sSocket == kInvalidSocket || buffer == nullptr || capacity <= 0) {
+    if (sSocket == kInvalidSocket || !valid_peer(peer) || data == nullptr || size <= 0) {
+        return -1;
+    }
+    const Peer &p = sPeers[peer];
+    int result = -1;
+
+    for (int i = 0; i < p.candidate_count; i++) {
+        if (raw_send_to(p.candidates[i], static_cast<const uint8_t *>(data), size) == size) {
+            result = size;
+        }
+    }
+    return result;
+}
+
+extern "C" int port_udp_recv_peer(void *buffer, int capacity, int *peer)
+{
+    if (sSocket == kInvalidSocket || buffer == nullptr || capacity <= 0 || peer == nullptr) {
         return -1;
     }
     flush_sim_queue();
 
     for (;;) {
         sockaddr_in from;
-        int kind = 2;
-        int size = raw_recv(buffer, capacity, &from, &kind);
+        bool relayed = false;
+        int size = raw_recv(buffer, capacity, &from, peer, &relayed);
 
         if (size <= 0) {
             return size;
         }
-        if (sHasPeer && kind == 2) {
-            continue; /* not our peer (stray lobby/server traffic) */
+        if (*peer >= 0) {
+            return size;
         }
-        return size;
+        /* not one of our peers (stray lobby/server traffic) */
     }
+}
+
+extern "C" int port_udp_recv_any(void *buffer, int capacity, int *peer, char *from_text, int from_capacity)
+{
+    sockaddr_in from;
+    bool relayed = false;
+    int source = -1;
+
+    if (sSocket == kInvalidSocket || buffer == nullptr || capacity <= 0) {
+        return -1;
+    }
+    flush_sim_queue();
+
+    int size = raw_recv(buffer, capacity, &from, &source, &relayed);
+    if (peer != nullptr) {
+        *peer = source;
+    }
+    if (size > 0 && from_text != nullptr && from_capacity > 0) {
+        if (relayed) {
+            std::snprintf(from_text, from_capacity, "relay");
+        } else {
+            text_of(from, from_text, from_capacity);
+        }
+    }
+    return size;
 }
 
 extern "C" int port_udp_send_to(const char *spec, const void *data, int size)
@@ -346,36 +542,18 @@ extern "C" int port_udp_send_to(const char *spec, const void *data, int size)
     return raw_send_to(to, static_cast<const uint8_t *>(data), size);
 }
 
-extern "C" int port_udp_recv_from(void *buffer, int capacity, char *from_text, int from_capacity)
-{
-    sockaddr_in from;
-    int kind = 2;
-
-    if (sSocket == kInvalidSocket || buffer == nullptr || capacity <= 0) {
-        return -1;
-    }
-    flush_sim_queue();
-
-    int size = raw_recv(buffer, capacity, &from, &kind);
-    if (size > 0 && from_text != nullptr && from_capacity > 0) {
-        if (kind == 1) {
-            std::snprintf(from_text, from_capacity, "relay");
-        } else {
-            char ip[INET_ADDRSTRLEN] = "?";
-            inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
-            std::snprintf(from_text, from_capacity, "%s:%u", ip, static_cast<unsigned>(ntohs(from.sin_port)));
-        }
-    }
-    return size;
-}
-
 extern "C" void port_udp_set_relay_hooks(port_udp_relay_send_fn send, port_udp_relay_recv_fn recv)
 {
     sRelaySend = send;
     sRelayRecv = recv;
+    if (send == nullptr) {
+        for (Peer &p : sPeers) {
+            p.relay = false;
+        }
+    }
 }
 
-extern "C" int port_udp_is_relay(void)
+extern "C" int port_udp_has_relay_hooks(void)
 {
     return (sRelaySend != nullptr) ? 1 : 0;
 }
