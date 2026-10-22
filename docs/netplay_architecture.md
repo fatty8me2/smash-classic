@@ -256,14 +256,21 @@ This verifies the input layer can reproduce the same per-tick controller stream 
 
 ## Non-Goals
 
-This module does not yet implement:
+Already implemented on top of this boundary (see `docs/netplay_online.md` for the online flow):
 
-- matchmaking, lobby, ELO, region, or ping selection
-- STUN/TURN, NAT traversal, or relay fallback
-- game-state snapshot/restore
-- framebuffer rollback
-- exhaustive determinism hashing of fighter/world state (only narrow diagnostic hashes ship today via `netsync.c`)
-- wall-clock input scheduling, rollback prediction windows, or resimulation
-- netplay support for 1P Game, Training Mode, Bonus 1 Practice, or Bonus 2 Practice
+- room-code lobby on the Cloudflare Worker (`server/cloudflare`) and the lobby state machine in `port/net/netlobby.cpp`
+- STUN endpoint discovery, UDP hole punching, and WebSocket relay fallback
+- game-state snapshot/restore and resimulation (`decomp/src/sys/netrollback.c`)
+- input delay, input prediction, and misprediction detection
+- desync detection on confirmed ticks (`netsync.c`)
+
+This module still does not implement:
+
+- matchmaking, ELO, region selection, or ping-based pairing (the lobby is room codes only)
+- TURN servers (the relay runs over the Worker's WebSocket, not TURN)
+- framebuffer rollback (render output is never part of rollback state)
+- rollback during the countdown, announcer and sudden-death intros (these run in lockstep and wait for confirmed input; see `docs/rollback_design.md`)
+- netplay for 1P Game, Training Mode, Bonus 1 Practice, or Bonus 2 Practice
+- more than two human players
 
 Those systems should build on top of this input boundary rather than bypassing it.
