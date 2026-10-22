@@ -135,5 +135,25 @@ const code = () => {
   for (const c of [host, join, h2]) c.ws.close();
 }
 
+// ---- hardening: two simultaneous hosts, non-object JSON ----
+{
+  const room = code();
+  const h1 = open(room, "host", 2);
+  const h2 = open(room, "host", 2);
+  await sleep(500);
+  const winners = [h1, h2].filter((h) => h.last("welcome"));
+  check(winners.length === 1, "only one of two simultaneous hosts gets slot 0");
+  const loser = [h1, h2].find((h) => !h.last("welcome"));
+  check(loser?.last("error")?.reason === "room-in-use", "losing host told room-in-use");
+  const host = winners[0];
+  host.ws.send("null");
+  host.ws.send("42");
+  host.send({ type: "endpoint", public: "1.2.3.4:1", local: "10.0.0.1:1" });
+  check(await host.wait(() => host.last("peers")), "host survives non-object JSON");
+  const j = open(room, "join", 2);
+  check(await j.wait(() => j.last("welcome")), "joiner still welcomed");
+  for (const c of [h1, h2, j]) c.ws.close();
+}
+
 console.log(fails ? `${fails} FAILED` : "ALL OK");
 process.exit(fails ? 1 : 0);

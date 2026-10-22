@@ -164,11 +164,17 @@ export class NetplayRoom extends DurableObject {
     if (role === "join" && !this.socketAt(0)) return this.reject("no-such-room");
 
     let slot = 0;
+    let pair = null;
     if (role === "host") {
+      // Claim slot 0 before the first await: a second host arriving while deleteAll is pending
+      // must see it taken (the check above runs synchronously with this claim).
+      pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1], [role, `s${slot}`]);
+      this.addSocket(pair[1], slot);
       // A new host starts a fresh room (relay off).
-      await this.ctx.storage.deleteAll();
       this.relay = false;
       this.legacy = legacy;
+      await this.ctx.storage.deleteAll();
       await this.ctx.storage.put("legacy", legacy);
     } else {
       if (this.legacy !== legacy) {
@@ -182,9 +188,11 @@ export class NetplayRoom extends DurableObject {
       }
       if (slot < 0) return this.reject("room-full");
     }
-    const pair = new WebSocketPair();
-    this.ctx.acceptWebSocket(pair[1], [role, `s${slot}`]);
-    this.addSocket(pair[1], slot);
+    if (!pair) {
+      pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1], [role, `s${slot}`]);
+      this.addSocket(pair[1], slot);
+    }
     pair[1].serializeAttachment({ endpoint: null });
     pair[1].send(JSON.stringify(legacy
       ? { type: "welcome", room, role }
@@ -255,6 +263,7 @@ export class NetplayRoom extends DurableObject {
     } catch {
       return;
     }
+    if (msg === null || typeof msg !== "object") return;
     switch (msg.type) {
       case "endpoint":
         ws.serializeAttachment({
@@ -282,6 +291,7 @@ export class NetplayRoom extends DurableObject {
     } catch {
       // already closed
     }
+    if (slot < 0) return;   // webSocketError then webSocketClose: already handled
     const text = JSON.stringify({ type: "peer_left", slot });
     for (const { slot: other, ws: socket } of this.members()) {
       if (other === slot) continue;

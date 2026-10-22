@@ -58,8 +58,11 @@ constexpr unsigned int kRelayTimeoutMs = 6000;
 constexpr unsigned int kPickMs = 250;
 constexpr unsigned int kStartRetryMs = 100;
 constexpr unsigned int kStartTimeoutMs = 10000;     // host: every GO must arrive within this
-constexpr unsigned int kStartStaleMs = 3000;        // client: no START for this long = the host gave up
-constexpr unsigned int kBeginRepeatMs = 2500;       // host keeps repeating BEGIN this long after starting
+/* A client that misses every BEGIN must still be waiting when the host (already in the match,
+ * barrier closed) keeps repeating it, so the client's stale window is not shorter than the host's
+ * BEGIN repeat window. */
+constexpr unsigned int kBeginRepeatMs = 10000;      // host keeps repeating BEGIN this long after starting
+constexpr unsigned int kStartStaleMs = kBeginRepeatMs; // client: no START for this long = the host gave up
 constexpr unsigned int kPeerTimeoutMs = 10000;
 constexpr int kMaxCodeRetries = 4;
 constexpr int kMaxPlayers = PORT_NETLOBBY_MAX_PLAYERS;
@@ -175,6 +178,16 @@ bool elapsed(unsigned int since, unsigned int ms)
 {
     return static_cast<int>(port_udp_now_ms() - since) >= static_cast<int>(ms);
 }
+
+/* Wire values are untrusted: they index fighter, stage and team-colour tables in the game.
+ * Ranges mirror nFTKindPlayableStart..End, nGRKindBattleStart..End and the 4 costumes. */
+constexpr int kMaxFkind = 11;      // nFTKindNess
+constexpr int kMaxStage = 9;       // nGRKindInishie (last VS stage)
+constexpr int kMaxCostume = 3;
+
+bool valid_fkind(int fkind) { return fkind >= 0 && fkind <= kMaxFkind; }
+bool valid_costume(int costume) { return costume >= 0 && costume <= kMaxCostume; }
+bool valid_stage(int stage) { return stage >= 0 && stage <= kMaxStage; }
 
 bool valid_slot(int slot)
 {
@@ -537,7 +550,7 @@ void handle_start(const std::vector<std::string> &args)
         m.fkind = std::atoi(args[13 + 4 * i].c_str());
         m.costume = std::atoi(args[14 + 4 * i].c_str());
         m.tap_jump_off = std::atoi(args[15 + 4 * i].c_str());
-        if (!valid_slot(m.slot)) {
+        if (!valid_slot(m.slot) || !valid_fkind(m.fkind) || !valid_costume(m.costume)) {
             return;
         }
         members.push_back(m);
@@ -557,6 +570,9 @@ void handle_start(const std::vector<std::string> &args)
     sLobby.items = std::atoi(args[4].c_str());
     sLobby.seed = static_cast<unsigned int>(std::strtoul(args[5].c_str(), nullptr, 10));
     sLobby.delay = std::atoi(args[6].c_str());
+    if (!valid_stage(sLobby.stage) || sLobby.stocks < 1 || sLobby.stocks > 99 || sLobby.delay < 0 || sLobby.delay > 16) {
+        return;
+    }
     for (int i = 0; i < 4; i++) {
         sLobby.pending_rules[i] = std::atoi(args[7 + i].c_str());
     }
@@ -605,7 +621,11 @@ void handle_peer(const std::vector<std::string> &args, int slot)
     if (args[1] == "HELLO") {
         send_peer(slot, "SSBL HELLOACK " + std::to_string(sLobby.my_slot));
     } else if (args[1] == "PICK" && args.size() >= 3) {
-        p.fkind = std::atoi(args[2].c_str());
+        const int fkind = std::atoi(args[2].c_str());
+        if (!valid_fkind(fkind)) {
+            return;
+        }
+        p.fkind = fkind;
         if (args.size() >= 4) {
             send_peer(slot, "SSBL PONG " + args[3]);
         }
@@ -1152,7 +1172,7 @@ extern "C" void port_netlobby_update(void)
 extern "C" void port_netlobby_host(const char *server, int fkind, int stage, int stocks, int items, int delay)
 {
     sLobby.my_fkind = fkind;
-    sLobby.stage = stage;
+    sLobby.stage = valid_stage(stage) ? stage : 0;
     sLobby.stocks = stocks;
     sLobby.items = items;
     sLobby.delay = delay;
@@ -1323,7 +1343,8 @@ extern "C" int port_netlobby_my_fkind(void) { return sLobby.my_fkind; }
 extern "C" int port_netlobby_stage(void) { return sLobby.stage; }
 extern "C" void port_netlobby_set_stage(int stage)
 {
-    if (sLobby.is_host && sLobby.state != PORT_NETLOBBY_IN_MATCH && sLobby.state != PORT_NETLOBBY_STARTING) {
+    if (sLobby.is_host && valid_stage(stage) && sLobby.state != PORT_NETLOBBY_IN_MATCH &&
+        sLobby.state != PORT_NETLOBBY_STARTING) {
         sLobby.stage = stage;
     }
 }
