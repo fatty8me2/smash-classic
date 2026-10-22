@@ -50,6 +50,7 @@ param(
     [int]$MatchMinutes = 0,     # timed match of this many minutes (SSB64_NETPLAY_TEST_MINUTES) so it ends by itself
     [string]$Kill = "",         # "slot@seconds,..." kill that peer's process this long after the last launch (drop-out test)
     [switch]$Suspend,           # with -Kill: freeze the process instead (its lobby socket stays open: only the silence detects it)
+    [int]$ResumeAfter = 0,      # with -Suspend: resume the frozen peer this many seconds later (it must leave the match itself)
     [int]$MinPostDrop = 0,      # with -Kill: every survivor must trace at least this many ticks past the last drop tick
     [string]$OutDir = "$PSScriptRoot\..\build\us\lobby-test"
 )
@@ -137,6 +138,7 @@ foreach ($item in ($Kill -split ',' | Where-Object { $_ })) {
     $killPlan += [pscustomobject]@{ Slot = [int]$parts[0]; At = [int]$parts[1]; Done = $false }
 }
 $killed = @{}
+$resumePlan = @()
 if ($killPlan.Count -gt 0) {
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     while ($clock.Elapsed.TotalSeconds -lt $Seconds) {
@@ -149,11 +151,20 @@ if ($killPlan.Count -gt 0) {
                     if ($Suspend) {
                         Add-Type -Namespace Win32 -Name Nt -MemberDefinition '[DllImport("ntdll.dll")] public static extern int NtSuspendProcess(System.IntPtr h);' -ErrorAction SilentlyContinue
                         [Win32.Nt]::NtSuspendProcess($victim.Handle) | Out-Null
+                        if ($ResumeAfter -gt 0) { $resumePlan += [pscustomobject]@{ Proc = $victim; At = $clock.Elapsed.TotalSeconds + $ResumeAfter } }
                     } else {
                         Stop-Process -Id $victim.Id -Force
                     }
                 }
                 $killed[$names[$k.Slot]] = $true
+            }
+        }
+        foreach ($r in @($resumePlan)) {
+            if ($clock.Elapsed.TotalSeconds -ge $r.At) {
+                Add-Type -Namespace Win32 -Name Nr -MemberDefinition '[DllImport("ntdll.dll")] public static extern int NtResumeProcess(System.IntPtr h);' -ErrorAction SilentlyContinue
+                [Win32.Nr]::NtResumeProcess($r.Proc.Handle) | Out-Null
+                Write-Output ("resumed pid {0}" -f $r.Proc.Id)
+                $resumePlan = @($resumePlan | Where-Object { $_ -ne $r })
             }
         }
         Start-Sleep -Milliseconds 250
@@ -199,6 +210,14 @@ Write-Output (($used | ForEach-Object { "$_ traced=$($traces[$_].Count)" }) -joi
 # diagnostic: `input` folds in predicted frames, so it legitimately differs
 # between peers once a rollback has corrected a misprediction.
 function Gated([string]$line) { ($line -split ' ')[0..8] -join ' ' }
+# A "N missing" line carries no hashes: comparing two of them proves nothing. Never count them as in sync.
+foreach ($f in $used) {
+    $missing = @($traces[$f] | Where-Object { $_ -match ' missing$' }).Count
+    if ($missing -gt 0) {
+        Write-Output "$f has $missing 'missing' trace lines (no hashes were recorded for those ticks): not a valid comparison"
+        exit 2
+    }
+}
 $survivors = @($used | Where-Object { -not $killed.ContainsKey($_) })
 $gone = @($used | Where-Object { $killed.ContainsKey($_) })
 if ($survivors.Count -eq 0) { Write-Output "no survivors"; exit 2 }
@@ -217,6 +236,12 @@ for ($i = 0; $i -lt $n; $i++) {
 }
 foreach ($f in $gone) {
     $m = [Math]::Min($traces[$f].Count, $ref_lines.Count)
+    # A frozen peer that wakes up keeps simulating without knowing it was dropped: only the ticks before its drop tick count.
+    $mine = Select-String -Path "$out\$f.log" -Pattern 'online match local=(\d+)' | Select-Object -First 1
+    if ($mine) {
+        $leave = Select-String -Path "$out\$refName.log" -Pattern ("SSB64 Drop: player {0} leaves the match at tick=(\d+)" -f $mine.Matches[0].Groups[1].Value) | Select-Object -First 1
+        if ($leave) { $m = [Math]::Min($m, [int]$leave.Matches[0].Groups[1].Value) }
+    }
     for ($i = 0; $i -lt $m; $i++) {
         if ((Gated $traces[$f][$i]) -ne (Gated $ref_lines[$i])) {
             Write-Output "DESYNC at line $i (killed $f vs $refName)`n  ${refName}: $($ref_lines[$i])`n  ${f}: $($traces[$f][$i])"

@@ -108,6 +108,7 @@ struct Lobby {
     std::string code;
     std::string status = "Not connected";
     std::string note;                       // transient message that overrides the computed status
+    std::string match_note;                 // why the game ended the match early; shown once it is over
     unsigned int note_ms = 0;
     std::string stun_public = "-";          // our public UDP endpoint from STUN
     bool stun_done = false;
@@ -501,6 +502,7 @@ void enter_match(bool is_host)
     }
     port_netrules_set(sLobby.pending_rules[0], sLobby.pending_rules[1], sLobby.pending_rules[2],
                       sLobby.pending_rules[3], tap_jump);
+    sLobby.match_note.clear();
     set_state(PORT_NETLOBBY_IN_MATCH, "In match");
     syNetPeerStartOnlineMatch(is_host ? 1 : 0, local, n, transports, static_cast<unsigned int>(sLobby.delay),
                               static_cast<unsigned int>(sLobby.stage), static_cast<unsigned int>(sLobby.stocks),
@@ -730,6 +732,11 @@ void handle_peers(const std::string &msg)
     }
     for (int i = 0; i < kMaxPlayers; i++) {
         if (!seen[i] && sLobby.peers[i].present) {
+            if (sLobby.state == PORT_NETLOBBY_IN_MATCH) {
+                /* A roster that merely omits someone is not proof they left (it can be a transient hiccup):
+                 * mid-match only the server's explicit peer_left counts. */
+                continue;
+            }
             peer_gone(i);
         }
     }
@@ -1262,6 +1269,11 @@ extern "C" void port_netlobby_set_fkind(int fkind)
     sLobby.my_fkind = fkind;
 }
 
+extern "C" void port_netlobby_set_match_note(const char *note)
+{
+    sLobby.match_note = note ? note : "";
+}
+
 extern "C" void port_netlobby_on_match_end(void)
 {
     port_netrules_clear();
@@ -1273,6 +1285,10 @@ extern "C" void port_netlobby_on_match_end(void)
         sLobby.match.clear();
         set_state(PORT_NETLOBBY_CONNECTED, "Match over");
         sLobby.after_match = true;
+        if (!sLobby.match_note.empty()) {
+            set_note(sLobby.match_note);
+            sLobby.match_note.clear();
+        }
         refresh_status();
         if (!sLobby.is_host && !sLobby.peers[0].present) {
             /* The host dropped out mid-match: the others finished without it, but nobody is left to start a rematch. */

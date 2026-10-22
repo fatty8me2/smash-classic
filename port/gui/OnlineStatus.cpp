@@ -10,6 +10,7 @@ extern "C" int syNetRollbackIsDesynced(void);
 extern "C" int syNetPeerGetSilentPlayer(unsigned int threshold_ms, unsigned int *out_silent_ms);
 extern "C" int syNetPeerGetDropNotice(unsigned int *out_pending_mask, unsigned int *out_gone_mask, unsigned int *out_age_ms);
 extern "C" int syNetPeerIsSelfDropped(void);
+extern "C" const char *syNetPeerGetAbortReason(void);
 
 namespace ssb64 {
 
@@ -39,7 +40,13 @@ bool DropNotice(unsigned int* pending, unsigned int* gone) {
     unsigned int ageMs = 0;
     *pending = 0;
     *gone = 0;
-    if (port_netlobby_state() != PORT_NETLOBBY_IN_MATCH || syNetPeerGetDropNotice(pending, gone, &ageMs) == 0) {
+    if (port_netlobby_state() != PORT_NETLOBBY_IN_MATCH) {
+        return false;
+    }
+    if (syNetPeerGetAbortReason() != nullptr) {
+        return true;
+    }
+    if (syNetPeerGetDropNotice(pending, gone, &ageMs) == 0) {
         return false;
     }
     return *pending != 0 || syNetPeerIsSelfDropped() != 0 || ageMs < kDropNoticeMs;
@@ -165,9 +172,9 @@ void OnlineStatusWindow::DrawElement() {
     unsigned int dropPending = 0;
     unsigned int dropGone = 0;
     if (DropNotice(&dropPending, &dropGone)) {
-        if (syNetPeerIsSelfDropped() != 0) {
-            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "The other players dropped you from the match.");
-            ImGui::TextWrapped("They stopped hearing from you. Leave the match from the menu and rejoin the room.");
+        if (const char* reason = syNetPeerGetAbortReason()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s.", reason);
+            ImGui::TextWrapped("Leaving the match...");
             return;
         }
         DrawPlayerList(dropPending, "left - the match continues without them...");

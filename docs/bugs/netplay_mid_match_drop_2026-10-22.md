@@ -64,3 +64,15 @@ Regressions: `rollback_synctest.ps1 -Stage 5 -Fighters "9,10,11,0" -Distance 7` 
 - An asymmetric link failure (A cannot hear B, everyone else can) drops B for all, by design; there is no vote.
 - Relay-only survivors lose their path when the host drops (the server closes the room).
 - No host migration: no rematch after the host dropped.
+
+## Review hardening (same day)
+
+- **Only the coordinator decides.** The coordinator is the lowest match slot that is not itself being dropped. DECIDE is believed from that slot or a lower one only; a REPORT can no longer decide (it only records, and carries the tick a survivor already knows so a new coordinator reuses it). Non-coordinators acknowledge (ACK to all) and, while someone has not, tell them the tick they know.
+- **Plausibility.** A DECIDE tick older than the snapshot ring (`now - 7`), further ahead than 600 ticks, or below what we hold of the player is not usable: the match is ended cleanly (menu Reset path, note shown in the lobby: "Lost sync with the other players"). A second, different tick for the same player (CONFLICT) ends the match the same way. A failed rollback while a drop is in progress does too.
+- **Frozen reports.** From the moment a player is suspected, its input at or beyond the frozen report is not taken (`syNetInputSetFreezeTick`), so how far we may simulate stays at report+5; T is the maximum over every REPORT received (also from peers we doubt). The freeze lifts when the tick is agreed, so FORWARDed input below T is accepted.
+- **REQUEST** is served only for a decided drop with `to == drop tick`, and the scan is bounded.
+- **Dropped but alive.** A player told by the coordinator that it was dropped (the notice is repeated for as long as the drop lasts) leaves the match: "You were disconnected from the match".
+- **Lobby.** Mid-match, a roster that merely omits a peer no longer counts as it leaving; only the server's `peer_left` does.
+- **FORWARD** is first-write-wins like normal input packets: a peer that can send a wrong forwarded input can equally send wrong normal input (same trust; peers are not authenticated, see Limitations). Accusations are trusted the same way.
+- **Trace.** Sudden death restarts the rollback session in the middle of a match; the confirmed trace restarted at tick 0 and wrote `N missing` placeholder lines for ticks 0..T-1, which the comparator counted as in sync. The trace now continues at the current tick (`syNetRollbackContinueTraceAt`), and `netplay_lobbytest.ps1` exits 2 if any compared trace contains a `missing` line. (My earlier 8174-tick rematch figure was a match without sudden death and unaffected.)
+- Test knobs: `SSB64_NETPLAY_TEST_FORGE=<slot>` (that peer sends a bogus DECIDE/REQUEST/FORWARD once), `SSB64_NETPLAY_TEST_SUSPECT_DELAY=<slot>:<ms>` (that peer notices drops late), script `-Suspend -ResumeAfter`.
