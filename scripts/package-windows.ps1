@@ -240,9 +240,9 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     Copy-Item (Join-Path $HubBin "RetroHub.exe") $StageDir
     Copy-Item (Join-Path $HubBin "n64run.exe") $StageDir
     Copy-Item (Join-Path $HubBin "retrorun.exe") $StageDir
-    # libretro cores for GBA / GB / GBC (mGBA MPL-2.0, SameBoy MIT, Gambatte GPL-2.0)
+    # libretro cores for GBA / GB / GBC / DS (mGBA MPL-2.0, SameBoy MIT, Gambatte GPL-2.0, melonDS DS GPL-3.0+)
     $CoreSrc = Join-Path $HubRoot "deps\cores"
-    if (-not (Test-Path (Join-Path $CoreSrc "mgba_libretro.dll"))) {
+    if (-not (Test-Path (Join-Path $CoreSrc "mgba_libretro.dll")) -or -not (Test-Path (Join-Path $CoreSrc "melondsds_libretro.dll"))) {
         & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $HubRoot "scripts\fetch-cores.ps1")
     }
     $CoreDst = Join-Path $StageDir "cores"
@@ -287,6 +287,11 @@ emu\ contains unmodified official binaries of:
 
 They are loaded at runtime by n64run.exe through the mupen64plus plugin API.
 The full license text is in mupen64plus-LICENSES.txt.
+
+cores\ contains unmodified libretro cores loaded by retrorun.exe:
+
+  - mGBA (MPL-2.0), SameBoy (MIT), Gambatte (GPL-2.0)
+  - melonDS DS (GPL-3.0-or-later)  source: https://github.com/JesseTG/melonds-ds
 '@ | Set-Content -Path (Join-Path $LicensesDir "emulator-README.txt") -Encoding UTF8
 } else {
     Write-Host "WARNING: ..\RetroHub not found - packaging without RetroHub" -ForegroundColor Yellow
