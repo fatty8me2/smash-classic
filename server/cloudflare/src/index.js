@@ -22,10 +22,11 @@
 //   S->C {type:"error", reason}  then close 4000
 //
 // Binary frames carry relayed game packets. The first byte is the DESTINATION
-// slot when sent and is rewritten to the SOURCE slot on delivery; the rest of
-// the frame is forwarded verbatim. Frames are only forwarded once relaying is
-// on. Game traffic normally goes peer-to-peer over UDP (a full mesh) and
-// never touches the Worker.
+// MASK when sent (bit n = slot n, so one frame can reach several players) and
+// is rewritten to the SOURCE slot on delivery; the rest of the frame is
+// forwarded verbatim. Frames are only forwarded once relaying is on. Game
+// traffic normally goes peer-to-peer over UDP (a full mesh) and never touches
+// the Worker.
 //
 // Legacy (protocol v1, no `v` parameter; older game builds): two players, the
 // "peer" message carries the single opponent's endpoints, and binary frames
@@ -97,13 +98,43 @@ export class NetplayRoom extends DurableObject {
 
   // ---- membership: sockets are tagged ["host"|"join", "s<slot>"] ----
 
+  // Slot lookups sit on the per-packet relay path, so they come from memory;
+  // the cache is rebuilt from the runtime's socket list after a hibernation.
+  loadSockets() {
+    if (this.slots) return;
+    this.slots = [null, null, null, null];
+    this.slotIndex = new Map();
+    for (const ws of this.ctx.getWebSockets()) {
+      const tag = this.ctx.getTags(ws).find((t) => /^s\d$/.test(t));
+      if (!tag) continue;
+      const slot = Number(tag.slice(1));
+      this.slots[slot] = ws;
+      this.slotIndex.set(ws, slot);
+    }
+  }
+
   socketAt(slot) {
-    return this.ctx.getWebSockets(`s${slot}`)[0] || null;
+    this.loadSockets();
+    return this.slots[slot] || null;
   }
 
   slotOf(ws) {
-    const tag = this.ctx.getTags(ws).find((t) => /^s\d$/.test(t));
-    return tag ? Number(tag.slice(1)) : -1;
+    this.loadSockets();
+    const slot = this.slotIndex.get(ws);
+    return slot === undefined ? -1 : slot;
+  }
+
+  addSocket(ws, slot) {
+    this.loadSockets();
+    this.slots[slot] = ws;
+    this.slotIndex.set(ws, slot);
+  }
+
+  removeSocket(ws) {
+    this.loadSockets();
+    const slot = this.slotIndex.get(ws);
+    if (slot !== undefined && this.slots[slot] === ws) this.slots[slot] = null;
+    this.slotIndex.delete(ws);
   }
 
   members() {
@@ -153,6 +184,7 @@ export class NetplayRoom extends DurableObject {
     }
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1], [role, `s${slot}`]);
+    this.addSocket(pair[1], slot);
     pair[1].serializeAttachment({ endpoint: null });
     pair[1].send(JSON.stringify(legacy
       ? { type: "welcome", room, role }
@@ -203,13 +235,16 @@ export class NetplayRoom extends DurableObject {
         return;
       }
       if (message.byteLength < 2) return;
+      // [destination mask][payload]: one frame can fan out to several players
+      // (bit n = slot n); each gets [source slot][payload].
       const bytes = new Uint8Array(message);
-      const dest = bytes[0];
-      if (dest >= MAX_PLAYERS || dest === from) return;
-      const target = this.socketAt(dest);
-      if (!target) return;
+      const mask = bytes[0] & ((1 << MAX_PLAYERS) - 1);
       bytes[0] = from;
-      target.send(bytes);
+      for (let dest = 0; dest < MAX_PLAYERS; dest++) {
+        if (!(mask & (1 << dest)) || dest === from) continue;
+        const target = this.socketAt(dest);
+        if (target) send(target, bytes);
+      }
       return;
     }
     if (message.length > MAX_TEXT_BYTES) return;
@@ -241,6 +276,7 @@ export class NetplayRoom extends DurableObject {
 
   async webSocketClose(ws, code) {
     const slot = this.slotOf(ws);
+    this.removeSocket(ws);
     try {
       ws.close(code === 1005 ? 1000 : code, "closed");
     } catch {

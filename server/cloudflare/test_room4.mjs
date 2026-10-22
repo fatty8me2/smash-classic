@@ -56,21 +56,30 @@ const code = () => {
   p[2].send({ type: "relay" });
   for (let i = 0; i < 4; i++) check(await p[i].wait(() => p[i].last("relaying")), `player ${i} gets relaying`);
 
-  // Per-destination relay: [dest][payload] -> [source][payload].
-  p[1].ws.send(new Uint8Array([3, 0xAA, 0xBB]));
+  // Relay: [destination mask][payload] -> [source][payload].
+  p[1].ws.send(new Uint8Array([1 << 3, 0xAA, 0xBB]));
   check(await p[3].wait(() => p[3].bin.length >= 1), "slot 3 receives slot 1's frame");
   check(p[3].bin[0][0] === 1 && p[3].bin[0][1] === 0xAA && p[3].bin[0][2] === 0xBB, "source byte rewritten to 1, payload intact");
   check(p[0].bin.length === 0 && p[2].bin.length === 0, "other players don't see it");
-  p[1].ws.send(new Uint8Array([1, 7]));        // to itself
-  p[1].ws.send(new Uint8Array([9, 7]));        // invalid destination
+  p[1].ws.send(new Uint8Array([1 << 1, 7]));   // to itself
+  p[1].ws.send(new Uint8Array([0x10, 7]));     // no valid destination
   await sleep(300);
   check(p[1].bin.length === 0, "self/invalid destinations dropped");
+
+  // Multicast: one frame to slots 0, 2 and 3.
+  const before = [p[0].bin.length, p[2].bin.length, p[3].bin.length];
+  p[1].ws.send(new Uint8Array([0b1101, 0x42]));
+  check(await p[0].wait(() => p[0].bin.length === before[0] + 1), "multicast reaches slot 0");
+  check(await p[2].wait(() => p[2].bin.length === before[1] + 1), "multicast reaches slot 2");
+  check(await p[3].wait(() => p[3].bin.length === before[2] + 1), "multicast reaches slot 3");
+  check(p[3].bin.at(-1)[0] === 1 && p[3].bin.at(-1)[1] === 0x42, "multicast carries source slot and payload");
+  p[0].bin.length = 0; p[2].bin.length = 0; p[3].bin.length = 0;
 
   // Ordered delivery both ways, many frames.
   const N = 200;
   for (let i = 0; i < N; i++) {
-    p[0].ws.send(new Uint8Array([2, i & 255, i >> 8]));
-    p[2].ws.send(new Uint8Array([0, i & 255, i >> 8]));
+    p[0].ws.send(new Uint8Array([1 << 2, i & 255, i >> 8]));
+    p[2].ws.send(new Uint8Array([1 << 0, i & 255, i >> 8]));
   }
   check(await p[2].wait(() => p[2].bin.length >= N, 5000), "slot 2 received all of host's frames");
   check(await p[0].wait(() => p[0].bin.length >= N, 5000), "host received all of slot 2's frames");
