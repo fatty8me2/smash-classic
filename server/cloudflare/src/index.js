@@ -3,23 +3,34 @@
 // Each room is a Durable Object keyed by its 6-character code. Players
 // connect over WebSocket:
 //
-//   GET /ws?room=CODE&role=host|join      (WebSocket upgrade)
+//   GET /ws?room=CODE&role=host|join[&v=2]      (WebSocket upgrade)
 //   GET /health
 //
+// Protocol v2 (up to 4 players: the host is slot 0, joiners take slots 1-3)
 // Control messages are JSON text frames:
 //   C->S {type:"endpoint", public:"ip:port", local:"ip:port"}
 //          the client's UDP addresses (public from STUN, LAN from the OS)
-//   S->C {type:"welcome", room, role}
-//   S->C {type:"peer", role, public, local}   once both endpoints are known
-//   C->S {type:"relay"}          direct UDP failed; relay game traffic here
-//   S->C {type:"relaying"}       to both; binary frames are now forwarded
+//   S->C {type:"welcome", room, role, slot, max}
+//   S->C {type:"peers", peers:[{slot, public, local}, ...]}
+//          every member of the room (including the receiver); sent again
+//          whenever someone joins, leaves or reports an endpoint. public and
+//          local are "-" until that member has reported its endpoint.
+//   C->S {type:"relay"}          direct UDP failed for some pair; allow relaying
+//   S->C {type:"relaying"}       to everyone; binary frames are now forwarded
 //   C->S {type:"keepalive"}  ->  S->C {type:"keepalive_ack"}
-//   S->C {type:"peer_left"}
+//   S->C {type:"peer_left", slot}
 //   S->C {type:"error", reason}  then close 4000
 //
-// Binary frames carry relayed game packets and are forwarded verbatim to
-// the other player once relaying is on. Game traffic normally goes
-// peer-to-peer over UDP and never touches the Worker.
+// Binary frames carry relayed game packets. The first byte is the DESTINATION
+// slot when sent and is rewritten to the SOURCE slot on delivery; the rest of
+// the frame is forwarded verbatim. Frames are only forwarded once relaying is
+// on. Game traffic normally goes peer-to-peer over UDP (a full mesh) and
+// never touches the Worker.
+//
+// Legacy (protocol v1, no `v` parameter; older game builds): two players, the
+// "peer" message carries the single opponent's endpoints, and binary frames
+// are forwarded verbatim to the other player. A room is either v1 or v2,
+// decided by its host; the other kind is refused with a readable reason.
 
 import { DurableObject } from "cloudflare:workers";
 import { hubFetch, HubRoom } from "./hub.js";
@@ -31,13 +42,22 @@ export { HubRoom, UserHub, Directory };
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;
 const MAX_BINARY_BYTES = 1024;
+const MAX_PLAYERS = 4;
+
+function send(ws, data) {
+  try {
+    ws.send(data);
+  } catch {
+    // the socket is closing
+  }
+}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
-      return Response.json({ ok: true, service: "smash-netplay" });
+      return Response.json({ ok: true, service: "smash-netplay", netplay: 2, maxPlayers: MAX_PLAYERS });
     }
     if (url.pathname === "/hub") {
       return hubFetch(request, env);
@@ -66,19 +86,33 @@ export class NetplayRoom extends DurableObject {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"keepalive"}', '{"type":"keepalive_ack"}'));
+    // In-memory copies of the room flags (null = not loaded yet, e.g. after hibernation).
+    this.relay = null;
+    this.legacy = null;
+    this.ctx.blockConcurrencyWhile(async () => {
+      this.relay = (await this.ctx.storage.get("relay")) === true;
+      this.legacy = (await this.ctx.storage.get("legacy")) === true;
+    });
   }
 
-  socket(role) {
-    return this.ctx.getWebSockets(role)[0] || null;
+  // ---- membership: sockets are tagged ["host"|"join", "s<slot>"] ----
+
+  socketAt(slot) {
+    return this.ctx.getWebSockets(`s${slot}`)[0] || null;
   }
 
-  other(ws) {
-    const role = this.roleOf(ws);
-    return this.socket(role === "host" ? "join" : "host");
+  slotOf(ws) {
+    const tag = this.ctx.getTags(ws).find((t) => /^s\d$/.test(t));
+    return tag ? Number(tag.slice(1)) : -1;
   }
 
-  roleOf(ws) {
-    return this.ctx.getTags(ws)[0];
+  members() {
+    const list = [];
+    for (let slot = 0; slot < MAX_PLAYERS; slot++) {
+      const ws = this.socketAt(slot);
+      if (ws) list.push({ slot, ws });
+    }
+    return list;
   }
 
   reject(reason) {
@@ -93,28 +127,59 @@ export class NetplayRoom extends DurableObject {
     const url = new URL(request.url);
     const room = url.searchParams.get("room").toUpperCase();
     const role = url.searchParams.get("role");
+    const legacy = Number(url.searchParams.get("v") || 1) < 2;
 
-    if (role === "host" && this.socket("host")) return this.reject("room-in-use");
-    if (role === "join" && !this.socket("host")) return this.reject("no-such-room");
-    if (role === "join" && this.socket("join")) return this.reject("room-full");
+    if (role === "host" && this.socketAt(0)) return this.reject("room-in-use");
+    if (role === "join" && !this.socketAt(0)) return this.reject("no-such-room");
 
+    let slot = 0;
     if (role === "host") {
       // A new host starts a fresh room (relay off).
       await this.ctx.storage.deleteAll();
+      this.relay = false;
+      this.legacy = legacy;
+      await this.ctx.storage.put("legacy", legacy);
+    } else {
+      if (this.legacy !== legacy) {
+        return this.reject(legacy
+          ? "This room needs a newer version of the game (it supports up to 4 players). Update the game and join again."
+          : "This room was hosted with an older version of the game. Ask the host to update, or host the room again.");
+      }
+      slot = -1;
+      for (let s = 1; s < (legacy ? 2 : MAX_PLAYERS); s++) {
+        if (!this.socketAt(s)) { slot = s; break; }
+      }
+      if (slot < 0) return this.reject("room-full");
     }
     const pair = new WebSocketPair();
-    this.ctx.acceptWebSocket(pair[1], [role]);
+    this.ctx.acceptWebSocket(pair[1], [role, `s${slot}`]);
     pair[1].serializeAttachment({ endpoint: null });
-    pair[1].send(JSON.stringify({ type: "welcome", room, role }));
-    this.introduce();
+    pair[1].send(JSON.stringify(legacy
+      ? { type: "welcome", room, role }
+      : { type: "welcome", room, role, slot, max: MAX_PLAYERS }));
+    this.announce();
 
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  // Both players known with endpoints: tell each about the other.
-  introduce() {
-    const host = this.socket("host");
-    const join = this.socket("join");
+  // Tell everyone who is in the room and where to reach them.
+  announce() {
+    if (this.legacy) {
+      this.introduceLegacy();
+      return;
+    }
+    const peers = this.members().map(({ slot, ws }) => {
+      const endpoint = ws.deserializeAttachment()?.endpoint;
+      return { slot, public: endpoint?.public || "-", local: endpoint?.local || "-" };
+    });
+    const text = JSON.stringify({ type: "peers", peers });
+    for (const { ws } of this.members()) send(ws, text);
+  }
+
+  // Legacy: both players known with endpoints: tell each about the other.
+  introduceLegacy() {
+    const host = this.socketAt(0);
+    const join = this.socketAt(1);
     if (!host || !join) return;
     const he = host.deserializeAttachment()?.endpoint;
     const je = join.deserializeAttachment()?.endpoint;
@@ -127,10 +192,24 @@ export class NetplayRoom extends DurableObject {
     if (typeof message !== "string") {
       // Relayed game packet.
       if (message.byteLength > MAX_BINARY_BYTES) return;
-      if (await this.ctx.storage.get("relay")) {
-        const other = this.other(ws);
+      if (this.relay === null) this.relay = (await this.ctx.storage.get("relay")) === true;
+      if (this.legacy === null) this.legacy = (await this.ctx.storage.get("legacy")) === true;
+      if (!this.relay) return;
+
+      const from = this.slotOf(ws);
+      if (this.legacy) {
+        const other = this.socketAt(from === 0 ? 1 : 0);
         if (other) other.send(message);
+        return;
       }
+      if (message.byteLength < 2) return;
+      const bytes = new Uint8Array(message);
+      const dest = bytes[0];
+      if (dest >= MAX_PLAYERS || dest === from) return;
+      const target = this.socketAt(dest);
+      if (!target) return;
+      bytes[0] = from;
+      target.send(bytes);
       return;
     }
     if (message.length > MAX_TEXT_BYTES) return;
@@ -146,12 +225,13 @@ export class NetplayRoom extends DurableObject {
         ws.serializeAttachment({
           endpoint: { public: String(msg.public || "-").slice(0, 64), local: String(msg.local || "-").slice(0, 64) },
         });
-        this.introduce();
+        this.announce();
         break;
       case "relay": {
+        this.relay = true;
         await this.ctx.storage.put("relay", true);
         const text = JSON.stringify({ type: "relaying" });
-        for (const s of this.ctx.getWebSockets()) s.send(text);
+        for (const s of this.ctx.getWebSockets()) send(s, text);
         break;
       }
       default:
@@ -160,16 +240,44 @@ export class NetplayRoom extends DurableObject {
   }
 
   async webSocketClose(ws, code) {
-    const other = this.other(ws);
-    if (other) {
-      other.send(JSON.stringify({ type: "peer_left" }));
-      if (this.roleOf(ws) === "host") other.close(4001, "host-left");
-    }
+    const slot = this.slotOf(ws);
     try {
       ws.close(code === 1005 ? 1000 : code, "closed");
     } catch {
       // already closed
     }
+    const text = JSON.stringify({ type: "peer_left", slot });
+    for (const { slot: other, ws: socket } of this.members()) {
+      if (other === slot) continue;
+      send(socket, text);
+      if (slot === 0) {
+        try {
+          socket.close(4001, "host-left");
+        } catch {
+          // already closed
+        }
+      }
+    }
+    if (slot !== 0) {
+      // Joiner gone: its slot is free again and everyone learns the new roster.
+      // (getWebSockets still lists the closing socket until the handler returns,
+      // so the roster is rebuilt without it.)
+      this.announceWithout(ws);
+    }
+  }
+
+  announceWithout(gone) {
+    if (this.legacy) return;
+    const peers = [];
+    const live = [];
+    for (const { slot, ws } of this.members()) {
+      if (ws === gone) continue;
+      const endpoint = ws.deserializeAttachment()?.endpoint;
+      peers.push({ slot, public: endpoint?.public || "-", local: endpoint?.local || "-" });
+      live.push(ws);
+    }
+    const text = JSON.stringify({ type: "peers", peers });
+    for (const ws of live) send(ws, text);
   }
 
   async webSocketError(ws) {
