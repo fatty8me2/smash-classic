@@ -144,7 +144,7 @@ export class HubRoom extends DurableObject {
 
   async webSocketMessage(ws, message) {
     const me = ws.deserializeAttachment();
-    if (!me || typeof me.slot !== "number") return;
+    if (!me || typeof me.slot !== "number" || me.slot < 0) return;   // departed / being closed
 
     if (typeof message !== "string") {
       // Relayed game packet: byte0 = destination slot.
