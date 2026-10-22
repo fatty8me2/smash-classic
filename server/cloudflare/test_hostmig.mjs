@@ -122,6 +122,25 @@ async function room(n, opts) {
   check(oldJoin.last("peer_left")?.slot === 0, "peer_left sent first");
 }
 
+// ---- a non-migratable host leave must not leave a joinable ghost room (hostSlot null window) ----
+for (let round = 0; round < 5; round++) {
+  const id = code();
+  const h = open(id, "host");
+  await h.wait(() => h.last("welcome"));
+  const oldJoin = open(id, "join", { hm: false });
+  await oldJoin.wait(() => oldJoin.last("welcome"));
+  oldJoin.send({ type: "endpoint", public: "1.1.1.2:1", local: "10.0.0.2:1" });
+  h.send({ type: "endpoint", public: "1.1.1.1:1", local: "10.0.0.1:1" });
+  await sleep(100);
+  h.ws.close();
+  const racer = open(id, "join");          // arrives while the room is closing
+  await sleep(700);
+  check(racer.last("welcome")?.host !== null, `round ${round}: no welcome with host null`);
+  check(racer.closed !== null, `round ${round}: the joiner of a closing room does not stay in it`);
+  const late = open(id, "join");
+  check(await late.wait(() => late.closed) && late.last("error")?.reason === "no-such-room", `round ${round}: room is gone afterwards`);
+}
+
 // ---- legacy v1 room: unchanged ----
 {
   const id = code();

@@ -222,6 +222,7 @@ $traces = @{}
 foreach ($f in $used) {
     $t = "$out\$f.trace"
     if (-not (Test-Path $t)) {
+        if ($HostDie -eq "begin2" -and $f -ne $names[0]) { $killed[$f] = $true }    # the player that missed BEGIN stayed in the lobby
         if ($killed.ContainsKey($f)) { Write-Output "$f left before any match started (no trace)"; $traces[$f] = @(); continue }
         Write-Output "no trace for $f (match did not start)"; exit 2
     }
@@ -323,6 +324,7 @@ if ($Migrate -or $HostDie) {
         if (@(Select-String -Path "$out\$f.log" -Pattern 'is now the host \(that is us\)').Count -gt 0) { $leaders++ }
         Write-Output ("{0}: {1}" -f $f, (($hits | ForEach-Object { $_.Line -replace '^.*SSB64 Lobby: ', '' }) -join "; "))
     }
+    if ($HostDie -eq "begin2" -and (@(Select-String -Path "$out\$($names[1]).log" -Pattern 'is now the host \(that is us\)').Count -gt 0)) { $leaders++ }   # the lobby-only player may be the new host
     if ($leaders -lt 1) { Write-Output "no survivor took over as host"; exit 1 }
 }
 if ($ExpectMatches -gt 0) {

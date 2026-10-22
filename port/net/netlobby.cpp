@@ -160,7 +160,7 @@ std::mt19937 sRng{ std::random_device{}() };
  *   SSB64_LOBBY_FORCE_RELAY=1      skip the direct path (tests the relay)
  *   SSB64_LOBBY_RELAY_PEER=<slot>  skip the direct path to that one lobby slot only
  *   SSB64_LOBBY_MIGRATE_PLAYERS=<n> autostart threshold after this process became host through a host migration
- *   SSB64_LOBBY_TEST_DIE=start|begin  the room's creator kills itself right after its first START / BEGIN (test only)
+ *   SSB64_LOBBY_TEST_DIE=start|begin|begin1|begin2  the room's creator kills itself right after its first START / BEGIN (test only)
  *   SSB64_LOBBY_CODE=<code>        use this room code (RetroHub passes the code its own
  *                                  lobby agreed on); joiners retry until the host's room exists
  * Without SSB64_LOBBY_FKIND/STAGE the player's Netplay menu choices are used. */
@@ -630,8 +630,14 @@ void begin_as_host(void)
     sLobby.begin_until_ms = port_udp_now_ms() + kBeginRepeatMs;
     sLobby.last_begin_ms = port_udp_now_ms();
     const bool partial = test_die_at("begin1");     // test: only the first player hears BEGIN
+    const bool skip_first = test_die_at("begin2");  // test: everyone but the first player hears BEGIN
+    bool first = true;
     for (const Member &m : sLobby.match) {
         if (m.slot != sLobby.my_slot) {
+            if (skip_first && first) {
+                first = false;
+                continue;
+            }
             for (int i = 0; i < 3; i++) {
                 send_peer(m.slot, "SSBL BEGIN " + std::to_string(sLobby.seed));
             }
@@ -640,7 +646,7 @@ void begin_as_host(void)
             }
         }
     }
-    if (test_die_at("begin") || partial) {
+    if (test_die_at("begin") || partial || skip_first) {
         die_now("begin");
     }
     enter_match(true);
@@ -787,6 +793,21 @@ void set_host(int slot)
     }
 }
 
+/* A HELLO from an address we have no candidate for is only accepted when its IP is one the server
+ * announced for that slot (a NAT may remap the port, not the address): a stale packet from the previous
+ * holder of the slot must not become the new player's path. */
+bool same_host_ip(const char *from, const Peer &p)
+{
+    const std::string addr(from);
+    const std::string ip = addr.substr(0, addr.rfind(':'));
+    for (const std::string &known : { p.pub, p.local }) {
+        if (known != "-" && known.substr(0, known.rfind(':')) == ip) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void apply_endpoint(int slot, const std::string &pub, const std::string &local)
 {
     Peer &p = sLobby.peers[slot];
@@ -870,7 +891,11 @@ void handle_server(const std::string &msg)
             const std::string host = json_field(msg, "host");
             sLobby.host_slot = -1;
             sLobby.electing = false;
-            set_host((host.empty() || host == "null") ? 0 : std::atoi(host.c_str()));
+            if (host == "null") {
+                fail("No room with code " + sLobby.code);      // a room without a host is closing
+                return;
+            }
+            set_host(host.empty() ? 0 : std::atoi(host.c_str()));
         }
         port_udp_set_relay_hooks(relay_send, relay_recv);   // sending through it is decided per peer
         if (sLobby.is_host) {
@@ -937,7 +962,7 @@ void receive(void)
                  * it to another port): its slot is in the packet. */
                 int slot = std::atoi(args[2].c_str());
                 if (valid_slot(slot) && slot != sLobby.my_slot && sLobby.peers[slot].present &&
-                    port_udp_peer_add_candidate(slot, from)) {
+                    same_host_ip(from, sLobby.peers[slot]) && port_udp_peer_add_candidate(slot, from)) {
                     peer = slot;
                 }
             }
@@ -1428,6 +1453,11 @@ extern "C" void port_netlobby_on_match_end(void)
             sLobby.match_note.clear();
         }
         refresh_status();
+        if (port_ws_state() == PORT_WS_FAILED) {
+            /* The lobby connection died during the match (this player may be a host the room already replaced). */
+            fail(sLobby.electing ? std::string("The host closed the room") : std::string("Lobby server: ") + port_ws_error());
+            return;
+        }
         /* If the host dropped out mid-match, the server has already promoted the next one (see set_host):
          * whoever leads the room now starts the rematch. */
     }

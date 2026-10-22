@@ -179,6 +179,8 @@ export class NetplayRoom extends DurableObject {
     const occupied = this.members().length > 0;
     if (role === "host" && occupied) return this.reject("room-in-use");
     if (role === "join" && (this.legacy ? !this.socketAt(0) : !occupied)) return this.reject("no-such-room");
+    // A v2 room whose host left without a successor (it is closing) has no host: nobody may join it.
+    if (role === "join" && !this.legacy && this.hostSlot === null) return this.reject("no-such-room");
 
     let slot = 0;
     let pair = null;

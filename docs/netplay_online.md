@@ -115,7 +115,7 @@ All test scripts launch the game with `SSB64_HIDDEN_WINDOW=1` (rendering, but no
 .\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 80 -Kill "2@35" -Suspend         # freeze it instead (only the silence detects it)
 .\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 130 -Kill "0@30" -Migrate -MigratePlayers 2 -Rematches 1 -ExpectMatches 2   # host leaves mid-match, survivors rematch under the new host
 .\scripts\netplay_lobbytest.ps1 -Players 4 -Seconds 90 -Kill "0@8" -StartDelayMs 15000 -Migrate -MigratePlayers 3         # host leaves in the lobby, the new host starts
-.\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 70 -HostDie start -Migrate -MigratePlayers 2                          # host dies right after START (-HostDie begin: right after BEGIN)
+.\scripts\netplay_lobbytest.ps1 -Players 3 -Seconds 70 -HostDie start -Migrate -MigratePlayers 2                          # host dies right after START (-HostDie begin: right after BEGIN; begin1 / begin2: BEGIN reaches only the first / all but the first player)
 .\scripts\netplay_lobbytest.ps1 -Players 4 -Seconds 110 -Kill "0@8" -LateLast 14 -StartDelayMs 20000 -Migrate -MigratePlayers 3   # a new player joins the migrated room (takes slot 0)
 .\scripts\netplay_lobbytest.ps1 -Server wss://smash-netplay.jumpcircuit.workers.dev   # (needs a v2 Worker)
 
