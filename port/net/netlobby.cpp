@@ -621,7 +621,7 @@ void update_auto(void)
     }
     if (sAuto.host && sAuto.rematches_left > 0 && sLobby.after_match && sLobby.state == PORT_NETLOBBY_CONNECTED) {
         if (sAuto.rematch_after_ms == 0) {
-            sAuto.rematch_after_ms = port_udp_now_ms() + 4000;
+            sAuto.rematch_after_ms = port_udp_now_ms() + (env("SSB64_LOBBY_REMATCH_DELAY_MS") ? (unsigned)std::atoi(env("SSB64_LOBBY_REMATCH_DELAY_MS")) : 4000u);
         } else if (elapsed(sAuto.rematch_after_ms, 0)) {
             port_netlobby_start_match();
             sAuto.rematches_left--;

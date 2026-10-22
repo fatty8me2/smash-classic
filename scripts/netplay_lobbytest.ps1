@@ -23,6 +23,7 @@ param(
     [switch]$ForceRelay,
     [string]$BuildDir = "$PSScriptRoot\..\build\us\Release",
     [int]$Rematches = 0,        # host starts this many rematches after the first match
+    [int]$RematchDelayMs = 4000, # delay before each host rematch (SSB64_LOBBY_REMATCH_DELAY_MS)
     [string]$ClientShots = "",  # client SSB64_SCREENSHOT_FRAMES list (saved under the out dir)
     [int]$PreRand = 0,          # client burns this many RNG calls before the battle loads
     [switch]$NoReseed,          # disable the stage-load reseed (to reproduce the bug)
@@ -68,7 +69,7 @@ function Start-Peer([string]$role, [int]$fighter, [int]$fuzz) {
     }
     if ($role -eq 'host') {
         $vars['SSB64_LOBBY_HOST'] = $Server; $vars['SSB64_LOBBY_AUTOSTART'] = '1'
-        if ($Rematches) { $vars['SSB64_LOBBY_AUTOREMATCH'] = "$Rematches" }
+        if ($Rematches) { $vars['SSB64_LOBBY_AUTOREMATCH'] = "$Rematches"; $vars['SSB64_LOBBY_REMATCH_DELAY_MS'] = "$RematchDelayMs" }
     } else {
         $vars['SSB64_LOBBY_JOIN'] = $Server
         if ($AddrJitter) { $vars['SSB64_ADDR_JITTER'] = "$AddrJitter" }
