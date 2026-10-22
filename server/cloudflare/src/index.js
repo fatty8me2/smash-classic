@@ -10,8 +10,9 @@
 // Control messages are JSON text frames:
 //   C->S {type:"endpoint", public:"ip:port", local:"ip:port"}
 //          the client's UDP addresses (public from STUN, LAN from the OS)
-//   S->C {type:"welcome", room, role, slot, max}
-//   S->C {type:"peers", peers:[{slot, public, local}, ...]}
+//   S->C {type:"welcome", room, role, slot, max, host}
+//          host = the slot that currently leads the room (0 until the host leaves)
+//   S->C {type:"peers", host, peers:[{slot, public, local}, ...]}
 //          every member of the room (including the receiver); sent again
 //          whenever someone joins, leaves or reports an endpoint. public and
 //          local are "-" until that member has reported its endpoint.
@@ -19,6 +20,9 @@
 //   S->C {type:"relaying"}       to everyone; binary frames are now forwarded
 //   C->S {type:"keepalive"}  ->  S->C {type:"keepalive_ack"}
 //   S->C {type:"peer_left", slot}
+//   S->C {type:"host", slot, prev}
+//          host migration: the host (prev) left and `slot` leads the room now;
+//          sent after peer_left and before the roster. Slot numbers never change.
 //   S->C {type:"error", reason}  then close 4000
 //
 // Binary frames carry relayed game packets. The first byte is the DESTINATION
@@ -27,6 +31,13 @@
 // forwarded verbatim. Frames are only forwarded once relaying is on. Game
 // traffic normally goes peer-to-peer over UDP (a full mesh) and never touches
 // the Worker.
+//
+// Host migration (v2 rooms whose members all connected with hm=1): when the
+// host's socket closes, the lowest remaining slot is promoted, the room (and
+// its code) stays open, and a joiner may take any free slot, slot 0 included.
+// The room closes when it is empty. If any member did not say hm=1 (an older
+// game that treats slot 0 as the host), the host leaving closes the room as
+// before, so old and new games never disagree about who leads.
 //
 // Legacy (protocol v1, no `v` parameter; older game builds): two players, the
 // "peer" message carries the single opponent's endpoints, and binary frames
@@ -58,7 +69,7 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
-      return Response.json({ ok: true, service: "smash-netplay", netplay: 2, maxPlayers: MAX_PLAYERS });
+      return Response.json({ ok: true, service: "smash-netplay", netplay: 2, maxPlayers: MAX_PLAYERS, hostMigration: 1 });
     }
     if (url.pathname === "/hub") {
       return hubFetch(request, env);
@@ -90,9 +101,12 @@ export class NetplayRoom extends DurableObject {
     // In-memory copies of the room flags (null = not loaded yet, e.g. after hibernation).
     this.relay = null;
     this.legacy = null;
+    this.hostSlot = null;   // slot that leads the room (v2); null = no room
     this.ctx.blockConcurrencyWhile(async () => {
       this.relay = (await this.ctx.storage.get("relay")) === true;
       this.legacy = (await this.ctx.storage.get("legacy")) === true;
+      const host = await this.ctx.storage.get("host");
+      this.hostSlot = Number.isInteger(host) ? host : null;
     });
   }
 
@@ -159,9 +173,14 @@ export class NetplayRoom extends DurableObject {
     const room = url.searchParams.get("room").toUpperCase();
     const role = url.searchParams.get("role");
     const legacy = Number(url.searchParams.get("v") || 1) < 2;
+    const hm = !legacy && url.searchParams.get("hm") === "1";
 
-    if (role === "host" && this.socketAt(0)) return this.reject("room-in-use");
-    if (role === "join" && !this.socketAt(0)) return this.reject("no-such-room");
+    // A room exists while it has members; a v2 room outlives its original host.
+    const occupied = this.members().length > 0;
+    if (role === "host" && occupied) return this.reject("room-in-use");
+    if (role === "join" && (this.legacy ? !this.socketAt(0) : !occupied)) return this.reject("no-such-room");
+    // A v2 room whose host left without a successor (it is closing) has no host: nobody may join it.
+    if (role === "join" && !this.legacy && this.hostSlot === null) return this.reject("no-such-room");
 
     let slot = 0;
     let pair = null;
@@ -169,34 +188,39 @@ export class NetplayRoom extends DurableObject {
       // Claim slot 0 before the first await: a second host arriving while deleteAll is pending
       // must see it taken (the check above runs synchronously with this claim).
       pair = new WebSocketPair();
-      this.ctx.acceptWebSocket(pair[1], [role, `s${slot}`]);
+      this.ctx.acceptWebSocket(pair[1], hm ? [role, `s${slot}`, "hm"] : [role, `s${slot}`]);
       this.addSocket(pair[1], slot);
       // A new host starts a fresh room (relay off).
       this.relay = false;
       this.legacy = legacy;
+      this.hostSlot = legacy ? null : 0;
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.put("legacy", legacy);
+      if (!legacy) await this.ctx.storage.put("host", 0);
     } else {
       if (this.legacy !== legacy) {
         return this.reject(legacy
           ? "This room needs a newer version of the game (it supports up to 4 players). Update the game and join again."
           : "This room was hosted with an older version of the game. Ask the host to update, or host the room again.");
       }
+      if (!legacy && !hm && this.hostSlot !== 0) {
+        return this.reject("This room changed hosts, which this version of the game can't follow. Update the game and join again.");
+      }
       slot = -1;
-      for (let s = 1; s < (legacy ? 2 : MAX_PLAYERS); s++) {
+      for (let s = legacy ? 1 : 0; s < (legacy ? 2 : MAX_PLAYERS); s++) {
         if (!this.socketAt(s)) { slot = s; break; }
       }
       if (slot < 0) return this.reject("room-full");
     }
     if (!pair) {
       pair = new WebSocketPair();
-      this.ctx.acceptWebSocket(pair[1], [role, `s${slot}`]);
+      this.ctx.acceptWebSocket(pair[1], hm ? [role, `s${slot}`, "hm"] : [role, `s${slot}`]);
       this.addSocket(pair[1], slot);
     }
     pair[1].serializeAttachment({ endpoint: null });
     pair[1].send(JSON.stringify(legacy
       ? { type: "welcome", room, role }
-      : { type: "welcome", room, role, slot, max: MAX_PLAYERS }));
+      : { type: "welcome", room, role, slot, max: MAX_PLAYERS, host: this.hostSlot }));
     this.announce();
 
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -212,7 +236,7 @@ export class NetplayRoom extends DurableObject {
       const endpoint = ws.deserializeAttachment()?.endpoint;
       return { slot, public: endpoint?.public || "-", local: endpoint?.local || "-" };
     });
-    const text = JSON.stringify({ type: "peers", peers });
+    const text = JSON.stringify({ type: "peers", host: this.hostSlot, peers });
     for (const { ws } of this.members()) send(ws, text);
   }
 
@@ -292,24 +316,56 @@ export class NetplayRoom extends DurableObject {
       // already closed
     }
     if (slot < 0) return;   // webSocketError then webSocketClose: already handled
-    const text = JSON.stringify({ type: "peer_left", slot });
-    for (const { slot: other, ws: socket } of this.members()) {
-      if (other === slot) continue;
-      send(socket, text);
-      if (slot === 0) {
+    if (this.legacy === null) this.legacy = (await this.ctx.storage.get("legacy")) === true;
+    const left = JSON.stringify({ type: "peer_left", slot });
+    const rest = this.members();
+    const wasHost = this.legacy ? slot === 0 : slot === this.hostSlot;
+
+    if (!wasHost) {
+      // Joiner gone: its slot is free again and everyone learns the new roster.
+      // (getWebSockets still lists the closing socket until the handler returns,
+      // so the roster is rebuilt without it.)
+      for (const { ws: socket } of rest) send(socket, left);
+      this.announceWithout(ws);
+      return;
+    }
+    if (rest.length === 0) {
+      // Empty room: it is gone. (Flags stay until the next host starts a fresh room.)
+      if (!this.legacy) {
+        this.hostSlot = null;
+        await this.ctx.storage.delete("host");
+      }
+      return;
+    }
+    // Host migration needs every remaining game to understand it; otherwise the
+    // room closes with its host, as it always did.
+    const canMigrate = !this.legacy && rest.every(({ ws: socket }) => this.ctx.getTags(socket).includes("hm"));
+    if (!canMigrate) {
+      for (const { ws: socket } of rest) {
+        send(socket, left);
         try {
           socket.close(4001, "host-left");
         } catch {
           // already closed
         }
       }
+      if (!this.legacy) {
+        this.hostSlot = null;
+        await this.ctx.storage.delete("host");
+      }
+      return;
     }
-    if (slot !== 0) {
-      // Joiner gone: its slot is free again and everyone learns the new roster.
-      // (getWebSockets still lists the closing socket until the handler returns,
-      // so the roster is rebuilt without it.)
-      this.announceWithout(ws);
+    // Promote the lowest remaining slot. Every in-memory change happens before the
+    // first await, so a join or a second close arriving meanwhile sees exactly one host.
+    const next = rest[0].slot;
+    this.hostSlot = next;
+    const moved = JSON.stringify({ type: "host", slot: next, prev: slot });
+    for (const { ws: socket } of rest) {
+      send(socket, left);
+      send(socket, moved);
     }
+    this.announce();
+    await this.ctx.storage.put("host", next);
   }
 
   announceWithout(gone) {
@@ -322,7 +378,7 @@ export class NetplayRoom extends DurableObject {
       peers.push({ slot, public: endpoint?.public || "-", local: endpoint?.local || "-" });
       live.push(ws);
     }
-    const text = JSON.stringify({ type: "peers", peers });
+    const text = JSON.stringify({ type: "peers", host: this.hostSlot, peers });
     for (const ws of live) send(ws, text);
   }
 

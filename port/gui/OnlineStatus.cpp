@@ -150,7 +150,8 @@ void OnlineStatusWindow::Draw() {
     unsigned int dropPending = 0;
     unsigned int dropGone = 0;
     const bool wanted = InMatchDesynced() || DropNotice(&dropPending, &dropGone) ||
-                        SilentPlayer(&silentMs) >= 0 || AfterMatch() || HubPreMatch();
+                        SilentPlayer(&silentMs) >= 0 || AfterMatch() || HubPreMatch() ||
+                        port_netlobby_host_notice()[0] != '\0';
     if (wanted != IsVisible()) {
         if (wanted) {
             Show();
@@ -171,6 +172,10 @@ void OnlineStatusWindow::DrawElement() {
     unsigned int silentMs = 0;
     unsigned int dropPending = 0;
     unsigned int dropGone = 0;
+    const char* hostNotice = port_netlobby_host_notice();
+    if (hostNotice[0] != '\0') {
+        ImGui::TextColored(ImVec4(0.45f, 0.85f, 1.0f, 1.0f), "%s.", hostNotice);
+    }
     if (DropNotice(&dropPending, &dropGone)) {
         if (const char* reason = syNetPeerGetAbortReason()) {
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s.", reason);

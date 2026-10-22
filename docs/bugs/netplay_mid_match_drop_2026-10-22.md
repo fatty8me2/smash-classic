@@ -27,7 +27,7 @@ Two drops are two independent agreements (a suspect is not a survivor of the oth
 
 UI: while the survivors are still agreeing, the Online window says `Player N left - the match continues without them...`, then `Player N left the match` for 8 s. A player who was dropped while still alive (a link problem only one survivor saw) gets `The other players dropped you from the match.`.
 
-Lobby: after the match the dropped player is simply absent from the room, so the rest can start a rematch. If the **host** dropped, the room is gone: the server closes the room when slot 0 leaves, so the survivors finish the match but cannot rematch.
+Lobby: after the match the dropped player is simply absent from the room, so the rest can start a rematch. If the **host** dropped, the server promotes the lowest remaining slot (see `netplay_host_migration_2026-10-22.md`) and the new host runs the rematch.
 
 Not changed: `server/cloudflare` (`peer_left` already reaches everyone and is used as the fast signal; v1 rooms are untouched).
 
@@ -62,8 +62,7 @@ Regressions: `rollback_synctest.ps1 -Stage 5 -Fighters "9,10,11,0" -Distance 7` 
 
 - A survivor that is the only holder of the missing part of the subject's input and dies before forwarding it leaves another survivor waiting (rare double fault).
 - An asymmetric link failure (A cannot hear B, everyone else can) drops B for all, by design; there is no vote.
-- Relay-only survivors lose their path when the host drops (the server closes the room).
-- No host migration: no rematch after the host dropped.
+- ~~Relay-only survivors lose their path when the host drops; no rematch after the host dropped~~: fixed by host migration (`netplay_host_migration_2026-10-22.md`).
 
 ## Review hardening (same day)
 
