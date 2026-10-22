@@ -7,6 +7,7 @@
 #include <libultraship/bridge/consolevariablebridge.h>
 
 extern "C" int syNetRollbackIsDesynced(void);
+extern "C" int syNetPeerGetSilentPlayer(unsigned int threshold_ms, unsigned int *out_silent_ms);
 
 namespace ssb64 {
 
@@ -18,6 +19,14 @@ const char* const kStages[] = { "Peach's Castle", "Sector Z", "Kongo Jungle", "P
 
 bool InMatchDesynced() {
     return port_netlobby_state() == PORT_NETLOBBY_IN_MATCH && syNetRollbackIsDesynced() != 0;
+}
+
+/* A player's data stopped arriving: everyone else's game waits for it. */
+int SilentPlayer(unsigned int* silent_ms) {
+    if (port_netlobby_state() != PORT_NETLOBBY_IN_MATCH) {
+        return -1;
+    }
+    return syNetPeerGetSilentPlayer(3000, silent_ms);
 }
 
 bool AfterMatch() {
@@ -106,7 +115,8 @@ void OnlineStatusWindow::UpdateElement() {
 }
 
 void OnlineStatusWindow::Draw() {
-    const bool wanted = InMatchDesynced() || AfterMatch() || HubPreMatch();
+    unsigned int silentMs = 0;
+    const bool wanted = InMatchDesynced() || SilentPlayer(&silentMs) >= 0 || AfterMatch() || HubPreMatch();
     if (wanted != IsVisible()) {
         if (wanted) {
             Show();
@@ -124,6 +134,14 @@ void OnlineStatusWindow::Draw() {
 }
 
 void OnlineStatusWindow::DrawElement() {
+    unsigned int silentMs = 0;
+    const int silent = SilentPlayer(&silentMs);
+    if (silent >= 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "Waiting for Player %d...", silent + 1);
+        ImGui::TextWrapped("No data from them for %u seconds. The match resumes as soon as they are back.",
+                           silentMs / 1000);
+        return;
+    }
     if (InMatchDesynced()) {
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "Out of sync with the other players.");
         ImGui::TextWrapped("Your games no longer match - what you see may differ from what they see. "

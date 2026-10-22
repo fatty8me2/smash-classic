@@ -12,11 +12,18 @@ param(
     [int]$Distance = 1,
     [int]$TimeoutSeconds = 400,
     [string]$BuildDir = "$PSScriptRoot\..\build\us\Release",
-    [int]$ShowLines = 40
+    [int]$ShowLines = 40,
+    [string]$OutDir = "$PSScriptRoot\..\build\us\synctest"
 )
+
+New-Item -ItemType Directory -Force $OutDir | Out-Null
+$out = Resolve-Path $OutDir
 
 $env:SSB64_ROLLBACK_SYNCTEST = "$Distance"
 $env:SSB64_MUTE = '1'
+$env:SSB64_HIDDEN_WINDOW = '1'                      # render, but never show a window
+$env:SSB64_LOG_PATH = "$out\synctest.log"
+$env:SSB64_SAVE_PATH = "$out\synctest.sav"
 $env:SSB64_NO_UPDATE_CHECK = '1'
 $env:SSB64_ROLLBACK_AUTOVS = '1'
 $env:SSB64_RIG_EXIT = '1'
@@ -35,7 +42,7 @@ if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
     $code = $p.ExitCode
 }
 
-$log = Join-Path $env:APPDATA 'BattleShip\ssb64.log'
+$log = $env:SSB64_LOG_PATH
 Select-String -Path $log -Pattern 'SSB64 Rollback' | Select-Object -First $ShowLines | ForEach-Object { $_.Line }
 Select-String -Path $log -Pattern 'SyncTest (PASS|FAIL)' | ForEach-Object { $_.Line }
 if ($code -ne 0 -and $code -ne 1) {

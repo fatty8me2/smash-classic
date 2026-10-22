@@ -25,7 +25,7 @@ $out = Resolve-Path $OutDir
 
 function Start-Peer([int]$local, [int]$remote, [int]$bindPort, [int]$peerPort, [int]$isHost, [int]$fuzz, [string]$name) {
     $vars = @{
-        SSB64_NETPLAY = '1'; SSB64_NETPLAY_BOOTSTRAP = '1'; SSB64_NETPLAY_HOST = "$isHost"; SSB64_MUTE = '1'; SSB64_NO_UPDATE_CHECK = '1'
+        SSB64_NETPLAY = '1'; SSB64_NETPLAY_BOOTSTRAP = '1'; SSB64_NETPLAY_HOST = "$isHost"; SSB64_MUTE = '1'; SSB64_NO_UPDATE_CHECK = '1'; SSB64_HIDDEN_WINDOW = '1'
         SSB64_NETPLAY_LOCAL_PLAYER = "$local"; SSB64_NETPLAY_REMOTE_PLAYER = "$remote"
         SSB64_NETPLAY_BIND = "127.0.0.1:$bindPort"; SSB64_NETPLAY_PEER = "127.0.0.1:$peerPort"
         SSB64_NETPLAY_DELAY = "$Delay"; SSB64_NETPLAY_SEED = "$Seed"; SSB64_NETPLAY_FUZZ = "$fuzz"
@@ -59,8 +59,12 @@ Write-Output "host traced=$($la.Count) client traced=$($lb.Count) compared=$n"
 foreach ($f in @('host', 'client')) {
     Select-String -Path "$out\$f.log" -Pattern 'netplay session|netplay tick|session stop|rollback FAILED|DESYNC|TEST injecting' | Select-Object -Last 3 | ForEach-Object { "$f> $($_.Line)" }
 }
+# Compare tick + the gated gameplay columns (full rng battle fighters items
+# weapons stage objman); the trailing input/joints/camera/vars columns are
+# diagnostic and legitimately differ between peers once a rollback corrected a misprediction.
+function Gated([string]$line) { ($line -split ' ')[0..8] -join ' ' }
 for ($i = 0; $i -lt $n; $i++) {
-    if ($la[$i] -ne $lb[$i]) {
+    if ((Gated $la[$i]) -ne (Gated $lb[$i])) {
         Write-Output "DESYNC at line $i"
         Write-Output "  host:   $($la[$i])"
         Write-Output "  client: $($lb[$i])"

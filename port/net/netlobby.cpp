@@ -140,6 +140,7 @@ std::mt19937 sRng{ std::random_device{}() };
  *   SSB64_LOBBY_JOIN=<server url>  join the code read from SSB64_LOBBY_CODE_FILE
  *   SSB64_LOBBY_FKIND / SSB64_LOBBY_STAGE / SSB64_LOBBY_AUTOSTART=1
  *   SSB64_LOBBY_PLAYERS=<n>        host autostarts once n players (2-4, itself included) are connected
+ *   SSB64_LOBBY_START_DELAY_MS=<ms> wait this long (default 1000) after everyone is connected before starting
  *   SSB64_LOBBY_AUTOREMATCH=<n>   host starts n rematches, each a few seconds after a match ends
  *   SSB64_LOBBY_FORCE_RELAY=1      skip the direct path (tests the relay)
  *   SSB64_LOBBY_RELAY_PEER=<slot>  skip the direct path to that one lobby slot only
@@ -1037,7 +1038,7 @@ void update_auto(void)
     if (sAuto.host && sAuto.autostart && sLobby.state == PORT_NETLOBBY_CONNECTED && !sLobby.after_match &&
         port_netlobby_connected_count() >= sAuto.players && port_netlobby_can_start()) {
         if (sAuto.start_after_ms == 0) {
-            sAuto.start_after_ms = port_udp_now_ms() + 1000;
+            sAuto.start_after_ms = port_udp_now_ms() + (env("SSB64_LOBBY_START_DELAY_MS") ? (unsigned)std::atoi(env("SSB64_LOBBY_START_DELAY_MS")) : 1000u);
         } else if (elapsed(sAuto.start_after_ms, 0)) {
             port_netlobby_start_match();
             sAuto.autostart = false;

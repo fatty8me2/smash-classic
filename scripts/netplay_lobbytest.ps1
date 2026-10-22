@@ -39,6 +39,9 @@ param(
     [int]$AddrJitter = 0,      # last client shifts its heap layout like a different PC would
     [string]$HostDir = "",      # run the host from another install (its own cfg + save)
     [int]$MinTicks = 0,         # fail (exit 2) when fewer ticks than this were compared
+    [int]$StartDelayMs = 0,     # host waits this long after everyone is connected (SSB64_LOBBY_START_DELAY_MS)
+    [switch]$RestartLast,       # kill the last client once everyone is connected and start it again (leave + rejoin before the match)
+    [int]$MatchMinutes = 0,     # timed match of this many minutes (SSB64_NETPLAY_TEST_MINUTES) so it ends by itself
     [string]$OutDir = "$PSScriptRoot\..\build\us\lobby-test"
 )
 
@@ -76,7 +79,9 @@ function Start-Peer([int]$index) {
     $vars = @{
         SSB64_LOBBY_CODE_FILE = "$out\code.txt"; SSB64_LOBBY_FKIND = "$($fighters[$index])"; SSB64_LOBBY_STAGE = "$Stage"
         SSB64_LOBBY_PLAYERS = "$Players"
+        SSB64_LOBBY_START_DELAY_MS = $(if ($RestartLast -and -not $StartDelayMs) { "22000" } elseif ($StartDelayMs) { "$StartDelayMs" } else { "" })
         SSB64_NETPLAY_FUZZ = "$(111 * ($index + 1))"; SSB64_MUTE = '1'; SSB64_NO_UPDATE_CHECK = '1'; SSB64_HIDDEN_WINDOW = '1'
+        SSB64_NETPLAY_TEST_MINUTES = $(if ($MatchMinutes) { "$MatchMinutes" } else { "" })
         SSB64_NETPLAY_SIM_LATENCY_MS = "$LatencyMs"; SSB64_NETPLAY_SIM_JITTER_MS = "$JitterMs"
         SSB64_NETPLAY_SIM_LOSS_PCT = "$LossPct"; SSB64_NETPLAY_SIM_SEED = "$(111 * ($index + 1))"
         SSB64_NETPLAY_CONFIRMED_TRACE = "$out\$role.trace"; SSB64_LOG_PATH = "$out\$role.log"
@@ -117,7 +122,17 @@ for ($i = 1; $i -lt $Players; $i++) {
     $procs += Start-Peer $i
     Start-Sleep -Seconds 1
 }
-Start-Sleep -Seconds $Seconds
+if ($RestartLast -and $Players -ge 3) {
+    Start-Sleep -Seconds 12
+    $last = $procs[$Players - 1]
+    Write-Output "restarting client $($Players - 1) (pid $($last.Id))"
+    Stop-Process -Id $last.Id -Force
+    Start-Sleep -Seconds 3
+    $procs[$Players - 1] = Start-Peer ($Players - 1)
+    Start-Sleep -Seconds ($Seconds - 15)
+} else {
+    Start-Sleep -Seconds $Seconds
+}
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.CloseMainWindow() | Out-Null } }
 Start-Sleep -Seconds 3
 foreach ($p in $procs) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
