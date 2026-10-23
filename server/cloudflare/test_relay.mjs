@@ -4,6 +4,9 @@ const BASE = process.argv[2] || "ws://127.0.0.1:8796";
 let fails = 0;
 const check = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else console.log("ok:  ", m); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Live Workers: ~1 s connects with multi-second spikes -> generous condition waits, longer negative settles.
+const REMOTE = !/^wss?:\/\/(127\.0\.0\.1|localhost)/.test(BASE);
+const settle = (ms) => sleep(REMOTE ? Math.max(ms, 2500) : ms);
 
 function open(room, role) {
   const ws = new WebSocket(`${BASE}/ws?room=${room}&role=${role}`);
@@ -14,9 +17,13 @@ function open(room, role) {
     else c.bin.push(new Uint8Array(e.data));
   };
   ws.onclose = (e) => { c.closed = { code: e.code, reason: e.reason }; };
-  c.send = (o) => ws.send(JSON.stringify(o));
+  c.send = (o) => {
+    const data = JSON.stringify(o);
+    if (ws.readyState === 0) ws.addEventListener("open", () => ws.send(data), { once: true });
+    else ws.send(data);
+  };
   c.last = (type) => [...c.text].reverse().find((m) => m.type === type);
-  c.wait = async (fn, ms = 3000) => {
+  c.wait = async (fn, ms = 20000) => {
     const t0 = Date.now();
     while (Date.now() - t0 < ms) { if (fn()) return true; await sleep(20); }
     return false;
@@ -37,7 +44,7 @@ check(await join.wait(() => join.last("welcome")), "join welcome");
 
 // Before relay is on, binary frames are dropped.
 host.ws.send(new Uint8Array([9, 9, 9]));
-await sleep(300);
+await settle(300);
 check(join.bin.length === 0, "binary dropped before relay flag set");
 
 // Endpoint introduction.
@@ -57,8 +64,8 @@ for (let i = 0; i < N; i++) {
   host.ws.send(new Uint8Array([1, i & 255, i >> 8]));
   join.ws.send(new Uint8Array([2, i & 255, i >> 8]));
 }
-check(await join.wait(() => join.bin.length >= N, 5000), "join received all host packets");
-check(await host.wait(() => host.bin.length >= N, 5000), "host received all join packets");
+check(await join.wait(() => join.bin.length >= N, 20000), "join received all host packets");
+check(await host.wait(() => host.bin.length >= N, 20000), "host received all join packets");
 const ordered = (c, tag) => c.bin.every((b, i) => b[0] === tag && (b[1] | (b[2] << 8)) === i);
 check(ordered(join, 1), "host->join packets in order");
 check(ordered(host, 2), "join->host packets in order");
@@ -83,7 +90,7 @@ check(await host2.wait(() => host2.last("welcome")), "new host welcome");
 const join2 = open(room, "join");
 check(await join2.wait(() => join2.last("welcome")), "new join welcome");
 host2.ws.send(new Uint8Array([3]));
-await sleep(300);
+await settle(300);
 check(join2.bin.length === 0, "relay flag cleared by new host");
 host2.send({ type: "relay" });
 check(await join2.wait(() => join2.last("relaying")), "relay re-enabled");

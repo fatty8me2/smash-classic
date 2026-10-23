@@ -29,11 +29,14 @@ async function newAccount() {
   return { uid, secret };
 }
 
+// Local dev only: Cloudflare's edge rejects requests with a spoofed CF-Connecting-IP (error 1000), and
+// the live Worker has no short TTL / low redeem limit, so those two checks are skipped when remote.
+const LOCAL = /^https?:\/\/(127\.0\.0\.1|localhost)/.test(BASE);
 const ip = () => rnd(12, "0123456789abcdef");   // fresh per-test client IP for redeem limits
 async function post(path, body, headers = {}) {
   const res = await fetch(BASE + path, {
     method: "POST",
-    headers: { "content-type": "application/json", "cf-connecting-ip": ip(), ...headers },
+    headers: { "content-type": "application/json", ...(LOCAL ? { "cf-connecting-ip": ip() } : {}), ...(LOCAL ? headers : {}) },
     body: JSON.stringify(body),
   });
   let data = null;
@@ -87,11 +90,13 @@ const again = await post("/link/put", { uid: acct.uid, secret: acct.secret, code
 check("second put refused (already)", again.status === 409);
 
 // ---- expiry (LINK_TTL_SECONDS=3 in dev) ----------------------------------
+if (LOCAL) {
 const exp = await post("/link/create", { uid: acct.uid, secret: acct.secret });
 await post("/link/put", { uid: acct.uid, secret: acct.secret, code: exp.data.code, ...bundle() });
 await new Promise((r) => setTimeout(r, 4000));
 const er = await post("/link/redeem", { code: exp.data.code });
 check("expired code refused", er.status === 404 && er.data?.error === "invalid", `status=${er.status}`);
+}
 
 // ---- rate limits ----------------------------------------------------------
 const rlAcct = await newAccount();
@@ -102,6 +107,7 @@ for (let i = 0; i < 6; i++) {
 }
 check("create rate-limited per account (6th refused)", rl === 1, `429s=${rl}`);
 
+if (LOCAL) {
 const ipHdr = ip();
 let redeemRl = 0;
 for (let i = 0; i < 7; i++) {
@@ -109,6 +115,7 @@ for (let i = 0; i < 7; i++) {
   if (r.status === 429) redeemRl++;
 }
 check("redeem rate-limited per IP", redeemRl >= 1, `429s=${redeemRl}`);
+}
 
 console.log(failures ? `${failures} FAILED` : "ALL PASSED");
 process.exit(failures ? 1 : 0);
