@@ -327,9 +327,31 @@ export class UserHub extends DurableObject {
   }
 
   addFriendRow(uid, name, status) {
+    // A person is either a friend or a pending request, never both.
+    this.run("DELETE FROM requests WHERE uid=?", uid);
     this.run("INSERT OR REPLACE INTO friends (uid, code, name, status, since) VALUES (?, ?, ?, ?, ?)",
       uid, codeOf(uid), cleanName(name) || "player", JSON.stringify(status || offlineStatus()), now());
     return this.friendObj(this.one("SELECT * FROM friends WHERE uid=?", uid));
+  }
+
+  /* Idempotent clean-up of rows that violate "one entry per person" (older versions or races left some):
+   * malformed/self friend rows, a request for someone who is already a friend, a person with both an incoming
+   * and an outgoing request (keep the incoming one so it can be accepted), friends/requests of blocked users. */
+  dedupeRows() {
+    const p = this.profile();
+    for (const r of this.all("SELECT uid FROM friends")) {
+      if (!UID_RE.test(r.uid) || r.uid === p.uid) this.run("DELETE FROM friends WHERE uid=?", r.uid);
+    }
+    this.run("DELETE FROM requests WHERE uid=?", p.uid);
+    this.run("DELETE FROM friends WHERE uid IN (SELECT uid FROM blocked)");
+    this.run("DELETE FROM requests WHERE uid IN (SELECT uid FROM blocked)");
+    this.run("DELETE FROM requests WHERE uid IN (SELECT uid FROM friends)");
+    this.run("DELETE FROM requests WHERE dir='out' AND uid IN (SELECT uid FROM requests WHERE dir='in')");
+  }
+
+  retiredTo() {
+    const r = this.one("SELECT v FROM kv WHERE k='retired'");
+    return r ? r.v : null;
   }
 
   saveHistory(peer, msg) {
@@ -366,7 +388,64 @@ export class UserHub extends DurableObject {
     if (!p) return { r: "none" };
     if (!b || !UID_RE.test(b.uid || "")) return { r: "none" };
     const from = b.uid;
+    if (this.retiredTo() && route !== "retire_begin" && route !== "link_auth") return { r: "none" };
     switch (route) {
+      case "retire_begin": {
+        // Called by the successor identity's hub with this (old) account's secret: hand over everything
+        // and become inert. Idempotent for the same successor.
+        if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
+        const to = this.retiredTo();
+        if (to && to !== from) return { r: "gone" };
+        if (from === p.uid) return { r: "none" };
+        const friends = this.all("SELECT uid, name, status FROM friends").map((f) => ({ uid: f.uid, name: f.name, status: JSON.parse(f.status) }));
+        const reqs = this.all("SELECT uid, dir, name FROM requests");
+        const blocked = this.all("SELECT uid FROM blocked").map((x) => x.uid);
+        this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('retired', ?)", from);
+        this.run("DELETE FROM friends");
+        this.run("DELETE FROM requests");
+        for (const ws of this.ctx.getWebSockets()) { try { ws.close(4005, "retired"); } catch { /* closed */ } }
+        try {
+          const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+          await dir.fetch("https://directory/online", {
+            method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+            body: JSON.stringify({ uid: p.uid, on: false }),
+          });
+        } catch { /* lease expires on its own */ }
+        return { r: "ok", old: p.uid, friends, requests: reqs, blocked };
+      }
+      case "replace_uid": {
+        // A friend's account `from` was retired in favour of b.to: swap them in our lists (no duplicates).
+        const to = String(b.to || "");
+        if (!UID_RE.test(to) || to === p.uid || to === from) return { r: "none" };
+        const name = cleanName(b.name) || "player";
+        const had = this.isFriend(from);
+        const reqOut = !!this.one("SELECT 1 FROM requests WHERE uid=? AND dir='out'", from); // we asked the old uid
+        const reqIn = !!this.one("SELECT 1 FROM requests WHERE uid=? AND dir='in'", from);   // the old uid asked us
+        this.run("DELETE FROM friends WHERE uid=?", from);
+        this.run("DELETE FROM requests WHERE uid=?", from);
+        if (had) this.push({ type: "friend_removed", uid: from });
+        if (reqOut) this.push({ type: "request_update", uid: from, result: "cancelled" });
+        if (reqIn) this.push({ type: "request_update", uid: from, result: "cancelled" });
+        let linked = this.isFriend(to);
+        if (this.isBlocked(to)) return { r: "ok", linked: false };
+        if (!linked && had && this.count("friends") < this.friendCap(p)) {
+          const f = this.addFriendRow(to, name, sanitizeStatus(b.status));
+          this.push({ type: "friend_added", friend: f });
+          linked = true;
+        }
+        let req = null;
+        if (!linked && (reqOut || reqIn)) {
+          const dirn = reqOut ? "out" : "in";
+          const code = codeOf(to);
+          const at = now();
+          if (!this.one("SELECT 1 FROM requests WHERE uid=?", to)) {
+            this.run("INSERT OR REPLACE INTO requests (uid, dir, code, name, at) VALUES (?, ?, ?, ?, ?)", to, dirn, code, name, at);
+            this.push({ type: "request", req: { uid: to, code, name, at }, dir: dirn });
+          }
+          req = reqOut ? "out" : "in";
+        }
+        return { r: "ok", linked, req };
+      }
       case "link_auth": {
         // Secret check for /link/* (see link.js). Optionally rate-limits link-code creation.
         if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
@@ -391,7 +470,12 @@ export class UserHub extends DurableObject {
       case "request": {
         const name = cleanName(b.name) || "player";
         if (this.isBlocked(from)) return { r: "ok", name: "player", code: p.code };
-        if (this.isFriend(from)) return { r: "already" };
+        if (this.isFriend(from)) {
+          // They no longer have us (a removal never reached them) but we still list them: finish the link
+          // instead of leaving a one-sided ghost entry.
+          this.run("DELETE FROM requests WHERE uid=?", from);
+          return { r: "accepted", friend: this.me() };
+        }
         if (this.one("SELECT 1 FROM requests WHERE uid=? AND dir='out'", from)) {
           if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
@@ -411,7 +495,8 @@ export class UserHub extends DurableObject {
       case "request_update": {
         const result = b.result;
         if (result === "accepted") {
-          if (!this.one("SELECT 1 FROM requests WHERE uid=? AND dir='out'", from) || this.isBlocked(from)) return { r: "none" };
+          // Normally they accept our outgoing request; with crossed requests (both asked at once) an incoming one counts too.
+          if (!this.one("SELECT 1 FROM requests WHERE uid=?", from) || this.isBlocked(from)) return { r: "none" };
           if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
           const f = this.addFriendRow(from, b.name, sanitizeStatus(b.status));
@@ -534,6 +619,10 @@ export class UserHub extends DurableObject {
       ws.close(4003, "bad-secret");
       return;
     }
+    if (this.retiredTo()) {
+      ws.close(4005, "retired");
+      return;
+    }
     let renamed = false;
     if (p.name !== name) {
       this.run("UPDATE profile SET name=? WHERE id=1", name);
@@ -550,6 +639,7 @@ export class UserHub extends DurableObject {
     }
 
     this.run("DELETE FROM inbox WHERE at < ?", now() - INBOX_TTL);
+    this.dedupeRows();
     const friends = this.all("SELECT * FROM friends ORDER BY name").map((r) => this.friendObj(r));
     const reqs = this.all("SELECT uid, dir, code, name, at FROM requests ORDER BY at");
     const strip = ({ uid: u, code, name: n, at }) => ({ uid: u, code, name: n, at });
@@ -586,6 +676,58 @@ export class UserHub extends DurableObject {
         await this.broadcastPresence(true);
         break;
       }
+      case "retire_old": {
+        // This account replaced another one (adopted an older identity / linked a new PC). Prove ownership
+        // of the old account with its secret; its friendships move here and it stops existing as a person.
+        const old = uidArg(msg.uid);
+        if (!old || old === p.uid || typeof msg.secret !== "string") return this.err(ws, "bad-request", type);
+        if (!this.hit("retire", 10, 3600 * 1000)) return this.err(ws, "rate-limited", type);
+        const r = await this.call(old, "retire_begin", { uid: p.uid, secret: msg.secret });
+        if (r.r === "bad-secret" || r.r === "gone" || r.r === "none") {
+          if (r.r === "bad-secret") return this.err(ws, "bad-request", type, "bad-secret");
+          ws.send(JSON.stringify({ type: "retired", uid: old })); // nothing (more) to move
+          return;
+        }
+        if (r.r !== "ok") return this.err(ws, "bad-request", type, "retire-failed");
+        for (const u of r.blocked || []) {
+          if (UID_RE.test(u) && u !== p.uid && !this.isBlocked(u) && this.count("blocked") < MAX_BLOCKED) {
+            this.run("INSERT OR IGNORE INTO blocked (uid, at) VALUES (?, ?)", u, now());
+            this.run("DELETE FROM friends WHERE uid=?", u);
+            this.run("DELETE FROM requests WHERE uid=?", u);
+            this.push({ type: "block_update", uid: u, blocked: true });
+          }
+        }
+        const status = this.me().status;
+        const seen = new Set();
+        const people = [...(r.friends || []).map((f) => ({ uid: f.uid, name: f.name })),
+                        ...(r.requests || []).map((q) => ({ uid: q.uid, name: q.name }))];
+        for (const f of people) {
+          if (!UID_RE.test(f.uid) || f.uid === p.uid || f.uid === old || seen.has(f.uid)) continue;
+          seen.add(f.uid);
+          if (this.isBlocked(f.uid)) continue;
+          let pr;
+          try { pr = await this.call(f.uid, "replace_uid", { uid: old, to: p.uid, name: p.name, status }); } catch { continue; }
+          if (!pr || pr.r !== "ok") continue;
+          if (pr.linked) {
+            if (!this.isFriend(f.uid) && this.count("friends") < this.friendCap(p)) {
+              const row = this.addFriendRow(f.uid, f.name, null);
+              this.push({ type: "friend_added", friend: row });
+            }
+          } else if ((pr.req === "out" || pr.req === "in") && !this.isFriend(f.uid)) {
+            // mirror image of the peer's request
+            const dirn = pr.req === "out" ? "in" : "out";
+            if (!this.one("SELECT 1 FROM requests WHERE uid=?", f.uid)) {
+              const q = { uid: f.uid, code: codeOf(f.uid), name: cleanName(f.name) || "player", at: now() };
+              this.run("INSERT OR REPLACE INTO requests (uid, dir, code, name, at) VALUES (?, ?, ?, ?, ?)", f.uid, dirn, q.code, q.name, q.at);
+              this.push({ type: "request", req: q, dir: dirn });
+            }
+          }
+        }
+        this.dedupeRows();
+        this.push({ type: "retired", uid: old });
+        await this.broadcastPresence(true);
+        break;
+      }
       case "add_friend": {
         if (typeof msg.code !== "string") return this.err(ws, "bad-request", type);
         if (!this.hit("add", 30, 3600 * 1000)) return this.err(ws, "rate-limited", type);
@@ -609,8 +751,14 @@ export class UserHub extends DurableObject {
         if (this.count("friends") >= this.friendCap(p)) return this.err(ws, "bad-request", type, "friends-full");
         const me = this.me();
         const r = await this.call(target, "request", { uid: p.uid, code: p.code, name: p.name, status: me.status, at: now() });
-        if (r.r === "ok") {
+        if (r.r === "ok" && this.isFriend(target)) {
+          // the friendship completed while the request was in flight (crossed requests): nothing to record
+        } else if (r.r === "ok") {
           const req = { uid: target, code: codeOf(target), name: cleanName(r.name) || "player", at: now() };
+          if (this.one("SELECT 1 FROM requests WHERE uid=? AND dir='in'", target)) {
+            // They asked us at the very same moment: one friendship, not two crossed requests.
+            return this.acceptFlow(ws, target);
+          }
           this.run("INSERT OR REPLACE INTO requests (uid, dir, code, name, at) VALUES (?, 'out', ?, ?, ?)", target, req.code, req.name, req.at);
           this.push({ type: "request", req, dir: "out" });
         } else if (r.r === "accepted") {
