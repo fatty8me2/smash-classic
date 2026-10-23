@@ -1,4 +1,5 @@
 // Node 24 test for the Smash /ws relay. Usage: node test_relay.mjs [ws://127.0.0.1:8796]
+// Run: npx wrangler dev --port 8796   (in another shell), then: node test_relay.mjs ws://127.0.0.1:8796
 const BASE = process.argv[2] || "ws://127.0.0.1:8796";
 let fails = 0;
 const check = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else console.log("ok:  ", m); };

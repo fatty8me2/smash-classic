@@ -1,4 +1,5 @@
 // Node test for host migration in the /ws room (protocol v2, hm=1) and the cases where it must not happen.
+// Run: npx wrangler dev --port 8799   (in another shell), then: node test_hostmig.mjs ws://127.0.0.1:8799
 // Usage: node test_hostmig.mjs [ws://127.0.0.1:8799] [--no-hibernate]   (against `wrangler dev`)
 const BASE = process.argv.find((a) => /^wss?:\/\//.test(a)) || "ws://127.0.0.1:8799";
 const SKIP_HIBERNATE = process.argv.includes("--no-hibernate");

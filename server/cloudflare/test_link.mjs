@@ -1,9 +1,9 @@
 // Link-a-new-PC tests. Run against a local worker:
-//   npx wrangler dev --port 8798 --var LINK_TTL_SECONDS:3 --var LINK_REDEEM_LIMIT:5
-//   node test_link.mjs [http://127.0.0.1:8798]
+//   npx wrangler dev        (plain; picks up the tracked .dev.vars: LINK_TTL_SECONDS=3, LINK_REDEEM_LIMIT=5)
+//   node test_link.mjs [http://127.0.0.1:8787]   (8787 is the wrangler dev default port)
 // Uses Node's global WebSocket to create the account (hello), then the /link/* routes.
 
-const BASE = process.argv[2] || "http://127.0.0.1:8798";
+const BASE = process.argv[2] || "http://127.0.0.1:8787";
 const WS = BASE.replace(/^http/, "ws");
 const B32 = "abcdefghijklmnopqrstuvwxyz234567";
 const rnd = (n, alpha) => Array.from({ length: n }, () => alpha[Math.floor(Math.random() * alpha.length)]).join("");

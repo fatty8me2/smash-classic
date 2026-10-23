@@ -1,4 +1,5 @@
 // Tests for GET /j/<CODE> invite pages. Usage:
+// Run: npx wrangler dev --port 8801   (in another shell), then: node test_invite.mjs http://127.0.0.1:8801
 //   node test_invite.mjs [http://127.0.0.1:8801]   (against a running wrangler dev)
 //   node test_invite.mjs --unit                    (pure validator/page tests only)
 import { isValidInviteCode, normalizeInviteCode, invitePage } from "./src/invite.js";
