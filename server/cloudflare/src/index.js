@@ -49,8 +49,9 @@ import { hubFetch, HubRoom } from "./hub.js";
 
 import { friendsFetch, UserHub, Directory } from "./friends.js";
 import { inviteFetch } from "./invite.js";
+import { linkFetch, LinkBox } from "./link.js";
 
-export { HubRoom, UserHub, Directory };
+export { HubRoom, UserHub, Directory, LinkBox };
 
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;
@@ -80,6 +81,9 @@ export default {
     }
     if (url.pathname === "/friends") {
       return friendsFetch(request, env);
+    }
+    if (url.pathname.startsWith("/link/")) {
+      return linkFetch(request, env);
     }
     if (url.pathname !== "/ws") {
       return new Response("not found", { status: 404 });

@@ -297,6 +297,12 @@ export class UserHub extends DurableObject {
     if (!b || !UID_RE.test(b.uid || "")) return { r: "none" };
     const from = b.uid;
     switch (route) {
+      case "link_auth": {
+        // Secret check for /link/* (see link.js). Optionally rate-limits link-code creation.
+        if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
+        if (b.count && !this.hit(`link:${from}`, 5, 60 * 60 * 1000)) return { r: "rate" };
+        return { r: "ok" };
+      }
       case "presence": {
         if (!this.isFriend(from)) return { r: "none" };
         const st = sanitizeStatus(b.status) || offlineStatus();
