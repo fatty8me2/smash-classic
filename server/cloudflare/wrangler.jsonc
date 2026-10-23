@@ -22,7 +22,7 @@
   // Optional cloud saves (src/saves.js). Without this binding every /saves route answers 503 and nothing else
   // changes. Enable it ONLY after R2 is turned on for the account and the bucket exists, otherwise `wrangler
   // deploy` fails. Steps: see docs/CLOUD_SAVES.md in RetroHub. Then uncomment:
-  // "r2_buckets": [{ "binding": "SAVES", "bucket_name": "retrohub-saves" }],
+  "r2_buckets": [{ "binding": "SAVES", "bucket_name": "retrohub-saves" }],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["NetplayRoom"] },
     { "tag": "v2", "new_sqlite_classes": ["HubRoom"] },
