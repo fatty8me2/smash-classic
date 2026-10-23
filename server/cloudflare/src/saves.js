@@ -94,6 +94,7 @@ async function budget(env, body) {
     return await r.json();
   } catch (e) { throw new BudgetDown(String(e)); }
 }
+const busyToday = () => err(429, "cloud-saves-busy-today", { retryAfter: 3600 });
 const paused = () => err(429, "cloud-saves-paused", { retryAfter: 3600 });
 const full = () => err(507, "cloud-saves-full");
 
@@ -138,6 +139,7 @@ async function savesInner(request, env) {
     const g = await budget(env, { op: "get", rkey });            // reserves one Class B op
     if (g.r === "none") return err(404, "not-found");
     if (g.r === "paused") return paused();
+    if (g.r === "busytoday") return busyToday();
     const off = range ? Number(range[1]) : 0;
     if (off >= g.size && g.size > 0) return err(416, "bad-range");
     const obj = off ? await env.SAVES.get(rkey, { range: { offset: off }, onlyIf: { etagMatches: g.rawEtag } })
@@ -159,6 +161,8 @@ async function savesInner(request, env) {
   if (method === "DELETE") {     // free R2 op and frees budgeted storage: allowed even when the budget is exhausted
     const d = await budget(env, { op: "del_check", rkey, ifMatch: request.headers.get("If-Match") });
     if (d.r === "none") return json({ ok: true, deleted: false });
+    if (d.r === "busy") return err(409, "busy", { retryAfter: 5 });
+    if (d.r === "busytoday") return busyToday();
     if (d.r === "conflict") return err(412, "conflict", { current: d.current });
     await env.SAVES.delete(rkey);
     await budget(env, { op: "del_commit", rkey });
@@ -185,6 +189,7 @@ async function savesInner(request, env) {
     case "quota": return err(507, "quota-exceeded", { used: b.used, quota: b.quota });
     case "full": return full();
     case "paused": return paused();
+    case "busytoday": return busyToday();
     case "ok": break;
     default: return paused();
   }
@@ -192,6 +197,8 @@ async function savesInner(request, env) {
   // The body must be exactly Content-Length bytes and hash to X-RH-Sha (enforced while streaming), so a bad upload
   // fails before anything is committed and the previous version is never touched. The conditional put makes R2
   // itself reject a lost race (replace: etag must match; create: object must not exist).
+  const tok = b.tok;
+  const abort = (unknown) => budget(env, { op: "put_abort", rkey, tok, unknown }).catch(() => {});
   let put;
   try {
     const body = len === 0 || !request.body ? new Uint8Array(0) : request.body.pipeThrough(new FixedLengthStream(len));
@@ -201,11 +208,18 @@ async function savesInner(request, env) {
       onlyIf: b.etag ? { etagMatches: b.etag } : { etagDoesNotMatch: "*" },
     });
   } catch (e) {
-    await budget(env, { op: "put_abort", rkey }).catch(() => {});
+    await abort(true);             // may or may not have landed: mark the index dirty so a reconcile re-checks
     return err(400, "bad-body");   // digest mismatch / truncated upload
   }
-  if (!put) { await budget(env, { op: "put_abort", rkey }).catch(() => {}); return err(412, "conflict", { current: null }); }
-  await budget(env, { op: "put_commit", rkey, size: put.size, etag: put.etag, hetag: put.httpEtag || put.etag, sha, mtime });
+  if (!put) { await abort(false); return err(412, "conflict", { current: null }); }
+  // The object is stored. Commit to the index; one retry, then a retryable 503. A pending row that is never
+  // committed is aborted after its TTL and the index marked dirty; a late commit re-applies the bytes.
+  const commit = { op: "put_commit", uid: au.uid, rkey, tok, size: put.size, etag: put.etag, hetag: put.httpEtag || put.etag, sha, mtime };
+  try { await budget(env, commit); }
+  catch (e1) {
+    try { await budget(env, commit); }
+    catch (e2) { return err(503, "cloud-saves-retry", { retryAfter: 30 }); }
+  }
   return json({ ok: true, etag: put.httpEtag || put.etag });
 }
 
@@ -215,8 +229,12 @@ async function testHooks(request, env) {
   const u = new URL(request.url);
   if (!u.pathname.startsWith("/saves/_test/")) return null;
   const op = u.pathname.slice("/saves/_test/".length);
-  const body = op === "month" ? { op: "test_month", month: u.searchParams.get("m") }
-    : op === "fail" ? { op: "test_fail", on: u.searchParams.get("on") === "1" }
-    : { op: "status" };
+  if (op === "rawput") {   // write straight into R2 behind the index's back (reconcile tests)
+    await env.SAVES.put(u.searchParams.get("rkey"), "x".repeat(Number(u.searchParams.get("n") || 10)), { customMetadata: { sha: "0".repeat(64), mtime: "1" } });
+    return json({ ok: true });
+  }
+  const body = { month: { op: "test_month", month: u.searchParams.get("m") }, day: { op: "test_day", day: u.searchParams.get("d") },
+    fail: { op: "test_fail", on: u.searchParams.get("on") === "1" }, commitfail: { op: "test_commit_fail", n: u.searchParams.get("n") },
+    reconcile: { op: "test_reconcile" }, sum: { op: "test_sum" } }[op] || { op: "status" };
   return json(await budget(env, body));
 }

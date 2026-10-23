@@ -1,5 +1,6 @@
 // Tests for the global R2 budget guard (src/r2budget.js) against a LOCAL `wrangler dev` (simulated R2, never the
 // real Cloudflare account). Tiny caps are injected with --var.  Usage: node test_r2budget.mjs   (port 8793)
+import { request as httpRequest } from "node:http";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,13 +17,12 @@ const B32 = "abcdefghijklmnopqrstuvwxyz234567";
 const b32 = (n) => Array.from(randomBytes(n), (b) => B32[b % 32]).join("");
 
 let proc;
-async function start() {
+async function start(vars) {
   const cfg = readFileSync("wrangler.jsonc", "utf8").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
   const j = JSON.parse(cfg);
   j.r2_buckets = [{ binding: "SAVES", bucket_name: "retrohub-saves-test" }];
   writeFileSync("wrangler.budget.jsonc", JSON.stringify(j, null, 1));
   const persist = mkdtempSync(join(tmpdir(), "rh-r2b-"));
-  const vars = { BUDGET_TEST: "1", BUDGET_STORAGE_MAX: "1000", BUDGET_A_MAX: "6", BUDGET_B_MAX: "4", SAVES_QUOTA: "600", SAVES_MAX_FILES: "50" };
   const args = ["node_modules/wrangler/bin/wrangler.js", "dev", "-c", "wrangler.budget.jsonc", "--port", String(PORT), "--persist-to", persist, "--ip", "127.0.0.1"];
   for (const [k, v] of Object.entries(vars)) args.push("--var", `${k}:${v}`);
   proc = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -66,8 +66,84 @@ const del = (a, k) => call(a, "DELETE", P(k));
 const status = async () => (await (await fetch(BASE + "/saves/_test/status")).json());
 const test = (path) => fetch(BASE + path).then((r) => r.json());
 
+const PH1 = { BUDGET_TEST: "1", BUDGET_STORAGE_MAX: "1000", BUDGET_A_MAX: "6", BUDGET_B_MAX: "4", SAVES_QUOTA: "600", SAVES_MAX_FILES: "50" };
+const PH2 = { BUDGET_TEST: "1", BUDGET_STORAGE_MAX: "100000", SAVES_QUOTA: "100000", PENDING_TTL_MS: "1500", DAILY_ROWS_MAX: "60" };
+
+// PUT whose body arrives in two parts, `gap` ms apart (a slow upload).
+function slowPut(a, k, body, gap, ifMatch) {
+  const path = P(k), s = sha(body);
+  const hdrs = { "X-RH-Sha": s, "X-RH-Mtime": "1", ...(ifMatch ? { "If-Match": ifMatch } : { "If-None-Match": "*" }), "Content-Length": String(body.length) };
+  hdrs.Authorization = sign(a, "PUT", path, s, hdrs);
+  return new Promise((res, rej) => {
+    const rq = httpRequest({ host: "127.0.0.1", port: PORT, path, method: "PUT", headers: hdrs }, (r) => {
+      let d = ""; r.on("data", (c) => (d += c)); r.on("end", () => res({ status: r.statusCode, data: JSON.parse(d || "{}") }));
+    });
+    rq.on("error", rej);
+    rq.write(body.subarray(0, 1));
+    setTimeout(() => rq.end(body.subarray(1)), gap);
+  });
+}
+
+async function phase2() {
+  const A = await account(), B = await account();
+  const sum = async () => (await test("/saves/_test/sum")).sum;
+  const consistent = async (m) => { const st = await status(); check(st.total === (await sum()), `${m}: total ${st.total} == index sum ${await sum()}`); };
+
+  // slow upload outliving the 1.5 s pending TTL: another put_begin expires it, the late commit must re-apply bytes
+  const slow = slowPut(A, "slow.sav", Buffer.alloc(400, 5), 2500);
+  await sleep(2000);
+  check((await put(B, "other.sav", Buffer.alloc(10, 1))).status === 200, "other put during slow upload ok (expires the stale pending)");
+  check((await status()).total === 10, "expired pending released its bytes");
+  const sr = await slow;
+  check(sr.status === 200, `slow upload still succeeds (${sr.status})`);
+  await consistent("after late commit");
+  check((await get(A, "slow.sav")).status === 200, "late-committed object is readable");
+
+  // delete during an in-flight upload is refused (busy), upload stays tracked
+  const rp = await put(A, "slow2.sav", Buffer.alloc(100, 6));
+  const slow2 = slowPut(A, "slow2.sav", Buffer.alloc(300, 6), 800, rp.data.etag);
+  await sleep(300);
+  const d = await del(A, "slow2.sav");
+  check(d.status === 409 && d.data.error === "busy", `delete during upload -> 409 busy (${d.status})`);
+  check((await slow2).status === 200, "upload finishes");
+  await consistent("after delete-during-upload");
+  check((await del(A, "slow2.sav")).data.deleted === true, "delete works after upload");
+  await consistent("after delete");
+
+  // put_commit failure: Worker retries once (ok), then twice failing -> 503 retryable; index heals via reconcile
+  await test("/saves/_test/commitfail?n=1");
+  check((await put(A, "cf1.sav", Buffer.alloc(20, 7))).status === 200, "one commit failure is retried");
+  await consistent("after 1 commit failure");
+  await test("/saves/_test/commitfail?n=2");
+  const cf = await put(A, "cf2.sav", Buffer.alloc(30, 8));
+  check(cf.status === 503 && cf.data.error === "cloud-saves-retry", `two commit failures -> 503 retryable (${cf.status})`);
+  await sleep(1800);                                           // pending expires on the next begin; dirty
+  check((await put(B, "after.sav", Buffer.alloc(5, 2))).status === 200, "service continues");
+  check((await status()).dirty === 1, "expired upload marks the index dirty");
+  await test("/saves/_test/reconcile");
+  await consistent("after reconcile");
+  check((await get(A, "cf2.sav")).status === 200, "reconcile recovered the object that landed without a commit");
+  check((await status()).dirty === 0, "reconcile clears dirty");
+
+  // reconcile adopts objects written behind the index's back, drops index rows for vanished ones
+  await fetch(BASE + `/saves/_test/rawput?rkey=${encodeURIComponent(`saves/${A.uid}/raw.sav`)}&n=77`);
+  await test("/saves/_test/reconcile");
+  const l = await call(A, "GET", "/saves/list");
+  check(l.data.files.some((f) => f.key === "raw.sav" && f.size === 77), "reconcile adopted the raw object");
+  await consistent("after raw adopt");
+
+  // daily row guard
+  let code = null, n = 0;
+  for (let i = 0; i < 60 && !code; i++) { const r = await put(B, `d${i}`, Buffer.from("z" + i)); n++; if (r.status !== 200) code = r; }
+  check(code && code.status === 429 && code.data.error === "cloud-saves-busy-today", `daily rows guard -> 429 cloud-saves-busy-today after ${n} puts`);
+  check((await get(B, "d0")).status === 429, "gets pause too");
+  check((await del(B, "d0")).status === 200, "delete still allowed (frees storage)");
+  await test("/saves/_test/day?d=2099-12-31");
+  check((await put(B, "newday.sav", Buffer.from("q"))).status === 200, "new UTC day resets the guard");
+}
+
 async function main() {
-  await start();
+  await start(PH1);
   const A = await account(), B = await account(), C = await account();
 
   // --- storage: global cap 1000 bytes, per-account 600 ---
@@ -132,7 +208,9 @@ async function main() {
   check(fr.every((r) => r.status === 429 && r.data.error === "cloud-saves-paused"), `budget DO failure refuses everything (${fr.map((r) => r.status)})`);
   await test("/saves/_test/fail?on=0");
   check((await get(F, "f1")).status === 200, "recovers once the DO is healthy");
-  // the object really was not touched while failing closed
+  stop(); await sleep(1500);
+  await start(PH2);
+  await phase2();
 }
 
 main().catch((e) => { fails++; console.log("ERROR:", e); }).finally(() => {
