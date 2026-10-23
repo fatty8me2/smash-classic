@@ -388,7 +388,7 @@ export class UserHub extends DurableObject {
     if (!p) return { r: "none" };
     if (!b || !UID_RE.test(b.uid || "")) return { r: "none" };
     const from = b.uid;
-    if (this.retiredTo() && route !== "retire_begin" && route !== "link_auth") return { r: "none" };
+    if (this.retiredTo() && route !== "retire_begin" && route !== "retire_done" && route !== "link_auth") return { r: "none" };
     switch (route) {
       case "retire_begin": {
         // Called by the successor identity's hub with this (old) account's secret: hand over everything
@@ -397,12 +397,12 @@ export class UserHub extends DurableObject {
         const to = this.retiredTo();
         if (to && to !== from) return { r: "gone" };
         if (from === p.uid) return { r: "none" };
+        // Non-destructive: the snapshot stays in this account until the successor confirms (retire_done),
+        // so a failure mid fan-out can simply be retried and resumes from the same snapshot.
         const friends = this.all("SELECT uid, name, status FROM friends").map((f) => ({ uid: f.uid, name: f.name, status: JSON.parse(f.status) }));
         const reqs = this.all("SELECT uid, dir, name FROM requests");
         const blocked = this.all("SELECT uid FROM blocked").map((x) => x.uid);
         this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('retired', ?)", from);
-        this.run("DELETE FROM friends");
-        this.run("DELETE FROM requests");
         for (const ws of this.ctx.getWebSockets()) { try { ws.close(4005, "retired"); } catch { /* closed */ } }
         try {
           const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
@@ -412,6 +412,15 @@ export class UserHub extends DurableObject {
           });
         } catch { /* lease expires on its own */ }
         return { r: "ok", old: p.uid, friends, requests: reqs, blocked };
+      }
+      case "retire_done": {
+        // The successor finished moving everything: only now is the snapshot dropped.
+        if (this.retiredTo() !== from) return { r: "none" };
+        if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
+        this.run("DELETE FROM friends");
+        this.run("DELETE FROM requests");
+        this.run("DELETE FROM blocked");
+        return { r: "ok" };
       }
       case "replace_uid": {
         // A friend's account `from` was retired in favour of b.to: swap them in our lists (no duplicates).
@@ -495,8 +504,13 @@ export class UserHub extends DurableObject {
       case "request_update": {
         const result = b.result;
         if (result === "accepted") {
-          // Normally they accept our outgoing request; with crossed requests (both asked at once) an incoming one counts too.
-          if (!this.one("SELECT 1 FROM requests WHERE uid=?", from) || this.isBlocked(from)) return { r: "none" };
+          // Normally they accept our outgoing request; crossed requests are resolved by the "request" route, not here.
+          // Only a request WE sent (dir='out') can be accepted by them; an incoming row must never be force-accepted.
+          // The only exception is a genuine crossed request (both asked within seconds): flagged by the sender
+          // and only honoured while our incoming row is fresh.
+          const okRow = this.one("SELECT 1 FROM requests WHERE uid=? AND dir='out'", from)
+            || (b.crossed === true && this.one("SELECT 1 FROM requests WHERE uid=? AND dir='in' AND at > ?", from, now() - 60000));
+          if (!okRow || this.isBlocked(from)) return { r: "none" };
           if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
           const f = this.addFriendRow(from, b.name, sanitizeStatus(b.status));
@@ -682,6 +696,10 @@ export class UserHub extends DurableObject {
         const old = uidArg(msg.uid);
         if (!old || old === p.uid || typeof msg.secret !== "string") return this.err(ws, "bad-request", type);
         if (!this.hit("retire", 10, 3600 * 1000)) return this.err(ws, "rate-limited", type);
+        if (this.one("SELECT 1 FROM kv WHERE k=?", "retire_done:" + old)) {
+          ws.send(JSON.stringify({ type: "retired", uid: old })); // already completed: never replay (would re-block)
+          return;
+        }
         const r = await this.call(old, "retire_begin", { uid: p.uid, secret: msg.secret });
         if (r.r === "bad-secret" || r.r === "gone" || r.r === "none") {
           if (r.r === "bad-secret") return this.err(ws, "bad-request", type, "bad-secret");
@@ -689,7 +707,8 @@ export class UserHub extends DurableObject {
           return;
         }
         if (r.r !== "ok") return this.err(ws, "bad-request", type, "retire-failed");
-        for (const u of r.blocked || []) {
+        const bkey = "retire_blocked:" + old;
+        if (!this.one("SELECT 1 FROM kv WHERE k=?", bkey)) for (const u of r.blocked || []) {
           if (UID_RE.test(u) && u !== p.uid && !this.isBlocked(u) && this.count("blocked") < MAX_BLOCKED) {
             this.run("INSERT OR IGNORE INTO blocked (uid, at) VALUES (?, ?)", u, now());
             this.run("DELETE FROM friends WHERE uid=?", u);
@@ -697,7 +716,9 @@ export class UserHub extends DurableObject {
             this.push({ type: "block_update", uid: u, blocked: true });
           }
         }
+        this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '1')", bkey);
         const status = this.me().status;
+        let failed = false, moved = 0;
         const seen = new Set();
         const people = [...(r.friends || []).map((f) => ({ uid: f.uid, name: f.name })),
                         ...(r.requests || []).map((q) => ({ uid: q.uid, name: q.name }))];
@@ -706,8 +727,17 @@ export class UserHub extends DurableObject {
           seen.add(f.uid);
           if (this.isBlocked(f.uid)) continue;
           let pr;
-          try { pr = await this.call(f.uid, "replace_uid", { uid: old, to: p.uid, name: p.name, status }); } catch { continue; }
-          if (!pr || pr.r !== "ok") continue;
+          try {
+            const lim = Number(this.env.TEST_RETIRE_FAIL_AFTER);
+            if (lim > 0 && moved >= lim && !this.one("SELECT 1 FROM kv WHERE k='test_fail_used'")) {
+              this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('test_fail_used', '1')");
+              throw new Error("test crash");
+            }
+            pr = await this.call(f.uid, "replace_uid", { uid: old, to: p.uid, name: p.name, status });
+          } catch { failed = true; break; }
+          if (!pr || (pr.r !== "ok" && pr.r !== "none")) { failed = true; continue; } // "none": that account no longer exists
+          if (pr.r !== "ok") continue;
+          moved++;
           if (pr.linked) {
             if (!this.isFriend(f.uid) && this.count("friends") < this.friendCap(p)) {
               const row = this.addFriendRow(f.uid, f.name, null);
@@ -724,6 +754,9 @@ export class UserHub extends DurableObject {
           }
         }
         this.dedupeRows();
+        if (failed) return this.err(ws, "bad-request", type, "retire-failed"); // snapshot kept on the old account: retry resumes
+        this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '1')", "retire_done:" + old);
+        try { await this.call(old, "retire_done", { uid: p.uid, secret: msg.secret }); } catch { /* old stays inert; marker prevents replay */ }
         this.push({ type: "retired", uid: old });
         await this.broadcastPresence(true);
         break;
@@ -742,7 +775,7 @@ export class UserHub extends DurableObject {
         if (this.isBlocked(target)) return this.err(ws, "blocked", type);
         if (this.isFriend(target)) return this.err(ws, "already-friends", type);
         if (this.one("SELECT 1 FROM requests WHERE uid=? AND dir='in'", target)) {
-          return this.acceptFlow(ws, target);
+          return this.acceptFlow(ws, target, true);
         }
         if (this.one("SELECT 1 FROM requests WHERE uid=? AND dir='out'", target)) {
           return this.err(ws, "bad-request", type, "already-requested");
@@ -757,7 +790,7 @@ export class UserHub extends DurableObject {
           const req = { uid: target, code: codeOf(target), name: cleanName(r.name) || "player", at: now() };
           if (this.one("SELECT 1 FROM requests WHERE uid=? AND dir='in'", target)) {
             // They asked us at the very same moment: one friendship, not two crossed requests.
-            return this.acceptFlow(ws, target);
+            return this.acceptFlow(ws, target, true);
           }
           this.run("INSERT OR REPLACE INTO requests (uid, dir, code, name, at) VALUES (?, 'out', ?, ?, ?)", target, req.code, req.name, req.at);
           this.push({ type: "request", req, dir: "out" });
@@ -929,13 +962,13 @@ export class UserHub extends DurableObject {
     }
   }
 
-  async acceptFlow(ws, uid) {
+  async acceptFlow(ws, uid, crossed = false) {
     const p = this.profile();
     if (!this.one("SELECT 1 FROM requests WHERE uid=? AND dir='in'", uid)) return this.err(ws, "bad-request", "accept", "no-such-request");
     if (this.isBlocked(uid)) return this.err(ws, "blocked", "accept");
     if (this.count("friends") >= this.friendCap(p)) return this.err(ws, "bad-request", "accept", "friends-full");
     const me = this.me();
-    const r = await this.call(uid, "request_update", { uid: p.uid, result: "accepted", name: p.name, status: me.status });
+    const r = await this.call(uid, "request_update", { uid: p.uid, result: "accepted", name: p.name, status: me.status, crossed });
     if (r.r === "full") return this.err(ws, "bad-request", "accept", "target-full");
     this.run("DELETE FROM requests WHERE uid=?", uid);
     this.push({ type: "request_update", uid, result: "accepted" });
