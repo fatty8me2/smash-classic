@@ -296,11 +296,8 @@ export class NetplayRoom extends DurableObject {
         this.buckets.set(ws, bucket);
       }
       if (!bucket.take(message.byteLength)) {
-        if (!this.overBudgetLogged) {
-          this.overBudgetLogged = true;
-          console.log(`[smash] relay over budget room=${this.roomCode || "?"} slot=${from}`);
-          setTimeout(() => { this.overBudgetLogged = false; }, 60 * 1000);
-        }
+        console.log(`[smash] relay over budget, closing room=${this.roomCode || "?"} slot=${from}`);
+        try { ws.close(1008, "relay-over-budget"); } catch { /* already closed */ }
         return;
       }
       if (this.legacy) {

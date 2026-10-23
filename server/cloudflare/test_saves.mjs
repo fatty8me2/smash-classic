@@ -1,4 +1,4 @@
-// Node test for the /saves (R2 cloud saves) endpoints.
+﻿// Node test for the /saves (R2 cloud saves) endpoints.
 // Usage: node test_saves.mjs            -> starts its own `wrangler dev` (local R2 emulation) on port 8791
 //        node test_saves.mjs --nor2     -> same but WITHOUT the R2 binding: every /saves route must be 503
 //        node test_saves.mjs --serve    -> only start the dev server (with R2) and keep it running (for the C++ test)
@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 
-const PORT = 8791;
+const PORT = Number(process.env.SAVES_TEST_PORT) || 8791;
 const NOR2 = process.argv.includes("--nor2");
 const SERVE = process.argv.includes("--serve");
 let BASE = process.argv.find((a) => /^https?:\/\//.test(a));
@@ -29,7 +29,7 @@ async function startServer() {
   proc = spawn(process.execPath, ["node_modules/wrangler/bin/wrangler.js", "dev", "-c", "wrangler.test.jsonc", "--port", String(port),
     "--persist-to", persist, "--ip", "127.0.0.1"], { stdio: ["ignore", "pipe", "pipe"] });
   let log = "";
-  proc.stdout.on("data", (d) => (log += d));
+  proc.stdout.on("data", (d) => { log += d; });
   proc.stderr.on("data", (d) => (log += d));
   BASE = `http://127.0.0.1:${port}`;
   for (let i = 0; i < 120; i++) {
@@ -59,15 +59,19 @@ async function account() {
   return { uid, secret, key: sha(secret) };
 }
 
-function sign(acct, method, pathq, shaHdr, ts = Date.now()) {
-  const sig = createHmac("sha256", acct.key).update(`${method}\n${pathq}\n${ts}\n${shaHdr || "-"}`).digest("hex");
+// hdrs: the request headers that are bound into the signature (If-Match, If-None-Match, X-RH-Mtime, Content-Length).
+function sign(acct, method, pathq, shaHdr, ts = Date.now(), hdrs = {}) {
+  const v = (n) => hdrs[n] ?? "-";
+  const msg = `${method}\n${pathq}\n${ts}\n${shaHdr || "-"}\n${v("If-Match")}\n${v("If-None-Match")}\n${v("Content-Length")}\n${v("X-RH-Mtime")}`;
+  const sig = createHmac("sha256", acct.key).update(msg).digest("hex");
   return `RHSIG uid=${acct.uid},ts=${ts},sig=${sig}`;
 }
-async function call(acct, method, pathq, { body, headers = {}, ts, sigsha } = {}) {
-  const h = { ...headers };
+async function call(acct, method, pathq, { body, headers = {}, ts, sigsha, sigover = {} } = {}) {
+  const h = {};
+  for (const [k, val] of Object.entries(headers)) if (val !== undefined) h[k] = val;
   const s = body !== undefined ? sha(body) : undefined;
   if (s) h["X-RH-Sha"] = s;
-  if (acct) h.Authorization = sign(acct, method, pathq, sigsha ?? s, ts);
+  if (acct) h.Authorization = sign(acct, method, pathq, sigsha ?? s, ts, { ...h, ...(body !== undefined ? { "Content-Length": String(body.length) } : {}), ...sigover });
   const r = await fetch(BASE + pathq, { method, headers: h, body });
   const ct = r.headers.get("content-type") || "";
   const data = ct.includes("json") ? await r.json() : Buffer.from(await r.arrayBuffer());
@@ -79,7 +83,15 @@ const get = (a, key, headers) => call(a, "GET", `/saves/obj?key=${encodeURICompo
 
 async function main() {
   if (!BASE) await startServer();
-  if (SERVE) { console.log("serving", BASE); await new Promise(() => {}); }
+  if (SERVE) {
+    // optional arg: write two registered accounts for the C++ end-to-end test (RETROHUB_TEST_SAVES_ACCOUNTS)
+    const out = process.argv.slice(2).find((a) => !a.startsWith("--") && !/^https?:/.test(a));
+    if (out) {
+      const a = await account(), b = await account();
+      writeFileSync(out, JSON.stringify({ url: BASE, a: { uid: a.uid, secret: a.secret }, b: { uid: b.uid, secret: b.secret } }));
+    }
+    console.log("serving", BASE); await new Promise(() => {});
+  }
 
   if (NOR2) {
     const r = await fetch(BASE + "/saves/list");
@@ -124,12 +136,30 @@ async function main() {
 
   // integrity: body not matching signed sha
   const bad = await fetch(BASE + "/saves/obj?key=bad.sav", { method: "PUT", body: Buffer.from("hello"),
-    headers: { "X-RH-Sha": sha("different"), "X-RH-Mtime": "1", "If-None-Match": "*", Authorization: sign(A, "PUT", "/saves/obj?key=bad.sav", sha("different")) } });
+    headers: { "X-RH-Sha": sha("different"), "X-RH-Mtime": "1", "If-None-Match": "*", Authorization: sign(A, "PUT", "/saves/obj?key=bad.sav", sha("different"), undefined, { "If-None-Match": "*", "X-RH-Mtime": "1", "Content-Length": "5" }) } });
   check(bad.status === 400, "body/sha mismatch rejected");
   check((await get(A, "bad.sav")).status === 404, "bad upload left nothing behind");
+  // a bad replace must not destroy the previous good version
+  const pv = await put(A, "keep.sav", Buffer.from("good-v1"));
+  const badRep = await fetch(BASE + "/saves/obj?key=keep.sav", { method: "PUT", body: Buffer.from("hello"),
+    headers: { "X-RH-Sha": sha("different"), "X-RH-Mtime": "1", "If-Match": pv.data.etag, Authorization: sign(A, "PUT", "/saves/obj?key=keep.sav", sha("different"), undefined, { "If-Match": pv.data.etag, "X-RH-Mtime": "1", "Content-Length": "5" }) } });
+  check(badRep.status === 400, "bad replace rejected");
+  const kept = await get(A, "keep.sav");
+  check(kept.status === 200 && kept.data.toString() === "good-v1", "bad replace left the previous version intact");
+  // signature now binds preconditions, length and mtime
+  const key2 = "/saves/obj?key=sig.sav";
+  const sb = Buffer.from("sigbody");
+  const tamper = async (over, label) => {
+    const r = await call(A, "PUT", key2, { body: sb, headers: { "X-RH-Mtime": "5", "If-None-Match": "*" }, sigover: over });
+    check(r.status === 401, `signature binds ${label}`);
+  };
+  await tamper({ "X-RH-Mtime": "6" }, "X-RH-Mtime");
+  await tamper({ "If-None-Match": "x" }, "If-None-Match");
+  await tamper({ "Content-Length": "99" }, "Content-Length");
+  await tamper({ "If-Match": "etag" }, "If-Match");
   // signature binds the sha header
   const forged = await fetch(BASE + "/saves/obj?key=f.sav", { method: "PUT", body: Buffer.from("hello"),
-    headers: { "X-RH-Sha": sha("hello"), "X-RH-Mtime": "1", "If-None-Match": "*", Authorization: sign(A, "PUT", "/saves/obj?key=f.sav", sha("zzz")) } });
+    headers: { "X-RH-Sha": sha("hello"), "X-RH-Mtime": "1", "If-None-Match": "*", Authorization: sign(A, "PUT", "/saves/obj?key=f.sav", sha("zzz"), undefined, { "If-None-Match": "*", "X-RH-Mtime": "1", "Content-Length": "5" }) } });
   check(forged.status === 401, "signature over a different sha -> 401");
 
   // key validation
@@ -154,7 +184,7 @@ async function main() {
   // size cap
   const big = await fetch(BASE + "/saves/obj?key=big.bin", { method: "PUT", body: Buffer.alloc(16 * 1024 * 1024 + 1),
     headers: { "X-RH-Sha": sha(Buffer.alloc(16 * 1024 * 1024 + 1)), "X-RH-Mtime": "1", "If-None-Match": "*",
-      Authorization: sign(A, "PUT", "/saves/obj?key=big.bin", sha(Buffer.alloc(16 * 1024 * 1024 + 1))) } });
+      Authorization: sign(A, "PUT", "/saves/obj?key=big.bin", sha(Buffer.alloc(16 * 1024 * 1024 + 1)), undefined, { "If-None-Match": "*", "X-RH-Mtime": "1", "Content-Length": String(16 * 1024 * 1024 + 1) }) } });
   check(big.status === 413, "object over 16 MB -> 413");
   const ok16 = Buffer.alloc(16 * 1024 * 1024, 7);
   check((await put(A, "big16.bin", ok16)).status === 200, "exactly 16 MB accepted");

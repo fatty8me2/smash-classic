@@ -1,4 +1,4 @@
-// RetroHub optional cloud saves (R2). Second sync backend beside sync folders.
+﻿// RetroHub optional cloud saves (R2). Second sync backend beside sync folders.
 //
 //   GET    /saves/list                  -> {ok, files:[{key,size,etag,sha,mtime}], used, quota, maxObject}
 //   GET    /saves/obj?key=REL           -> object bytes (supports "Range: bytes=N-" to resume)
@@ -8,7 +8,9 @@
 //   DELETE /saves/obj?key=REL           -> optional If-Match
 //
 // Auth: Authorization: RHSIG uid=<26 b32>,ts=<unix ms>,sig=<hex>
-//   sig = HMAC-SHA256(key = sha256hex(account secret), "METHOD\n/saves/...?query\nts\nX-RH-Sha or -")
+//   sig = HMAC-SHA256(key = sha256hex(account secret),
+//         "METHOD\n/saves/...?query\nts\nX-RH-Sha\nIf-Match\nIf-None-Match\nContent-Length\nX-RH-Mtime")
+//   (each header value, or "-" when absent)
 // The Worker never sees the secret itself; the account's UserHub Durable Object holds sha256hex(secret) (the same
 // value the friends hello checks) and hands it to this module over the internal route "saves_auth", which also
 // applies the per-account rate limit. The R2 key is always saves/<uid>/<rel> with uid taken from the verified
@@ -75,8 +77,8 @@ async function authenticate(request, env, url, write) {
   const a = await r.json();
   if (a.r === "limited") return { res: err(429, "rate-limited", { retryAfter: 60 }) };
   if (a.r !== "ok" || typeof a.key !== "string") return { res: err(401, "unauthorized") };
-  const body = request.headers.get("X-RH-Sha") || "-";
-  const want = await hmacHex(a.key, `${request.method}\n${url.pathname}${url.search}\n${ts}\n${body}`);
+  const hv = (n) => request.headers.get(n) || "-";
+  const msgS = `${request.method}\n${url.pathname}${url.search}\n${ts}\n${hv("X-RH-Sha")}\n${hv("If-Match")}\n${hv("If-None-Match")}\n${request.method === "PUT" ? hv("Content-Length") : "-"}\n${hv("X-RH-Mtime")}`; const want = await hmacHex(a.key, msgS);
   if (!safeEq(want, sig)) return { res: err(401, "unauthorized") };
   return { uid };
 }
@@ -187,9 +189,13 @@ export async function savesFetch(request, env) {
   if (!head && files.length >= MAX_FILES) return err(507, "too-many-files", { max: MAX_FILES });
   if (used - old + len > QUOTA) return err(507, "quota-exceeded", { used, quota: QUOTA });
 
+  // The body must be exactly Content-Length bytes and hash to X-RH-Sha. Both are enforced while the upload
+  // streams (FixedLengthStream errors on a mismatch, put's sha256 option rejects a bad digest), so a bad upload
+  // fails before anything is committed and the previous version is never touched.
   let put;
   try {
-    put = await env.SAVES.put(rkey, request.body, {
+    const body = len === 0 || !request.body ? new Uint8Array(0) : request.body.pipeThrough(new FixedLengthStream(len));
+    put = await env.SAVES.put(rkey, body, {
       sha256: sha,
       customMetadata: { sha, mtime },
       onlyIf: head ? { etagMatches: head.etag } : undefined,
@@ -198,6 +204,6 @@ export async function savesFetch(request, env) {
     return err(400, "bad-body");   // digest mismatch / truncated upload
   }
   if (!put) return err(412, "conflict", { current: metaOf((await env.SAVES.head(rkey)) || { size: 0 }) });
-  if (put.size !== len) { await env.SAVES.delete(rkey); return err(400, "bad-length"); }
+  if (put.size !== len) return err(400, "bad-length"); // unreachable in practice; never delete on the replace path
   return json({ ok: true, etag: put.httpEtag || put.etag });
 }

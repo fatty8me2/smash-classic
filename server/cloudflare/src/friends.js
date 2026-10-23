@@ -36,6 +36,7 @@ const MAX_INBOX = 200;
 const INBOX_TTL = 30 * 24 * 3600 * 1000;
 const MAX_HISTORY = 200;
 const INVITE_TTL = 30 * 60 * 1000;
+export const ONLINE_LEASE_MS = 3 * 60 * 1000;
 const RANK = { offline: 0, online: 1, in_lobby: 2, in_game: 3 };
 
 const now = () => Date.now();
@@ -111,6 +112,8 @@ export class Directory extends DurableObject {
     // Accounts with at least one authed socket. Lets a sender fan presence out to
     // online friends only, with one call here instead of one per friend.
     this.sql.exec("CREATE TABLE IF NOT EXISTS online (uid TEXT PRIMARY KEY)");
+    // `at` makes the flag a lease: entries older than ONLINE_LEASE_MS count as offline.
+    try { this.sql.exec("ALTER TABLE online ADD COLUMN at INTEGER NOT NULL DEFAULT 0"); } catch { /* already added */ }
   }
 
   async fetch(request) {
@@ -134,14 +137,14 @@ export class Directory extends DurableObject {
     if (url.pathname === "/online" && request.method === "POST") {
       const { uid, on } = await request.json();
       if (!UID_RE.test(uid)) return json({ ok: false }, 400);
-      if (on) this.sql.exec("INSERT OR REPLACE INTO online (uid) VALUES (?)", uid);
+      if (on) this.sql.exec("INSERT OR REPLACE INTO online (uid, at) VALUES (?, ?)", uid, Date.now());
       else this.sql.exec("DELETE FROM online WHERE uid=?", uid);
       return json({ ok: true });
     }
     if (url.pathname === "/online-of" && request.method === "POST") {
       const { uids } = await request.json();
       const list = (Array.isArray(uids) ? uids : []).filter((u) => UID_RE.test(u)).slice(0, 5000);
-      const set = new Set(this.sql.exec("SELECT uid FROM online").toArray().map((r) => r.uid));
+      const set = new Set(this.sql.exec("SELECT uid FROM online WHERE at > ?", Date.now() - ONLINE_LEASE_MS).toArray().map((r) => r.uid));
       return json({ uids: list.filter((u) => set.has(u)) });
     }
     return new Response("not found", { status: 404 });
@@ -294,15 +297,33 @@ export class UserHub extends DurableObject {
   // Record this account in the directory's online set (called on the first socket up / last socket down).
   async setOnline(on) {
     const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
-    try {
-      await dir.fetch("https://directory/online", {
-        method: "POST",
-        headers: { "x-rh-internal": "1", "content-type": "application/json" },
-        body: JSON.stringify({ uid: this.profile().uid, on }),
-      });
-    } catch {
-      // directory unreachable: presence falls back to the next transition
+    const uid = this.profile().uid;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await dir.fetch("https://directory/online", {
+          method: "POST",
+          headers: { "x-rh-internal": "1", "content-type": "application/json" },
+          body: JSON.stringify({ uid, on }),
+        });
+        if (r.ok) break;
+      } catch {
+        // retry once; the lease refresh (alarm) repairs anything still missed
+      }
     }
+    if (on) await this.scheduleLease();
+  }
+
+  // Keep the directory lease fresh while sockets are connected (keepalives are auto-answered
+  // without waking this object, so a timer does the refresh).
+  async scheduleLease() {
+    try {
+      if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + ONLINE_LEASE_MS / 3);
+    } catch { /* storage alarm unavailable */ }
+  }
+
+  async alarm() {
+    if (this.authedSockets().length === 0) return;
+    await this.setOnline(true);
   }
 
   addFriendRow(uid, name, status) {
@@ -455,7 +476,8 @@ export class UserHub extends DurableObject {
     try { msg = JSON.parse(message); } catch { return; }
     if (!msg || typeof msg !== "object" || typeof msg.type !== "string") return;
     // Per-account budget for all API traffic (in-memory, per UserHub instance).
-    if (!this.msgLimit.hit("m")) {
+    // hello and keepalive are exempt so reconnect storms can't lock an account out.
+    if (msg.type !== "hello" && msg.type !== "keepalive" && !this.msgLimit.hit("m")) {
       this.err(ws, "rate-limited", msg.type);
       return;
     }

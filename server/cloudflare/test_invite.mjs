@@ -33,7 +33,7 @@ if (process.argv[2] !== "--unit") {
   check(body.includes("retrohub://join/") && body.includes('var code = "ABCDEF"'), "body builds retrohub://join URL for the code");
   r = await get("/j/abcdef");
   check(r.status === 200, "lowercase code normalized and served");
-  for (const bad of ["/j/ABC", "/j/ABCDEF9X", "/j/ABCD%3CE", "/j/", "/j/ABCDE0"]) {
+  for (const bad of ["/j/ABC", "/j/ABCDEF9X", "/j/ABCD%3CE", "/j/", "/j/ABCDE0", "/j/%E0%A4%A", "/j/%"]) {
     r = await get(bad);
     check(r.status === 400, `GET ${bad} returns 400`);
   }

@@ -72,6 +72,17 @@ const check = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else con
   console.log("socket still open after burst:", ws.readyState === WebSocket.OPEN);
   const limited = replies.filter((m) => m.type === "error" && m.reason === "rate-limited").length;
   check(limited > 0, `friends API refuses a burst past the per-account budget (${limited} refused)`);
+  // hello is exempt from the budget: a reconnect right after the burst still authenticates.
+  const ws2 = new WebSocket(`${BASE}/friends?uid=${uid}`);
+  const replies2 = [];
+  ws2.onmessage = (e) => { try { replies2.push(JSON.parse(e.data)); } catch { /* ignore */ } };
+  await new Promise((res, rej) => { ws2.onopen = res; ws2.onerror = () => rej(new Error("connect failed")); });
+  ws2.send(JSON.stringify({ type: "hello", secret: "limit-test-secret-0123456789", name: "limit" }));
+  for (let t0 = Date.now(); Date.now() - t0 < 5000 && !replies2.some((m) => m.type === "welcome"); ) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  check(replies2.some((m) => m.type === "welcome"), "hello after an exhausted budget still gets a welcome");
+  ws2.close();
   ws.close();
 }
 

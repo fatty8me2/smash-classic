@@ -77,7 +77,11 @@ export function invitePage(code) {
 
 export function inviteFetch(request, pathname) {
   const raw = pathname.slice("/j/".length);
-  const code = normalizeInviteCode(decodeURIComponent(raw));
+  let decoded;
+  try { decoded = decodeURIComponent(raw); } catch {
+    return new Response("bad invite code", { status: 400, headers: { "content-type": "text/plain; charset=utf-8" } });
+  }
+  const code = normalizeInviteCode(decoded);
   if (!isValidInviteCode(code)) {
     return new Response("bad invite code", { status: 400, headers: { "content-type": "text/plain; charset=utf-8" } });
   }
