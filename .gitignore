@@ -114,3 +114,5 @@ debug_traces/
 # Local extraction / scratch directories used during debugging
 extract/
 test.zip
+server/cloudflare/wrangler.test.jsonc
+server/cloudflare/.wrangler/

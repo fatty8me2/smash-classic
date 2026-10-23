@@ -51,6 +51,7 @@ import { friendsFetch, UserHub, Directory } from "./friends.js";
 import { inviteFetch } from "./invite.js";
 import { linkFetch, LinkBox } from "./link.js";
 import { FixedWindow, ByteBucket, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN } from "./limits.js";
+import { savesFetch } from "./saves.js";
 
 export { HubRoom, UserHub, Directory, LinkBox };
 
@@ -89,6 +90,9 @@ export default {
     }
     if (url.pathname.startsWith("/link/")) {
       return linkFetch(request, env);
+    }
+    if (url.pathname.startsWith("/saves/")) {
+      return savesFetch(request, env);
     }
     if (url.pathname !== "/ws") {
       return new Response("not found", { status: 404 });
