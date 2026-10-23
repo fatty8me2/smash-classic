@@ -12,6 +12,7 @@
 // requires the x-rh-internal header on them.
 
 import { DurableObject } from "cloudflare:workers";
+import { FixedWindow, onlineTargets, FRIENDS_MSGS_PER_MIN } from "./limits.js";
 
 const UID_RE = /^[a-z2-7]{26}$/;
 const LOBBY_RE = /^[A-HJ-NP-Z2-9]{6}(-[0-9]{1,6})?$/;
@@ -107,6 +108,9 @@ export class Directory extends DurableObject {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec("CREATE TABLE IF NOT EXISTS dir (prefix TEXT PRIMARY KEY, uid TEXT NOT NULL)");
+    // Accounts with at least one authed socket. Lets a sender fan presence out to
+    // online friends only, with one call here instead of one per friend.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS online (uid TEXT PRIMARY KEY)");
   }
 
   async fetch(request) {
@@ -127,6 +131,19 @@ export class Directory extends DurableObject {
       this.sql.exec("INSERT INTO dir (prefix, uid) VALUES (?, ?)", prefix, uid);
       return json({ ok: true });
     }
+    if (url.pathname === "/online" && request.method === "POST") {
+      const { uid, on } = await request.json();
+      if (!UID_RE.test(uid)) return json({ ok: false }, 400);
+      if (on) this.sql.exec("INSERT OR REPLACE INTO online (uid) VALUES (?)", uid);
+      else this.sql.exec("DELETE FROM online WHERE uid=?", uid);
+      return json({ ok: true });
+    }
+    if (url.pathname === "/online-of" && request.method === "POST") {
+      const { uids } = await request.json();
+      const list = (Array.isArray(uids) ? uids : []).filter((u) => UID_RE.test(u)).slice(0, 5000);
+      const set = new Set(this.sql.exec("SELECT uid FROM online").toArray().map((r) => r.uid));
+      return json({ uids: list.filter((u) => set.has(u)) });
+    }
     return new Response("not found", { status: 404 });
   }
 }
@@ -144,6 +161,7 @@ export class UserHub extends DurableObject {
     this.env = env;
     this.sql = ctx.storage.sql;
     this.helloChain = Promise.resolve();
+    this.msgLimit = new FixedWindow(FRIENDS_MSGS_PER_MIN, 60 * 1000);
     ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"keepalive"}', '{"type":"keepalive_ack"}'));
     const q = (s) => this.sql.exec(s);
@@ -250,10 +268,41 @@ export class UserHub extends DurableObject {
     this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('pres', ?)", key);
     const payload = { uid: p.uid, name: p.name, status: eff };
     const isAdmin = !!this.env.ADMIN_UID && p.uid === this.env.ADMIN_UID;
-    const friends = isAdmin
+    const rows = isAdmin
       ? this.all("SELECT uid FROM friends ORDER BY since ASC LIMIT ?", ADMIN_FANOUT)
       : this.all("SELECT uid FROM friends");
-    await Promise.allSettled(friends.map((f) => this.call(f.uid, "presence", payload)));
+    const uids = rows.map((f) => f.uid);
+    if (uids.length === 0) return;
+    // Only online friends are contacted: one directory call, then one call per online friend.
+    // Offline friends pick up our status when they connect (their hello pulls it below).
+    const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+    const on = await (await dir.fetch("https://directory/online-of", {
+      method: "POST",
+      headers: { "x-rh-internal": "1", "content-type": "application/json" },
+      body: JSON.stringify({ uids }),
+    })).json();
+    const targets = onlineTargets(uids, new Set(on.uids || []));
+    const results = await Promise.allSettled(targets.map((uid) => this.call(uid, "presence", payload)));
+    // Each reply carries the friend's own status, so our copy of it stays current too.
+    results.forEach((res, i) => {
+      const r = res.status === "fulfilled" ? res.value : null;
+      const st = r && sanitizeStatus(r.st);
+      if (st) this.run("UPDATE friends SET name=?, status=? WHERE uid=?", cleanName(r.name) || "player", JSON.stringify(st), targets[i]);
+    });
+  }
+
+  // Record this account in the directory's online set (called on the first socket up / last socket down).
+  async setOnline(on) {
+    const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+    try {
+      await dir.fetch("https://directory/online", {
+        method: "POST",
+        headers: { "x-rh-internal": "1", "content-type": "application/json" },
+        body: JSON.stringify({ uid: this.profile().uid, on }),
+      });
+    } catch {
+      // directory unreachable: presence falls back to the next transition
+    }
   }
 
   addFriendRow(uid, name, status) {
@@ -309,7 +358,7 @@ export class UserHub extends DurableObject {
         const name = cleanName(b.name) || "player";
         this.run("UPDATE friends SET name=?, status=? WHERE uid=?", name, JSON.stringify(st), from);
         this.push({ type: "presence", uid: from, name, status: st });
-        return { r: "ok" };
+        return { r: "ok", name: p.name, st: this.effective() };
       }
       case "request": {
         const name = cleanName(b.name) || "player";
@@ -398,6 +447,11 @@ export class UserHub extends DurableObject {
     let msg;
     try { msg = JSON.parse(message); } catch { return; }
     if (!msg || typeof msg !== "object" || typeof msg.type !== "string") return;
+    // Per-account budget for all API traffic (in-memory, per UserHub instance).
+    if (!this.msgLimit.hit("m")) {
+      this.err(ws, "rate-limited", msg.type);
+      return;
+    }
 
     if (msg.type === "hello") {
       this.helloChain = this.helloChain.then(() => this.hello(ws, msg)).catch(() => {
@@ -457,8 +511,14 @@ export class UserHub extends DurableObject {
       p.name = name;
       renamed = true;
     }
+    const wasOnline = this.authedSockets().length > 0;
     ws.serializeAttachment({ uid, authed: true, status: { state: "online", updated: now() } });
     await this.autoLinkAdmin(p);
+    if (!wasOnline) {
+      // First socket up: announce ourselves and pull friends' current statuses before the welcome.
+      await this.setOnline(true);
+      await this.broadcastPresence(true);
+    }
 
     this.run("DELETE FROM inbox WHERE at < ?", now() - INBOX_TTL);
     const friends = this.all("SELECT * FROM friends ORDER BY name").map((r) => this.friendObj(r));
@@ -710,7 +770,10 @@ export class UserHub extends DurableObject {
   async webSocketClose(ws, code) {
     try { ws.close(code === 1005 || code === 1006 ? 1000 : code, "closed"); } catch { /* already closed */ }
     const a = ws.deserializeAttachment();
-    if (a && a.authed) await this.broadcastPresence(false, ws);
+    if (a && a.authed) {
+      if (this.authedSockets(ws).length === 0) await this.setOnline(false);
+      await this.broadcastPresence(false, ws);
+    }
   }
 
   async webSocketError(ws) {

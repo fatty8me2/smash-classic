@@ -50,6 +50,7 @@ import { hubFetch, HubRoom } from "./hub.js";
 import { friendsFetch, UserHub, Directory } from "./friends.js";
 import { inviteFetch } from "./invite.js";
 import { linkFetch, LinkBox } from "./link.js";
+import { FixedWindow, ByteBucket, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN } from "./limits.js";
 
 export { HubRoom, UserHub, Directory, LinkBox };
 
@@ -57,6 +58,10 @@ const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;
 const MAX_BINARY_BYTES = 1024;
 const MAX_PLAYERS = 4;
+
+// In-memory per-isolate limiter for room creation. Only applies when Cloudflare
+// supplies the client IP (not under wrangler dev), so local tests are unaffected.
+const roomCreates = new FixedWindow(ROOMS_PER_IP_PER_MIN, 60 * 1000);
 
 function send(ws, data) {
   try {
@@ -96,6 +101,15 @@ export default {
     if (!CODE_RE.test(room) || (role !== "host" && role !== "join")) {
       return new Response("bad room or role", { status: 400 });
     }
+    const ip = request.headers.get("CF-Connecting-IP");
+    if (role === "host" && ip && !roomCreates.hit(ip)) {
+      console.log(`[smash] room-create rate-limited ip=${ip.slice(0, 45)}`);
+      return new Response("too many rooms, try again in a minute", { status: 429 });
+    }
+    const v = url.searchParams.get("v") || "1";
+    const hm = url.searchParams.get("hm") || "0";
+    const ver = (url.searchParams.get("ver") || "-").slice(0, 16);
+    console.log(`[smash] ${role} room=${room} v=${v} hm=${hm} ver=${ver}`);
     const stub = env.ROOMS.get(env.ROOMS.idFromName(room));
     return stub.fetch(request);
   },
@@ -180,6 +194,7 @@ export class NetplayRoom extends DurableObject {
     const url = new URL(request.url);
     const room = url.searchParams.get("room").toUpperCase();
     const role = url.searchParams.get("role");
+    this.roomCode = room;
     const legacy = Number(url.searchParams.get("v") || 1) < 2;
     const hm = !legacy && url.searchParams.get("hm") === "1";
 
@@ -269,6 +284,21 @@ export class NetplayRoom extends DurableObject {
       if (!this.relay) return;
 
       const from = this.slotOf(ws);
+      // Per-socket relay budget (in memory; resets if the room is evicted).
+      if (!this.buckets) this.buckets = new Map();
+      let bucket = this.buckets.get(ws);
+      if (!bucket) {
+        bucket = new ByteBucket(RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES);
+        this.buckets.set(ws, bucket);
+      }
+      if (!bucket.take(message.byteLength)) {
+        if (!this.overBudgetLogged) {
+          this.overBudgetLogged = true;
+          console.log(`[smash] relay over budget room=${this.roomCode || "?"} slot=${from}`);
+          setTimeout(() => { this.overBudgetLogged = false; }, 60 * 1000);
+        }
+        return;
+      }
       if (this.legacy) {
         const other = this.socketAt(from === 0 ? 1 : 0);
         if (other) other.send(message);
@@ -303,8 +333,18 @@ export class NetplayRoom extends DurableObject {
         });
         this.announce();
         break;
+      case "desync": {
+        // Client-reported desync exit (log only; no protocol reply).
+        const reason = String(msg.reason || "-").replace(/[^\x20-\x7E]/g, "").slice(0, 64);
+        console.log(`[smash] desync room=${this.roomCode || "?"} slot=${this.slotOf(ws)} reason=${reason}`);
+        break;
+      }
       case "relay": {
         await this.ctx.storage.put("relay", true);
+        if (!this.relay) {
+          this.relayStart = Date.now();
+          console.log(`[smash] relay on room=${this.roomCode || "?"}`);
+        }
         this.relay = true;
         const text = JSON.stringify({ type: "relaying" });
         for (const s of this.ctx.getWebSockets()) send(s, text);
@@ -324,6 +364,11 @@ export class NetplayRoom extends DurableObject {
       // already closed
     }
     if (slot < 0) return;   // webSocketError then webSocketClose: already handled
+    if (this.buckets) this.buckets.delete(ws);
+    if (this.relayStart && this.members().length <= 1) {
+      console.log(`[smash] relay minutes room=${this.roomCode || "?"} secs=${Math.round((Date.now() - this.relayStart) / 1000)}`);
+      this.relayStart = 0;
+    }
     if (this.legacy === null) this.legacy = (await this.ctx.storage.get("legacy")) === true;
     const left = JSON.stringify({ type: "peer_left", slot });
     const rest = this.members();
