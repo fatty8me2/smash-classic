@@ -529,6 +529,7 @@ file(GLOB_RECURSE SSB64_SRC_WP      "decomp/src/wp/*.c"      "decomp/src/wp/*.h"
 # link error against a stale glob.
 file(GLOB_RECURSE SSB64_SRC_PORT CONFIGURE_DEPENDS "port/*.cpp" "port/*.c" "port/*.h")
 list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/stubs/")
+list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "_test\\.cpp$")   # standalone tests with their own main()
 # RelocFileTable.{us,jp}.cpp both define gRelocFileTable — compile only the
 # selected version's table (the rest are siblings for the other version).
 list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/resource/RelocFileTable\\.(us|jp)\\.cpp$")
