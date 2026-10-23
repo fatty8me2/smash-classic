@@ -13,12 +13,14 @@
       { "name": "ROOMS", "class_name": "NetplayRoom" },
       { "name": "HUB_ROOMS", "class_name": "HubRoom" },
       { "name": "USER_HUBS", "class_name": "UserHub" },
-      { "name": "DIRECTORY", "class_name": "Directory" }
+      { "name": "DIRECTORY", "class_name": "Directory" },
+      { "name": "LINK_BOXES", "class_name": "LinkBox" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["NetplayRoom"] },
     { "tag": "v2", "new_sqlite_classes": ["HubRoom"] },
-    { "tag": "v3", "new_sqlite_classes": ["UserHub", "Directory"] }
+    { "tag": "v3", "new_sqlite_classes": ["UserHub", "Directory"] },
+    { "tag": "v4", "new_sqlite_classes": ["LinkBox"] }
   ]
 }
