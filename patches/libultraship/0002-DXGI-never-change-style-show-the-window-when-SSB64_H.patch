@@ -1,0 +1,27 @@
+From 00cb577b1a829c5cf807cf171310035a9805efc5 Mon Sep 17 00:00:00 2001
+From: Cameron Wiegand <cameron.wiegand@gmail.com>
+Date: Thu, 22 Oct 2026 14:51:36 -0500
+Subject: [PATCH 2/2] DXGI: never change style/show the window when
+ SSB64_HIDDEN_WINDOW is set
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/fast/backends/gfx_dxgi.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/fast/backends/gfx_dxgi.cpp b/src/fast/backends/gfx_dxgi.cpp
+index 80a485a5..42c59e71 100644
+--- a/src/fast/backends/gfx_dxgi.cpp
++++ b/src/fast/backends/gfx_dxgi.cpp
+@@ -153,6 +153,11 @@ static bool GetMonitorAtCoords(std::vector<std::tuple<HMONITOR, RECT, BOOL>> Mon
+ }
+ 
+ void GfxWindowBackendDXGI::ToggleBorderlessWindowFullScreen(bool enable, bool call_callback) {
++    // SSB64_HIDDEN_WINDOW=1 (test harness): never change the window style or show it, whatever the
++    // saved fullscreen setting says (the style change below adds WS_VISIBLE and ShowWindow can activate).
++    if (const char* hidden = std::getenv("SSB64_HIDDEN_WINDOW"); hidden != nullptr && hidden[0] != '\0' && hidden[0] != '0') {
++        return;
++    }
+     // Windows 7 + flip mode + waitable object can't go to exclusive fullscreen,
+     // so do borderless instead. If DWM is enabled, this means we get one monitor
+     // sync interval of latency extra. On Win 10 however (maybe Win 8 too), due to

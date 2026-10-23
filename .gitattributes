@@ -17,3 +17,6 @@ port/resource/RelocFileTable.cpp text eol=lf
 
 # PowerShell tolerates either, but pinning LF keeps the repo consistent.
 *.ps1 text eol=lf
+
+# Patch files must stay byte-exact (applied with git apply at configure time).
+patches/**/*.patch -text

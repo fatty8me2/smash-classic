@@ -3,6 +3,9 @@
 ## Build System
 - CMake is the build system
 - libultraship and Torch are git submodules
+- Submodule pins must be fetchable from PUBLIC remotes (JRickey/libultraship, JRickey/Torch, fatty8me2/ssb-decomp-re). Never pin a commit that exists only locally.
+- Local libultraship changes live as patches in `patches/libultraship/*.patch` (made with `git format-patch <pinned>..HEAD` inside the submodule). `cmake/ApplyLusPatches.cmake` applies them at configure time, idempotently (`git apply --check --reverse` skips ones already applied). Fresh clones and worktrees need nothing extra. The submodule shows as dirty after configure; `.gitmodules` sets `ignore = dirty`.
+- To change libultraship: edit it, regenerate the patch files, never bump the gitlink to an unpublished commit. Patches must apply on the pinned upstream commit.
 - MSVC on Windows, Apple Clang on macOS, GCC/Clang on Linux
 - The decomp's original MIPS toolchain (IDO 7.1) is NOT used for the port
   - **Windows**: `& 'C:\Program Files\CMake\bin\cmake' -S . -B "build/x64" -A x64` (CMake auto-picks the newest installed Visual Studio + default toolset)
