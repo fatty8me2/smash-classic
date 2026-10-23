@@ -12,7 +12,13 @@
 //          the client's UDP addresses (public from STUN, LAN from the OS)
 //   S->C {type:"welcome", room, role, slot, max, host}
 //          host = the slot that currently leads the room (0 until the host leaves)
-//   S->C {type:"peers", host, peers:[{slot, public, local}, ...]}
+//   S->C {type:"peers", host, peers:[{slot, public, local, tok}, ...]}
+//          tok = this receiver's private pair token with that member (absent
+//          on the receiver's own entry): a random 128-bit hex string the server
+//          draws when the later of the two joins and gives to exactly those two
+//          members. Game clients put it in their UDP `SSBL HELLO <slot> <tok>`
+//          and ignore HELLOs from addresses they don't know unless it matches,
+//          so knowing the room code is not enough to spoof a slot.
 //          every member of the room (including the receiver); sent again
 //          whenever someone joins, leaves or reports an endpoint. public and
 //          local are "-" until that member has reported its endpoint.
@@ -244,7 +250,8 @@ export class NetplayRoom extends DurableObject {
       this.ctx.acceptWebSocket(pair[1], hm ? [role, `s${slot}`, "hm"] : [role, `s${slot}`]);
       this.addSocket(pair[1], slot);
     }
-    pair[1].serializeAttachment({ endpoint: null });
+    pair[1].serializeAttachment({ endpoint: null, toks: {} });
+    if (!legacy) this.issuePairTokens(pair[1], slot);
     pair[1].send(JSON.stringify(legacy
       ? { type: "welcome", room, role }
       : { type: "welcome", room, role, slot, max: MAX_PLAYERS, host: this.hostSlot }));
@@ -253,18 +260,44 @@ export class NetplayRoom extends DurableObject {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
+  // A fresh random token for every pair (new member, each existing member), kept in both sockets'
+  // attachments (survives hibernation). A reused slot gets new tokens, so a previous holder's are dead.
+  issuePairTokens(ws, slot) {
+    const mine = ws.deserializeAttachment() || {};
+    mine.toks = {};
+    for (const { slot: other, ws: socket } of this.members()) {
+      if (socket === ws || other === slot) continue;
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      const tok = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+      const theirs = socket.deserializeAttachment() || {};
+      theirs.toks = { ...(theirs.toks || {}), [slot]: tok };
+      socket.serializeAttachment(theirs);
+      mine.toks[other] = tok;
+    }
+    ws.serializeAttachment(mine);
+  }
+
+  // The roster as `receiver` sees it: pair tokens are private to the two members they join.
+  rosterFor(receiver, skip) {
+    const toks = receiver.deserializeAttachment()?.toks || {};
+    const peers = [];
+    for (const { slot, ws } of this.members()) {
+      if (ws === skip) continue;
+      const endpoint = ws.deserializeAttachment()?.endpoint;
+      const entry = { slot, public: endpoint?.public || "-", local: endpoint?.local || "-" };
+      if (ws !== receiver && toks[slot]) entry.tok = toks[slot];
+      peers.push(entry);
+    }
+    return JSON.stringify({ type: "peers", host: this.hostSlot, peers });
+  }
+
   // Tell everyone who is in the room and where to reach them.
   announce() {
     if (this.legacy) {
       this.introduceLegacy();
       return;
     }
-    const peers = this.members().map(({ slot, ws }) => {
-      const endpoint = ws.deserializeAttachment()?.endpoint;
-      return { slot, public: endpoint?.public || "-", local: endpoint?.local || "-" };
-    });
-    const text = JSON.stringify({ type: "peers", host: this.hostSlot, peers });
-    for (const { ws } of this.members()) send(ws, text);
+    for (const { ws } of this.members()) send(ws, this.rosterFor(ws, null));
   }
 
   // Legacy: both players known with endpoints: tell each about the other.
@@ -336,6 +369,7 @@ export class NetplayRoom extends DurableObject {
     switch (msg.type) {
       case "endpoint":
         ws.serializeAttachment({
+          ...(ws.deserializeAttachment() || {}),
           endpoint: { public: String(msg.public || "-").slice(0, 64), local: String(msg.local || "-").slice(0, 64) },
         });
         this.announce();
@@ -430,16 +464,9 @@ export class NetplayRoom extends DurableObject {
 
   announceWithout(gone) {
     if (this.legacy) return;
-    const peers = [];
-    const live = [];
-    for (const { slot, ws } of this.members()) {
-      if (ws === gone) continue;
-      const endpoint = ws.deserializeAttachment()?.endpoint;
-      peers.push({ slot, public: endpoint?.public || "-", local: endpoint?.local || "-" });
-      live.push(ws);
+    for (const { ws } of this.members()) {
+      if (ws !== gone) send(ws, this.rosterFor(ws, gone));
     }
-    const text = JSON.stringify({ type: "peers", host: this.hostSlot, peers });
-    for (const ws of live) send(ws, text);
   }
 
   async webSocketError(ws) {

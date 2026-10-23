@@ -26,6 +26,7 @@
  *   SSBL BEGIN <seed>                         host -> players: everyone said GO, start now
  *   SSBL ABORT                                host -> players: the start was cancelled */
 #include "netlobby.h"
+#include "hello_auth.h"
 #include "port_udp.h"
 #include "port_ws.h"
 #include "port_log.h"
@@ -83,6 +84,7 @@ struct Peer {
     bool present = false;
     std::string pub = "-";
     std::string local = "-";
+    std::string tok;                // pair token from the server roster (empty: old server)
     LinkState link = LINK_NONE;
     unsigned int punch_ms = 0;
     unsigned int last_hello_ms = 0;
@@ -676,7 +678,7 @@ void handle_peer(const std::vector<std::string> &args, int slot)
         mark_connected(slot);       // any word from it proves the path works
     }
     if (args[1] == "HELLO") {
-        send_peer(slot, "SSBL HELLOACK " + std::to_string(sLobby.my_slot));
+        send_peer(slot, hello_auth::make("HELLOACK", sLobby.my_slot, p.tok));
     } else if (args[1] == "PICK" && args.size() >= 3) {
         const int fkind = std::atoi(args[2].c_str());
         if (!valid_fkind(fkind)) {
@@ -808,9 +810,10 @@ bool same_host_ip(const char *from, const Peer &p)
     return false;
 }
 
-void apply_endpoint(int slot, const std::string &pub, const std::string &local)
+void apply_endpoint(int slot, const std::string &pub, const std::string &local, const std::string &tok)
 {
     Peer &p = sLobby.peers[slot];
+    p.tok = tok;
     const bool changed = (p.pub != pub) || (p.local != local);
 
     p.present = true;
@@ -860,7 +863,7 @@ void handle_peers(const std::string &msg)
             continue;
         }
         seen[slot] = true;
-        apply_endpoint(slot, json_field(obj, "public"), json_field(obj, "local"));
+        apply_endpoint(slot, json_field(obj, "public"), json_field(obj, "local"), json_field(obj, "tok"));
     }
     for (int i = 0; i < kMaxPlayers; i++) {
         if (!seen[i] && sLobby.peers[i].present) {
@@ -962,7 +965,8 @@ void receive(void)
                  * it to another port): its slot is in the packet. */
                 int slot = std::atoi(args[2].c_str());
                 if (valid_slot(slot) && slot != sLobby.my_slot && sLobby.peers[slot].present &&
-                    same_host_ip(from, sLobby.peers[slot]) && port_udp_peer_add_candidate(slot, from)) {
+                    same_host_ip(from, sLobby.peers[slot]) &&
+                    hello_auth::may_learn(sLobby.peers[slot].tok, args.size(), args.data()) && port_udp_peer_add_candidate(slot, from)) {
                     peer = slot;
                 }
             }
@@ -1097,7 +1101,7 @@ void update_peers(void)
                 port_log("SSB64 Lobby: direct path to player %d failed, trying relay\n", i);
             }
             if (elapsed(p.last_hello_ms, kHelloMs)) {
-                const std::string hello = "SSBL HELLO " + std::to_string(sLobby.my_slot);
+                const std::string hello = hello_auth::make("HELLO", sLobby.my_slot, p.tok);
                 if (!force_direct_skip(i)) {
                     port_udp_peer_punch(i, hello.data(), static_cast<int>(hello.size()));
                 }

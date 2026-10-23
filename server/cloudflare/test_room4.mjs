@@ -156,5 +156,46 @@ const code = () => {
   for (const c of [h1, h2, j]) c.ws.close();
 }
 
+// ---- HELLO pair tokens: private per pair, never on one's own entry, fresh on slot reuse ----
+{
+  const room = code();
+  const p = [open(room, "host")];
+  await p[0].wait(() => p[0].last("welcome"));
+  for (let i = 1; i <= 2; i++) { p.push(open(room, "join")); await p[i].wait(() => p[i].last("welcome")); }
+  for (let i = 0; i < 3; i++) p[i].send({ type: "endpoint", public: `2.2.2.${i}:200${i}`, local: `10.0.1.${i}:200${i}` });
+  await sleep(300);
+  const tokOf = (c, slot) => c.last("peers")?.peers.find((x) => x.slot === slot)?.tok;
+  const HEX = /^[0-9a-f]{32}$/;
+  check(p.every((c) => c.last("peers").peers.find((x) => x.slot === p.indexOf(c)).tok === undefined), "own roster entry carries no token");
+  check(HEX.test(tokOf(p[0], 1)) && HEX.test(tokOf(p[0], 2)) && HEX.test(tokOf(p[1], 2)), "every other member has a 128-bit hex token");
+  check(tokOf(p[0], 1) === tokOf(p[1], 0) && tokOf(p[0], 2) === tokOf(p[2], 0) && tokOf(p[1], 2) === tokOf(p[2], 1), "both ends of a pair see the same token");
+  check(new Set([tokOf(p[0], 1), tokOf(p[0], 2), tokOf(p[1], 2)]).size === 3, "different pairs have different tokens");
+  check(!JSON.stringify(p[2].text).includes(tokOf(p[0], 1)), "slot 2 never sees the 0-1 token");
+  const old = tokOf(p[0], 1);
+  p[1].ws.close();
+  check(await p[0].wait(() => p[0].last("peers")?.peers.length === 2), "slot 1 left");
+  p[1] = open(room, "join");
+  await p[1].wait(() => p[1].last("welcome"));
+  check(p[1].last("welcome").slot === 1, "slot 1 reused");
+  await p[0].wait(() => p[0].last("peers")?.peers.length === 3);
+  check(HEX.test(tokOf(p[0], 1)) && tokOf(p[0], 1) !== old, "reused slot gets a new token (old holder's is dead)");
+  check(tokOf(p[0], 1) === tokOf(p[1], 0), "new pair tokens match on both ends");
+  p[1].send({ type: "endpoint", public: "2.2.2.9:2009", local: "-" });
+  await sleep(200);
+  check(tokOf(p[0], 1) !== undefined && tokOf(p[1], 2) === tokOf(p[2], 1), "endpoint update keeps tokens");
+  for (const c of p) c.ws.close();
+}
+
+// ---- legacy rooms get no tokens (unchanged peer message) ----
+{
+  const room = code();
+  const h = open(room, "host", 0); await h.wait(() => h.last("welcome"));
+  const j = open(room, "join", 0); await j.wait(() => j.last("welcome"));
+  h.send({ type: "endpoint", public: "3.3.3.3:1", local: "-" }); j.send({ type: "endpoint", public: "3.3.3.4:1", local: "-" });
+  await sleep(300);
+  check(!JSON.stringify(h.text).includes('"tok"'), "legacy room has no tokens");
+  h.ws.close(); j.ws.close();
+}
+
 console.log(fails ? `${fails} FAILED` : "ALL OK");
 process.exit(fails ? 1 : 0);
