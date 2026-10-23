@@ -50,7 +50,7 @@ import { hubFetch, HubRoom } from "./hub.js";
 import { friendsFetch, UserHub, Directory } from "./friends.js";
 import { inviteFetch } from "./invite.js";
 import { linkFetch, LinkBox } from "./link.js";
-import { FixedWindow, ByteBucket, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN } from "./limits.js";
+import { FixedWindow, ByteBucket, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN, RELAY_ABUSE_MS } from "./limits.js";
 import { savesFetch } from "./saves.js";
 
 export { HubRoom, UserHub, Directory, LinkBox };
@@ -296,8 +296,14 @@ export class NetplayRoom extends DurableObject {
         this.buckets.set(ws, bucket);
       }
       if (!bucket.take(message.byteLength)) {
-        console.log(`[smash] relay over budget, closing room=${this.roomCode || "?"} slot=${from}`);
-        try { ws.close(1008, "relay-over-budget"); } catch { /* already closed */ }
+        if (bucket.sustainedOver(RELAY_ABUSE_MS)) {
+          console.log(`[smash] relay sustained abuse, closing room=${this.roomCode || "?"} slot=${from}`);
+          try { ws.close(1008, "relay-over-budget"); } catch { /* already closed */ }
+        } else if (!this.overBudgetLogged) {
+          this.overBudgetLogged = true;
+          console.log(`[smash] relay over budget (dropping) room=${this.roomCode || "?"} slot=${from}`);
+          setTimeout(() => { this.overBudgetLogged = false; }, 60 * 1000);
+        }
         return;
       }
       if (this.legacy) {

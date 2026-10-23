@@ -38,13 +38,24 @@ export class ByteBucket {
     this.now = now;
     this.tokens = burst;
     this.last = now();
+    this.overSince = 0;
+  }
+
+  // Tracks how long the bucket has been refusing without a single success.
+  // Returns true when frames have been refused continuously for >= ms.
+  sustainedOver(ms) {
+    return this.overSince !== 0 && this.now() - this.overSince >= ms;
   }
 
   take(bytes) {
     const t = this.now();
     this.tokens = Math.min(this.burst, this.tokens + ((t - this.last) / 1000) * this.rate);
     this.last = t;
-    if (bytes > this.tokens) return false;
+    if (bytes > this.tokens) {
+      if (!this.overSince) this.overSince = t;
+      return false;
+    }
+    this.overSince = 0;
     this.tokens -= bytes;
     return true;
   }
@@ -63,7 +74,10 @@ export function onlineTargets(friendUids, onlineSet, cap = Infinity) {
 
 // Constants. Relay: worst case from the game is ~60 frames/s x 1024 bytes per
 // frame from one socket (about 61 KB/s); the bucket allows 8x that sustained.
-export const RELAY_BYTES_PER_SEC = 512 * 1024;
-export const RELAY_BURST_BYTES = 2 * 1024 * 1024;
+// Over-budget frames are dropped (never a close for a short burst); a socket is closed only after
+// RELAY_ABUSE_MS of continuous over-budget traffic (sustained abuse, not a save-exchange burst).
+export const RELAY_BYTES_PER_SEC = 1024 * 1024;
+export const RELAY_BURST_BYTES = 4 * 1024 * 1024;
+export const RELAY_ABUSE_MS = 10 * 1000;
 export const ROOMS_PER_IP_PER_MIN = 30;
 export const FRIENDS_MSGS_PER_MIN = 300;

@@ -2,7 +2,7 @@
 // Run: npx wrangler dev --port 8771   (in another shell), then: node test_limits.mjs ws://127.0.0.1:8771
 // Pure checks import src/limits.js directly; the last check talks to a running
 // `wrangler dev`. Usage: node test_limits.mjs [ws://127.0.0.1:8771]
-import { FixedWindow, ByteBucket, onlineTargets, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES } from "./src/limits.js";
+import { FixedWindow, ByteBucket, onlineTargets, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, RELAY_ABUSE_MS } from "./src/limits.js";
 
 const BASE = process.argv.find((a) => /^wss?:\/\//.test(a)) || "ws://127.0.0.1:8771";
 let fails = 0;
@@ -39,6 +39,23 @@ const check = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else con
   let ok = true;
   for (let i = 0; i < 60 * 10; i++) { t += 1000 / 60; if (!bk.take(1024)) ok = false; }
   check(ok, "a 60 fps, 1 KiB-per-frame stream never hits the relay budget");
+}
+
+// A short burst (a 1 MiB save exchange) and a refused stretch below RELAY_ABUSE_MS never count as abuse.
+{
+  let t = 0;
+  const bk = new ByteBucket(RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, () => t);
+  let ok = true;
+  for (let i = 0; i < 1024; i++) if (!bk.take(1024)) ok = false;   // 1 MiB at once
+  check(ok && !bk.sustainedOver(RELAY_ABUSE_MS), "a 1 MiB save-exchange burst passes and is not abuse");
+  for (let i = 0; i < 8; i++) bk.take(1024 * 1024);                // drain
+  t += 5000;
+  while (bk.take(1024 * 1024)) { /* drain refill */ }
+  check(!bk.sustainedOver(RELAY_ABUSE_MS), "a few seconds over budget is not sustained abuse");
+  for (let i = 0; i < 40; i++) { t += 500; bk.take(8 * 1024 * 1024); }
+  check(bk.sustainedOver(RELAY_ABUSE_MS), "continuous refusal for the abuse window is sustained abuse");
+  bk.take(1); t += 20000; bk.take(1);
+  check(!bk.sustainedOver(RELAY_ABUSE_MS), "abuse state clears once traffic fits the budget again");
 }
 
 // Presence targets: only online friends, in order, capped.
