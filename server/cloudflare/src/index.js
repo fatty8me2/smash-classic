@@ -59,8 +59,9 @@ import { linkFetch, LinkBox } from "./link.js";
 import { FixedWindow, ByteBucket, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN, RELAY_ABUSE_MS } from "./limits.js";
 import { savesFetch } from "./saves.js";
 import { R2Budget } from "./r2budget.js";
+import { OpsStats, adminStatsFetch, count, countVersion, flushDue } from "./stats.js";
 
-export { HubRoom, UserHub, Directory, LinkBox, R2Budget };
+export { HubRoom, UserHub, Directory, LinkBox, R2Budget, OpsStats };
 
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;
@@ -80,9 +81,12 @@ function send(ws, data) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    if (url.pathname === "/admin/stats") {
+      return adminStatsFetch(request, env, (p) => ctx.waitUntil(p));
+    }
     if (url.pathname === "/health") {
       return Response.json({ ok: true, service: "smash-netplay", netplay: 2, maxPlayers: MAX_PLAYERS, hostMigration: 1 });
     }
@@ -121,6 +125,8 @@ export default {
     const hm = url.searchParams.get("hm") || "0";
     const ver = (url.searchParams.get("ver") || "-").slice(0, 16);
     console.log(`[smash] ${role} room=${room} v=${v} hm=${hm} ver=${ver}`);
+    countVersion(ver);
+    flushDue(env, (p) => ctx.waitUntil(p));
     const stub = env.ROOMS.get(env.ROOMS.idFromName(room));
     return stub.fetch(request);
   },
@@ -257,6 +263,7 @@ export class NetplayRoom extends DurableObject {
       ? { type: "welcome", room, role }
       : { type: "welcome", room, role, slot, max: MAX_PLAYERS, host: this.hostSlot }));
     this.announce();
+    if (role === "host") { count("rooms"); flushDue(this.env, (p) => this.ctx.waitUntil(p)); }
 
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
@@ -379,6 +386,8 @@ export class NetplayRoom extends DurableObject {
         // Client-reported desync exit (log only; no protocol reply).
         const reason = String(msg.reason || "-").replace(/[^\x20-\x7E]/g, "").slice(0, 64);
         console.log(`[smash] desync room=${this.roomCode || "?"} slot=${this.slotOf(ws)} reason=${reason}`);
+        count("desync");
+        flushDue(this.env, (p) => this.ctx.waitUntil(p));
         break;
       }
       case "relay": {
@@ -408,7 +417,10 @@ export class NetplayRoom extends DurableObject {
     if (slot < 0) return;   // webSocketError then webSocketClose: already handled
     if (this.buckets) this.buckets.delete(ws);
     if (this.relayStart && this.members().length <= 1) {
-      console.log(`[smash] relay minutes room=${this.roomCode || "?"} secs=${Math.round((Date.now() - this.relayStart) / 1000)}`);
+      const secs = Math.round((Date.now() - this.relayStart) / 1000);
+      console.log(`[smash] relay minutes room=${this.roomCode || "?"} secs=${secs}`);
+      count("relay_secs", secs);
+      flushDue(this.env, (p) => this.ctx.waitUntil(p));
       this.relayStart = 0;
     }
     if (this.legacy === null) this.legacy = (await this.ctx.storage.get("legacy")) === true;
