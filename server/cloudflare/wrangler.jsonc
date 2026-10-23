@@ -16,7 +16,9 @@
       { "name": "DIRECTORY", "class_name": "Directory" },
       { "name": "LINK_BOXES", "class_name": "LinkBox" },
       // Global R2 free-tier budget guard + saves index (src/r2budget.js). Free-plan SQLite class.
-      { "name": "R2_BUDGET", "class_name": "R2Budget" }
+      { "name": "R2_BUDGET", "class_name": "R2Budget" },
+      // Daily operational counters for /admin/stats (src/stats.js). Free-plan SQLite class.
+      { "name": "OPS_STATS", "class_name": "OpsStats" }
     ]
   },
   // Optional cloud saves (src/saves.js). Without this binding every /saves route answers 503 and nothing else
@@ -28,6 +30,7 @@
     { "tag": "v2", "new_sqlite_classes": ["HubRoom"] },
     { "tag": "v3", "new_sqlite_classes": ["UserHub", "Directory"] },
     { "tag": "v4", "new_sqlite_classes": ["LinkBox"] },
-    { "tag": "v5", "new_sqlite_classes": ["R2Budget"] }
+    { "tag": "v5", "new_sqlite_classes": ["R2Budget"] },
+    { "tag": "v6", "new_sqlite_classes": ["OpsStats"] }
   ]
 }
