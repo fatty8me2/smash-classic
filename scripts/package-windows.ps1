@@ -252,6 +252,11 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     $LinkCore = Join-Path $HubBin "cores\mgba_link_libretro.dll"
     if (-not (Test-Path $LinkCore)) { Fail "mgba_link_libretro.dll not built (expected $LinkCore)" }
     Copy-Item $LinkCore $CoreDst -Force
+    # GB/GBC rollback core (patched libretro SameBoy, MIT). Built by RetroHub with MinGW gcc (see RetroHub CLAUDE.md);
+    # without it GB/GBC netplay silently falls back to lockstep, so fail the package instead.
+    $SameBoyRb = Join-Path $HubBin "cores\sameboy_rb_libretro.dll"
+    if (-not (Test-Path $SameBoyRb)) { Fail "sameboy_rb_libretro.dll not built (expected $SameBoyRb); build RetroHub with MinGW gcc (see RetroHub CLAUDE.md)" }
+    Copy-Item $SameBoyRb $CoreDst -Force
     Get-ChildItem -Path (Join-Path $CoreSrc "info") -File -Filter "*.info" -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName (Join-Path $CoreDst "info") }
     Copy-Item (Join-Path $HubBin "SDL2.dll") $StageDir -Force
 
@@ -296,6 +301,7 @@ cores\ contains unmodified libretro cores loaded by retrorun.exe:
 
   - mGBA (MPL-2.0), SameBoy (MIT), Gambatte (GPL-2.0)
   - mgba_link_libretro (mGBA 0.10.5 built from source, MPL-2.0)  source: https://github.com/mgba-emu/mgba
+  - sameboy_rb_libretro (SameBoy MIT, libretro fork with a rollback determinism patch)  source: https://github.com/libretro/SameBoy
   - melonDS DS (GPL-3.0-or-later)  source: https://github.com/JesseTG/melonds-ds
 '@ | Set-Content -Path (Join-Path $LicensesDir "emulator-README.txt") -Encoding UTF8
 } else {
