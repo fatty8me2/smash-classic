@@ -95,6 +95,7 @@ async function budget(env, body) {
   } catch (e) { throw new BudgetDown(String(e)); }
 }
 const busyToday = () => err(429, "cloud-saves-busy-today", { retryAfter: 3600 });
+const unavailable = () => err(429, "cloud-saves-unavailable", { retryAfter: 600 });
 const paused = () => err(429, "cloud-saves-paused", { retryAfter: 3600 });
 const full = () => err(507, "cloud-saves-full");
 
@@ -102,7 +103,7 @@ export async function savesFetch(request, env) {
   if (!env.SAVES) return err(503, "cloud-saves-disabled");
   if (!env.R2_BUDGET) return err(503, "cloud-saves-disabled");   // no budget guard -> never touch R2
   try { return await savesInner(request, env); }
-  catch (e) { if (e instanceof BudgetDown) return paused(); throw e; }
+  catch (e) { if (e instanceof BudgetDown) return unavailable(); throw e; }
 }
 
 async function savesInner(request, env) {

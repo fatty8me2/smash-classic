@@ -67,7 +67,8 @@ const status = async () => (await (await fetch(BASE + "/saves/_test/status")).js
 const test = (path) => fetch(BASE + path).then((r) => r.json());
 
 const PH1 = { BUDGET_TEST: "1", BUDGET_STORAGE_MAX: "1000", BUDGET_A_MAX: "6", BUDGET_B_MAX: "4", SAVES_QUOTA: "600", SAVES_MAX_FILES: "50" };
-const PH2 = { BUDGET_TEST: "1", BUDGET_STORAGE_MAX: "100000", SAVES_QUOTA: "100000", PENDING_TTL_MS: "1500", DAILY_ROWS_MAX: "60" };
+const PH3 = { BUDGET_TEST: "1", SAVES_QUOTA: "100000", DAILY_READS_MAX: "40", EST_MS: "1000", DAILY_MS_MAX: "1000000" };
+const PH2 = { BUDGET_TEST: "1", BUDGET_STORAGE_MAX: "100000", SAVES_QUOTA: "100000", PENDING_TTL_MS: "1500", DAILY_ROWS_MAX: "300" };
 
 // PUT whose body arrives in two parts, `gap` ms apart (a slow upload).
 function slowPut(a, k, body, gap, ifMatch) {
@@ -121,6 +122,9 @@ async function phase2() {
   check((await put(B, "after.sav", Buffer.alloc(5, 2))).status === 200, "service continues");
   check((await status()).dirty === 1, "expired upload marks the index dirty");
   await test("/saves/_test/reconcile");
+  check((await status()).dirty === 1, "reconcile defers while an expired upload may still be landing");
+  await sleep(1700);
+  await test("/saves/_test/reconcile");
   await consistent("after reconcile");
   check((await get(A, "cf2.sav")).status === 200, "reconcile recovered the object that landed without a commit");
   check((await status()).dirty === 0, "reconcile clears dirty");
@@ -134,12 +138,35 @@ async function phase2() {
 
   // daily row guard
   let code = null, n = 0;
-  for (let i = 0; i < 60 && !code; i++) { const r = await put(B, `d${i}`, Buffer.from("z" + i)); n++; if (r.status !== 200) code = r; }
+  for (let i = 0; i < 200 && !code; i++) { const r = await put(B, `d${i}`, Buffer.from("z" + i)); n++; if (r.status !== 200) code = r; }
   check(code && code.status === 429 && code.data.error === "cloud-saves-busy-today", `daily rows guard -> 429 cloud-saves-busy-today after ${n} puts`);
   check((await get(B, "d0")).status === 429, "gets pause too");
   check((await del(B, "d0")).status === 200, "delete still allowed (frees storage)");
   await test("/saves/_test/day?d=2099-12-31");
   check((await put(B, "newday.sav", Buffer.from("q"))).status === 200, "new UTC day resets the guard");
+}
+
+async function phase3() {
+  const A = await account(), B = await account();
+  const s0 = await status();
+  await put(A, "w1", Buffer.alloc(50, 1));
+  const s1 = await status();
+  check(s1.rows - s0.rows >= 3, `real rowsWritten counted for a put (${s1.rows - s0.rows} rows, want >= 3)`);
+  const r0 = (await status()).reads;
+  await get(A, "w1");
+  check((await status()).reads > r0, "rowsRead counted");
+  await put(A, "w2", Buffer.alloc(60, 2)); await put(B, "b1", Buffer.alloc(70, 3));
+  await del(A, "w1");
+  const ac = await test("/saves/_test/acct");
+  check(JSON.stringify(ac.acct) === JSON.stringify(ac.real), `per-account table matches the index (${JSON.stringify(ac.acct)})`);
+  const st = await status();
+  check(st.ms >= 1000 * 6, `wall-time meter counts requests (${st.ms} ms)`);
+  let code = null;
+  for (let i = 0; i < 80 && !code; i++) { const r = await put(B, `r${i}`, Buffer.from("k" + i)); if (r.status !== 200) code = r; }
+  check(code && code.status === 429 && code.data.error === "cloud-saves-busy-today", "rows-read daily cap -> busy-today");
+  check((await status()).reads < 40 * 2, "reads stay near the cap");
+  await test("/saves/_test/day?d=2099-12-30");
+  check((await put(B, "ok", Buffer.from("q"))).status === 200, "reads reset on a new day");
 }
 
 async function main() {
@@ -205,12 +232,15 @@ async function main() {
   // --- fail closed ---
   await test("/saves/_test/fail?on=1");
   const fr = [await put(F, "f2", Buffer.from("q")), await get(F, "f1"), await call(F, "GET", "/saves/list"), await del(F, "f1")];
-  check(fr.every((r) => r.status === 429 && r.data.error === "cloud-saves-paused"), `budget DO failure refuses everything (${fr.map((r) => r.status)})`);
+  check(fr.every((r) => r.status === 429 && r.data.error === "cloud-saves-unavailable"), `budget DO failure refuses everything (${fr.map((r) => r.status)})`);
   await test("/saves/_test/fail?on=0");
   check((await get(F, "f1")).status === 200, "recovers once the DO is healthy");
   stop(); await sleep(1500);
   await start(PH2);
   await phase2();
+  stop(); await sleep(1500);
+  await start(PH3);
+  await phase3();
 }
 
 main().catch((e) => { fails++; console.log("ERROR:", e); }).finally(() => {
