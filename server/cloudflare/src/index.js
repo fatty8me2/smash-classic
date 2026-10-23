@@ -48,6 +48,7 @@ import { DurableObject } from "cloudflare:workers";
 import { hubFetch, HubRoom } from "./hub.js";
 
 import { friendsFetch, UserHub, Directory } from "./friends.js";
+import { inviteFetch } from "./invite.js";
 
 export { HubRoom, UserHub, Directory };
 
@@ -73,6 +74,9 @@ export default {
     }
     if (url.pathname === "/hub") {
       return hubFetch(request, env);
+    }
+    if (url.pathname.startsWith("/j/")) {
+      return inviteFetch(request, url.pathname);
     }
     if (url.pathname === "/friends") {
       return friendsFetch(request, env);
