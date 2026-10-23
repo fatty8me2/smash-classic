@@ -354,6 +354,21 @@ if ($Iscc) {
     Write-Host "Setup ready: $SetupPath" -ForegroundColor Green
 }
 
+# ── 7. SHA256SUMS.txt: the in-app updater (RetroHub src/hub/updater.cpp) verifies the zip against this ──
+# Upload it as a release asset next to the zip and the setup exe. Format: "<sha256>  <file name>" per line,
+# lowercase hex, LF endings, no BOM (sha256sum -c compatible). JP gets its own file name so variants never collide.
+Write-Step "Writing checksums"
+$SumsPath = Join-Path $DistDir $(if ($Ver -eq "jp") { "SHA256SUMS-JP.txt" } else { "SHA256SUMS.txt" })
+$SumLines = foreach ($f in @($ZipPath, $SetupPath)) {
+    if ($f -and (Test-Path $f)) {
+        $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower()
+        "$h  $(Split-Path -Leaf $f)"
+    }
+}
+[System.IO.File]::WriteAllText($SumsPath, (($SumLines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+Write-Host "Checksums ready: $SumsPath" -ForegroundColor Green
+$SumLines | ForEach-Object { Write-Host "   $_" }
+
 $ZipKB = [int]((Get-Item $ZipPath).Length / 1024)
 Write-Host "`nRelease zip ready: $ZipPath ($ZipKB KB)" -ForegroundColor Green
 Write-Host "   Portable: extract anywhere; save data lives next to BattleShip.exe."
