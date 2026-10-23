@@ -5,6 +5,10 @@ const BASE = process.argv[2] || "ws://127.0.0.1:8799";
 let fails = 0;
 const check = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else console.log("ok:  ", m); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Live Workers have ~1 s connect latency with multi-second spikes: waits are condition-based with a
+// generous timeout, and the fixed "nothing should arrive" settles are longer off-localhost.
+const REMOTE = !/^wss?:\/\/(127\.0\.0\.1|localhost)/.test(BASE);
+const settle = (ms) => sleep(REMOTE ? Math.max(ms, 2500) : ms);
 
 function open(room, role, v = 2) {
   const ws = new WebSocket(`${BASE}/ws?room=${room}&role=${role}${v ? `&v=${v}` : ""}`);
@@ -14,10 +18,15 @@ function open(room, role, v = 2) {
     if (typeof e.data === "string") c.text.push(JSON.parse(e.data));
     else c.bin.push(new Uint8Array(e.data));
   };
+  ws.onerror = () => { c.connectFailed = true; console.log(`note: connect failed for ${room}/${role} (429 room-create rate limit? 30 hosts/min/IP; space runs >60 s apart)`); };
   ws.onclose = (e) => { c.closed = { code: e.code, reason: e.reason }; };
-  c.send = (o) => ws.send(JSON.stringify(o));
+  c.send = (o) => {
+    const data = JSON.stringify(o);
+    if (ws.readyState === 0) ws.addEventListener("open", () => ws.send(data), { once: true });
+    else ws.send(data);
+  };
   c.last = (type) => [...c.text].reverse().find((m) => m.type === type);
-  c.wait = async (fn, ms = 3000) => {
+  c.wait = async (fn, ms = 20000) => {
     const t0 = Date.now();
     while (Date.now() - t0 < ms) { if (fn()) return true; await sleep(20); }
     return false;
@@ -51,7 +60,7 @@ const code = () => {
 
   // Relay is off: binary dropped.
   p[0].ws.send(new Uint8Array([1, 9, 9]));
-  await sleep(300);
+  await settle(300);
   check(p[1].bin.length === 0, "binary dropped before relay flag set");
 
   p[2].send({ type: "relay" });
@@ -64,7 +73,7 @@ const code = () => {
   check(p[0].bin.length === 0 && p[2].bin.length === 0, "other players don't see it");
   p[1].ws.send(new Uint8Array([1 << 1, 7]));   // to itself
   p[1].ws.send(new Uint8Array([0x10, 7]));     // no valid destination
-  await sleep(300);
+  await settle(300);
   check(p[1].bin.length === 0, "self/invalid destinations dropped");
 
   // Multicast: one frame to slots 0, 2 and 3.
@@ -82,8 +91,8 @@ const code = () => {
     p[0].ws.send(new Uint8Array([1 << 2, i & 255, i >> 8]));
     p[2].ws.send(new Uint8Array([1 << 0, i & 255, i >> 8]));
   }
-  check(await p[2].wait(() => p[2].bin.length >= N, 5000), "slot 2 received all of host's frames");
-  check(await p[0].wait(() => p[0].bin.length >= N, 5000), "host received all of slot 2's frames");
+  check(await p[2].wait(() => p[2].bin.length >= N, 20000), "slot 2 received all of host's frames");
+  check(await p[0].wait(() => p[0].bin.length >= N, 20000), "host received all of slot 2's frames");
   let ordered = true;
   for (let i = 0; i < N; i++) if (p[2].bin[i][0] !== 0 || p[2].bin[i][1] !== (i & 255)) ordered = false;
   check(ordered, "frames in order with source = host");
@@ -141,10 +150,11 @@ const code = () => {
   const room = code();
   const h1 = open(room, "host", 2);
   const h2 = open(room, "host", 2);
-  await sleep(500);
+  await h1.wait(() => (h1.last("welcome") || h1.closed) && (h2.last("welcome") || h2.closed));
   const winners = [h1, h2].filter((h) => h.last("welcome"));
   check(winners.length === 1, "only one of two simultaneous hosts gets slot 0");
   const loser = [h1, h2].find((h) => !h.last("welcome"));
+  await loser?.wait(() => loser.last("error"));
   check(loser?.last("error")?.reason === "room-in-use", "losing host told room-in-use");
   const host = winners[0];
   host.ws.send("null");
@@ -163,7 +173,7 @@ const code = () => {
   await p[0].wait(() => p[0].last("welcome"));
   for (let i = 1; i <= 2; i++) { p.push(open(room, "join")); await p[i].wait(() => p[i].last("welcome")); }
   for (let i = 0; i < 3; i++) p[i].send({ type: "endpoint", public: `2.2.2.${i}:200${i}`, local: `10.0.1.${i}:200${i}` });
-  await sleep(300);
+  await settle(300);
   const tokOf = (c, slot) => c.last("peers")?.peers.find((x) => x.slot === slot)?.tok;
   const HEX = /^[0-9a-f]{32}$/;
   check(p.every((c) => c.last("peers").peers.find((x) => x.slot === p.indexOf(c)).tok === undefined), "own roster entry carries no token");
@@ -181,7 +191,7 @@ const code = () => {
   check(HEX.test(tokOf(p[0], 1)) && tokOf(p[0], 1) !== old, "reused slot gets a new token (old holder's is dead)");
   check(tokOf(p[0], 1) === tokOf(p[1], 0), "new pair tokens match on both ends");
   p[1].send({ type: "endpoint", public: "2.2.2.9:2009", local: "-" });
-  await sleep(200);
+  await settle(200);
   check(tokOf(p[0], 1) !== undefined && tokOf(p[1], 2) === tokOf(p[2], 1), "endpoint update keeps tokens");
   for (const c of p) c.ws.close();
 }
@@ -192,7 +202,7 @@ const code = () => {
   const h = open(room, "host", 0); await h.wait(() => h.last("welcome"));
   const j = open(room, "join", 0); await j.wait(() => j.last("welcome"));
   h.send({ type: "endpoint", public: "3.3.3.3:1", local: "-" }); j.send({ type: "endpoint", public: "3.3.3.4:1", local: "-" });
-  await sleep(300);
+  await settle(300);
   check(!JSON.stringify(h.text).includes('"tok"'), "legacy room has no tokens");
   h.ws.close(); j.ws.close();
 }
