@@ -16,7 +16,9 @@ function open(room, role, { v = 2, hm = true } = {}) {
     else c.bin.push(new Uint8Array(e.data));
   };
   ws.onclose = (e) => { c.closed = { code: e.code, reason: e.reason }; };
-  c.send = (o) => ws.send(JSON.stringify(o));
+  // Never send before the socket is open ("sent before socket open"): queue until the open event.
+  c.sendRaw = (d) => { if (ws.readyState === 0) ws.addEventListener("open", () => ws.send(d), { once: true }); else ws.send(d); };
+  c.send = (o) => c.sendRaw(JSON.stringify(o));
   c.last = (type) => [...c.text].reverse().find((m) => m.type === type);
   c.all = (type) => c.text.filter((m) => m.type === type);
   c.wait = async (fn, ms = 3000) => {
@@ -61,9 +63,9 @@ async function room(n, opts) {
 
   p[2].send({ type: "relay" });
   check(await p[1].wait(() => p[1].last("relaying")), "relay can still be enabled");
-  p[1].ws.send(new Uint8Array([1 << 2, 0xAB]));
+  p[1].sendRaw(new Uint8Array([1 << 2, 0xAB]));
   check(await p[2].wait(() => p[2].bin.length === 1 && p[2].bin[0][0] === 1 && p[2].bin[0][1] === 0xAB), "relay between survivors works");
-  p[1].ws.send(new Uint8Array([1 << 0, 0xCD]));   // to the vanished slot 0
+  p[1].sendRaw(new Uint8Array([1 << 0, 0xCD]));   // to the vanished slot 0
   await sleep(200);
   check(p[2].bin.length === 1, "frame to the empty slot is dropped");
 
@@ -73,7 +75,7 @@ async function room(n, opts) {
   check(j.slot() === 0 && j.last("welcome").host === 1, "joiner fills slot 0; host stays 1");
   j.send({ type: "endpoint", public: "9.9.9.9:999", local: "10.0.0.9:999" });
   check(await p[1].wait(() => p[1].roster() === "0,1,2" && p[1].last("peers").host === 1), "everyone sees roster 0,1,2 with host 1");
-  p[1].ws.send(new Uint8Array([1 << 0, 0x11]));
+  p[1].sendRaw(new Uint8Array([1 << 0, 0x11]));
   check(await j.wait(() => j.bin.length === 1 && j.bin[0][0] === 1), "relay reaches the joiner in slot 0 (relay flag persisted)");
 
   // A game that doesn't know migration can't join a migrated room.
