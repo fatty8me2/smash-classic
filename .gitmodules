@@ -1,6 +1,7 @@
 [submodule "libultraship"]
 	path = libultraship
 	url = https://github.com/JRickey/libultraship.git
+	ignore = dirty
 	branch = ssb64
 [submodule "torch"]
 	path = torch

@@ -183,6 +183,7 @@ endif()
 # Subdirectories: libultraship
 ################################################################################
 
+include(cmake/ApplyLusPatches.cmake)
 add_subdirectory(libultraship ${CMAKE_BINARY_DIR}/libultraship)
 
 ################################################################################

@@ -1,0 +1,82 @@
+From 297554eb51514068168dbc75c2095650d5229af6 Mon Sep 17 00:00:00 2001
+From: Cameron Wiegand <cameron.wiegand@gmail.com>
+Date: Wed, 21 Oct 2026 22:51:11 -0500
+Subject: [PATCH 1/2] SSB64_HIDDEN_WINDOW=1: render without ever showing the
+ window (test harness)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/fast/backends/gfx_dxgi.cpp | 13 +++++++++----
+ src/fast/backends/gfx_sdl2.cpp | 16 +++++++++++++---
+ 2 files changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/src/fast/backends/gfx_dxgi.cpp b/src/fast/backends/gfx_dxgi.cpp
+index dc6d9378..80a485a5 100644
+--- a/src/fast/backends/gfx_dxgi.cpp
++++ b/src/fast/backends/gfx_dxgi.cpp
+@@ -620,13 +620,18 @@ void GfxWindowBackendDXGI::Init(const char* game_name, const char* gfx_api_name,
+ 
+     LoadDxgi();
+ 
+-    ShowWindow(h_wnd, SW_SHOW);
+-    UpdateWindow(h_wnd);
++    // SSB64_HIDDEN_WINDOW=1 (test harness): render without ever showing the window.
++    const char* hiddenEnv = std::getenv("SSB64_HIDDEN_WINDOW");
++    const bool hiddenWindow = hiddenEnv != nullptr && hiddenEnv[0] != '\0' && hiddenEnv[0] != '0';
++    if (!hiddenWindow) {
++        ShowWindow(h_wnd, SW_SHOW);
++        UpdateWindow(h_wnd);
++    }
+ 
+     // Get refresh rate
+     GetMonitorHzPeriod(mMonitor, mDetectedHz, mDisplayPeriod);
+ 
+-    if (start_in_fullscreen) {
++    if (start_in_fullscreen && !hiddenWindow) {
+         ToggleBorderlessWindowFullScreen(true, false);
+     }
+ 
+@@ -637,7 +642,7 @@ void GfxWindowBackendDXGI::Init(const char* game_name, const char* gfx_api_name,
+     // + AttachThreadInput dance bypasses the foreground lock so the game
+     // actually appears on screen with focus on launch.
+ #ifndef _UWP
+-    {
++    if (!hiddenWindow) {
+         DWORD thisTid = GetCurrentThreadId();
+         HWND fg = GetForegroundWindow();
+         DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+diff --git a/src/fast/backends/gfx_sdl2.cpp b/src/fast/backends/gfx_sdl2.cpp
+index ddd81805..e011a94a 100644
+--- a/src/fast/backends/gfx_sdl2.cpp
++++ b/src/fast/backends/gfx_sdl2.cpp
+@@ -415,6 +415,12 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
+ #else
+     Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+ #endif
++    // SSB64_HIDDEN_WINDOW=1 (test harness): render without ever showing the window.
++    const char* hiddenEnv = std::getenv("SSB64_HIDDEN_WINDOW");
++    const bool hiddenWindow = hiddenEnv != nullptr && hiddenEnv[0] != '\0' && hiddenEnv[0] != '0';
++    if (hiddenWindow) {
++        flags = (flags & ~SDL_WINDOW_SHOWN) | SDL_WINDOW_HIDDEN;
++    }
+ 
+     if (use_opengl) {
+         flags = flags | SDL_WINDOW_OPENGL;
+@@ -479,10 +485,14 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
+     // Final step before scancode tables: claw foreground focus back so the
+     // window doesn't end up minimized in the taskbar (especially common when
+     // launching directly into fullscreen).
+-    SDL_RaiseWindow(mWnd);
+-    gfx_sdl_force_foreground_on_launch(mWnd);
++    if (!hiddenWindow) {
++        SDL_RaiseWindow(mWnd);
++        gfx_sdl_force_foreground_on_launch(mWnd);
++    }
+ #else
+-    SDL_RaiseWindow(mWnd);
++    if (!hiddenWindow) {
++        SDL_RaiseWindow(mWnd);
++    }
+ #endif
+ 
+     for (size_t i = 0; i < std::size(lus_to_sdl_table); i++) {
