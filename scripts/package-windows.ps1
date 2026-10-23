@@ -248,6 +248,10 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     $CoreDst = Join-Path $StageDir "cores"
     New-Item -ItemType Directory -Path (Join-Path $CoreDst "info") -Force | Out-Null
     Get-ChildItem -Path $CoreSrc -File -Filter "*_libretro.dll" | ForEach-Object { Copy-Item $_.FullName $CoreDst }
+    # GBA link cable core (N mGBA cores in one libretro DLL, built from source by RetroHub; MPL-2.0).
+    $LinkCore = Join-Path $HubBin "cores\mgba_link_libretro.dll"
+    if (-not (Test-Path $LinkCore)) { Fail "mgba_link_libretro.dll not built (expected $LinkCore)" }
+    Copy-Item $LinkCore $CoreDst -Force
     Get-ChildItem -Path (Join-Path $CoreSrc "info") -File -Filter "*.info" -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName (Join-Path $CoreDst "info") }
     Copy-Item (Join-Path $HubBin "SDL2.dll") $StageDir -Force
 
@@ -291,6 +295,7 @@ The full license text is in mupen64plus-LICENSES.txt.
 cores\ contains unmodified libretro cores loaded by retrorun.exe:
 
   - mGBA (MPL-2.0), SameBoy (MIT), Gambatte (GPL-2.0)
+  - mgba_link_libretro (mGBA 0.10.5 built from source, MPL-2.0)  source: https://github.com/mgba-emu/mgba
   - melonDS DS (GPL-3.0-or-later)  source: https://github.com/JesseTG/melonds-ds
 '@ | Set-Content -Path (Join-Path $LicensesDir "emulator-README.txt") -Encoding UTF8
 } else {
