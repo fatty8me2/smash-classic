@@ -48,6 +48,7 @@ import { DurableObject } from "cloudflare:workers";
 import { hubFetch, HubRoom } from "./hub.js";
 
 import { friendsFetch, UserHub, Directory } from "./friends.js";
+import { savesFetch } from "./saves.js";
 
 export { HubRoom, UserHub, Directory };
 
@@ -76,6 +77,9 @@ export default {
     }
     if (url.pathname === "/friends") {
       return friendsFetch(request, env);
+    }
+    if (url.pathname.startsWith("/saves/")) {
+      return savesFetch(request, env);
     }
     if (url.pathname !== "/ws") {
       return new Response("not found", { status: 404 });

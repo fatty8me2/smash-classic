@@ -297,6 +297,13 @@ export class UserHub extends DurableObject {
     if (!b || !UID_RE.test(b.uid || "")) return { r: "none" };
     const from = b.uid;
     switch (route) {
+      case "saves_auth": {
+        // Cloud saves: hand the Worker the HMAC key (sha256hex of the secret) after rate limiting this account.
+        if (from !== p.uid) return { r: "none" };
+        const w = !!b.write;
+        if (!this.hit(w ? "saves:w" : "saves:r", w ? 120 : 600, 60000)) return { r: "limited" };
+        return { r: "ok", key: p.secret_hash };
+      }
       case "presence": {
         if (!this.isFriend(from)) return { r: "none" };
         const st = sanitizeStatus(b.status) || offlineStatus();
