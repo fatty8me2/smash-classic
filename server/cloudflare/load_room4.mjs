@@ -1,4 +1,5 @@
 // Load test: N players blast small relay frames at each other at 60 Hz, like a match.
+// Run: npx wrangler dev --port 8799   (in another shell), then: node load_room4.mjs 3 8 ws://127.0.0.1:8799
 // Usage: node load_room4.mjs [players=3] [seconds=8] [ws://127.0.0.1:8799]
 const PLAYERS = Number(process.argv[2] || 3);
 const SECONDS = Number(process.argv[3] || 8);

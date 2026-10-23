@@ -1,4 +1,5 @@
 // Node test for the 4-player /ws room (protocol v2) and legacy (v1) compatibility.
+// Run: npx wrangler dev --port 8799   (in another shell), then: node test_room4.mjs ws://127.0.0.1:8799
 // Usage: node test_room4.mjs [ws://127.0.0.1:8799]   (against `npx wrangler dev --port 8799`)
 const BASE = process.argv[2] || "ws://127.0.0.1:8799";
 let fails = 0;
