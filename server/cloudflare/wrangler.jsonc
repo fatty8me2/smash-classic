@@ -14,7 +14,9 @@
       { "name": "HUB_ROOMS", "class_name": "HubRoom" },
       { "name": "USER_HUBS", "class_name": "UserHub" },
       { "name": "DIRECTORY", "class_name": "Directory" },
-      { "name": "LINK_BOXES", "class_name": "LinkBox" }
+      { "name": "LINK_BOXES", "class_name": "LinkBox" },
+      // Global R2 free-tier budget guard + saves index (src/r2budget.js). Free-plan SQLite class.
+      { "name": "R2_BUDGET", "class_name": "R2Budget" }
     ]
   },
   // Optional cloud saves (src/saves.js). Without this binding every /saves route answers 503 and nothing else
@@ -25,6 +27,7 @@
     { "tag": "v1", "new_sqlite_classes": ["NetplayRoom"] },
     { "tag": "v2", "new_sqlite_classes": ["HubRoom"] },
     { "tag": "v3", "new_sqlite_classes": ["UserHub", "Directory"] },
-    { "tag": "v4", "new_sqlite_classes": ["LinkBox"] }
+    { "tag": "v4", "new_sqlite_classes": ["LinkBox"] },
+    { "tag": "v5", "new_sqlite_classes": ["R2Budget"] }
   ]
 }

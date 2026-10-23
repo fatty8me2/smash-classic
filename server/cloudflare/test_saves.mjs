@@ -197,7 +197,9 @@ async function main() {
     last = (await put(Q, `fill/${n}.bin`, buf)).status;
     if (last === 200) n++;
   }
-  check(last === 507 && n >= 31 && n <= 32, `quota stops at ~500 MB (accepted ${n - 1} x 16 MB, then ${last})`);
+  const qmb = (await call(Q, "GET", "/saves/list")).data.quota / 1048576;
+  check(qmb === 200, "per-account quota is 200 MB");
+  check(last === 507 && n - 1 === Math.floor(qmb / 16), `quota stops at ~${qmb} MB (accepted ${n - 1} x 16 MB, then ${last})`);
   const lq = await call(Q, "GET", "/saves/list");
   check(lq.data.used <= lq.data.quota, "used never exceeds quota");
   check((await put(Q, "small.sav", Buffer.from("tiny"))).status === 200 || true, "small write after quota is evaluated");

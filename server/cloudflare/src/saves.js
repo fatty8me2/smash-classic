@@ -1,4 +1,4 @@
-﻿// RetroHub optional cloud saves (R2). Second sync backend beside sync folders.
+// RetroHub optional cloud saves (R2). Second sync backend beside sync folders.
 //
 //   GET    /saves/list                  -> {ok, files:[{key,size,etag,sha,mtime}], used, quota, maxObject}
 //   GET    /saves/obj?key=REL           -> object bytes (supports "Range: bytes=N-" to resume)
@@ -20,8 +20,8 @@
 
 const UID_RE = /^[a-z2-7]{26}$/;
 export const MAX_OBJECT = 16 * 1024 * 1024;
-export const QUOTA = 500 * 1024 * 1024;
-export const MAX_FILES = 3000;
+export const QUOTA = 200 * 1024 * 1024;   // per account (env SAVES_QUOTA overrides, for tests)
+export const MAX_FILES = 1500;
 const MAX_KEY = 240;
 const MAX_SEGMENTS = 8;
 const SKEW_MS = 5 * 60 * 1000;
@@ -83,30 +83,30 @@ async function authenticate(request, env, url, write) {
   return { uid };
 }
 
-function metaOf(o) {
-  const c = o.customMetadata || {};
-  return { key: null, size: o.size, etag: o.httpEtag || o.etag, sha: c.sha || "", mtime: c.mtime || "0" };
+// Every R2 call goes through the global R2Budget Durable Object first (src/r2budget.js). If it errors or is
+// unreachable the operation is refused: fail CLOSED.
+class BudgetDown extends Error {}
+async function budget(env, body) {
+  try {
+    const r = await env.R2_BUDGET.get(env.R2_BUDGET.idFromName("global")).fetch("https://budget/b", {
+      method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error("budget " + r.status);
+    return await r.json();
+  } catch (e) { throw new BudgetDown(String(e)); }
 }
-
-async function listAll(env, prefix) {
-  const files = [];
-  let cursor;
-  let used = 0;
-  do {
-    const page = await env.SAVES.list({ prefix, cursor, limit: 1000, include: ["customMetadata"] });
-    for (const o of page.objects) {
-      const m = metaOf(o);
-      m.key = o.key.slice(prefix.length);
-      files.push(m);
-      used += o.size;
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor && files.length <= MAX_FILES + 1000);
-  return { files, used };
-}
+const paused = () => err(429, "cloud-saves-paused", { retryAfter: 3600 });
+const full = () => err(507, "cloud-saves-full");
 
 export async function savesFetch(request, env) {
   if (!env.SAVES) return err(503, "cloud-saves-disabled");
+  if (!env.R2_BUDGET) return err(503, "cloud-saves-disabled");   // no budget guard -> never touch R2
+  try { return await savesInner(request, env); }
+  catch (e) { if (e instanceof BudgetDown) return paused(); throw e; }
+}
+
+async function savesInner(request, env) {
+  const testRes = await testHooks(request, env);
+  if (testRes) return testRes;
   const url = new URL(request.url);
   const route = url.pathname;
   const method = request.method;
@@ -125,8 +125,8 @@ export async function savesFetch(request, env) {
   const prefix = `saves/${au.uid}/`;
 
   if (route === "/saves/list") {
-    const { files, used } = await listAll(env, prefix);
-    return json({ ok: true, files, used, quota: QUOTA, maxObject: MAX_OBJECT });
+    const l = await budget(env, { op: "list", uid: au.uid });   // served from the DO index: zero R2 ops
+    return json({ ok: true, files: l.files, used: l.used, quota: l.quota, maxObject: MAX_OBJECT });
   }
 
   const key = cleanKey(url.searchParams.get("key"));
@@ -135,33 +135,33 @@ export async function savesFetch(request, env) {
 
   if (method === "GET") {
     const range = /^bytes=(\d+)-$/.exec(request.headers.get("Range") || "");
-    const head = await env.SAVES.head(rkey);
-    if (!head) return err(404, "not-found");
+    const g = await budget(env, { op: "get", rkey });            // reserves one Class B op
+    if (g.r === "none") return err(404, "not-found");
+    if (g.r === "paused") return paused();
     const off = range ? Number(range[1]) : 0;
-    if (off >= head.size && head.size > 0) return err(416, "bad-range");
-    const obj = off ? await env.SAVES.get(rkey, { range: { offset: off }, onlyIf: { etagMatches: head.etag } })
-                    : await env.SAVES.get(rkey, { onlyIf: { etagMatches: head.etag } });
+    if (off >= g.size && g.size > 0) return err(416, "bad-range");
+    const obj = off ? await env.SAVES.get(rkey, { range: { offset: off }, onlyIf: { etagMatches: g.rawEtag } })
+                    : await env.SAVES.get(rkey, { onlyIf: { etagMatches: g.rawEtag } });
     if (!obj || !obj.body) return err(409, "changed-during-read");
-    const m = metaOf(head);
     return new Response(obj.body, {
       status: off ? 206 : 200,
       headers: {
         "content-type": "application/octet-stream",
-        ETag: m.etag,
-        "X-RH-Sha": m.sha,
-        "X-RH-Mtime": m.mtime,
-        "X-RH-Size": String(head.size),
-        ...(off ? { "Content-Range": `bytes ${off}-${head.size - 1}/${head.size}` } : {}),
+        ETag: g.etag,
+        "X-RH-Sha": g.sha,
+        "X-RH-Mtime": g.mtime,
+        "X-RH-Size": String(g.size),
+        ...(off ? { "Content-Range": `bytes ${off}-${g.size - 1}/${g.size}` } : {}),
       },
     });
   }
 
-  if (method === "DELETE") {
-    const head = await env.SAVES.head(rkey);
-    if (!head) return json({ ok: true, deleted: false });
-    const im = request.headers.get("If-Match");
-    if (im && im !== head.httpEtag && im !== head.etag) return err(412, "conflict", { current: metaOf(head) });
+  if (method === "DELETE") {     // free R2 op and frees budgeted storage: allowed even when the budget is exhausted
+    const d = await budget(env, { op: "del_check", rkey, ifMatch: request.headers.get("If-Match") });
+    if (d.r === "none") return json({ ok: true, deleted: false });
+    if (d.r === "conflict") return err(412, "conflict", { current: d.current });
     await env.SAVES.delete(rkey);
+    await budget(env, { op: "del_commit", rkey });
     return json({ ok: true, deleted: true });
   }
 
@@ -173,37 +173,50 @@ export async function savesFetch(request, env) {
   const ifMatch = request.headers.get("If-Match");
   const ifNone = request.headers.get("If-None-Match");
   if (!ifMatch && ifNone !== "*") return err(428, "precondition-required");
-
-  const head = await env.SAVES.head(rkey);
-  if (ifNone === "*" && head) return err(412, "conflict", { current: metaOf(head) });
-  if (ifMatch && (!head || (ifMatch !== head.httpEtag && ifMatch !== head.etag))) {
-    return err(412, "conflict", { current: head ? metaOf(head) : null });
-  }
   const len = Number(request.headers.get("Content-Length"));
-  // Idempotent retry: identical content already stored -> success without rewriting.
-  if (head && head.customMetadata && head.customMetadata.sha === sha && head.size === len) {
-    return json({ ok: true, etag: head.httpEtag || head.etag, unchanged: true });
-  }
-  const { files, used } = await listAll(env, prefix);
-  const old = head ? head.size : 0;
-  if (!head && files.length >= MAX_FILES) return err(507, "too-many-files", { max: MAX_FILES });
-  if (used - old + len > QUOTA) return err(507, "quota-exceeded", { used, quota: QUOTA });
 
-  // The body must be exactly Content-Length bytes and hash to X-RH-Sha. Both are enforced while the upload
-  // streams (FixedLengthStream errors on a mismatch, put's sha256 option rejects a bad digest), so a bad upload
-  // fails before anything is committed and the previous version is never touched.
+  // One atomic DO step: preconditions, idempotency, per-account + global storage caps, Class A reservation.
+  const b = await budget(env, { op: "put_begin", uid: au.uid, rkey, len, sha, ifMatch, ifNone });
+  switch (b.r) {
+    case "conflict": return err(412, "conflict", { current: b.current });
+    case "busy": return err(409, "busy", { retryAfter: 5 });
+    case "unchanged": return json({ ok: true, etag: b.etag, unchanged: true });
+    case "toomany": return err(507, "too-many-files", { max: b.max });
+    case "quota": return err(507, "quota-exceeded", { used: b.used, quota: b.quota });
+    case "full": return full();
+    case "paused": return paused();
+    case "ok": break;
+    default: return paused();
+  }
+
+  // The body must be exactly Content-Length bytes and hash to X-RH-Sha (enforced while streaming), so a bad upload
+  // fails before anything is committed and the previous version is never touched. The conditional put makes R2
+  // itself reject a lost race (replace: etag must match; create: object must not exist).
   let put;
   try {
     const body = len === 0 || !request.body ? new Uint8Array(0) : request.body.pipeThrough(new FixedLengthStream(len));
     put = await env.SAVES.put(rkey, body, {
       sha256: sha,
       customMetadata: { sha, mtime },
-      onlyIf: head ? { etagMatches: head.etag } : undefined,
+      onlyIf: b.etag ? { etagMatches: b.etag } : { etagDoesNotMatch: "*" },
     });
   } catch (e) {
+    await budget(env, { op: "put_abort", rkey }).catch(() => {});
     return err(400, "bad-body");   // digest mismatch / truncated upload
   }
-  if (!put) return err(412, "conflict", { current: metaOf((await env.SAVES.head(rkey)) || { size: 0 }) });
-  if (put.size !== len) return err(400, "bad-length"); // unreachable in practice; never delete on the replace path
+  if (!put) { await budget(env, { op: "put_abort", rkey }).catch(() => {}); return err(412, "conflict", { current: null }); }
+  await budget(env, { op: "put_commit", rkey, size: put.size, etag: put.etag, hetag: put.httpEtag || put.etag, sha, mtime });
   return json({ ok: true, etag: put.httpEtag || put.etag });
+}
+
+// Test-only hooks (need BUDGET_TEST=1 in .dev.vars; never set in production).
+async function testHooks(request, env) {
+  if (env.BUDGET_TEST !== "1") return null;
+  const u = new URL(request.url);
+  if (!u.pathname.startsWith("/saves/_test/")) return null;
+  const op = u.pathname.slice("/saves/_test/".length);
+  const body = op === "month" ? { op: "test_month", month: u.searchParams.get("m") }
+    : op === "fail" ? { op: "test_fail", on: u.searchParams.get("on") === "1" }
+    : { op: "status" };
+  return json(await budget(env, body));
 }

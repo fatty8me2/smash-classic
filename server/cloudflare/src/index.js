@@ -58,8 +58,9 @@ import { inviteFetch } from "./invite.js";
 import { linkFetch, LinkBox } from "./link.js";
 import { FixedWindow, ByteBucket, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN, RELAY_ABUSE_MS } from "./limits.js";
 import { savesFetch } from "./saves.js";
+import { R2Budget } from "./r2budget.js";
 
-export { HubRoom, UserHub, Directory, LinkBox };
+export { HubRoom, UserHub, Directory, LinkBox, R2Budget };
 
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;
