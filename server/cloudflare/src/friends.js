@@ -104,6 +104,10 @@ export function friendsFetch(request, env) {
 
 // ---------------------------------------------------------------------------
 
+/* Throwaway QA/test identities (never auto-linked to the admin). */
+export const TEST_NAME_RE = /^(qa-|At\d+$|linktest|scratch-test|test)/i;
+export function isTestName(n) { return typeof n === "string" && TEST_NAME_RE.test(n); }
+
 export class Directory extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -622,6 +626,7 @@ export class UserHub extends DurableObject {
       case "admin_link": {
         // Only the configured admin's own UserHub accepts automatic links.
         if (!this.env.ADMIN_UID || p.uid !== this.env.ADMIN_UID) return { r: "none" };
+        if (isTestName(b.name)) return { r: "blocked" };
         if (this.isBlocked(from)) return { r: "blocked" };
         if (!this.isFriend(from)) {
           if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
@@ -740,6 +745,7 @@ export class UserHub extends DurableObject {
     }
     const wasOnline = this.authedSockets().length > 0;
     ws.serializeAttachment({ uid, authed: true, status: { state: "online", updated: now() } });
+    if (msg.test === true || isTestName(name)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('is_test', '1')");
     await this.autoLinkAdmin(p);
     if (!wasOnline) {
       // First socket up: announce ourselves and pull friends' current statuses before the welcome.
@@ -1037,6 +1043,7 @@ export class UserHub extends DurableObject {
     const admin = this.env.ADMIN_UID;
     if (!admin || !UID_RE.test(admin) || p.uid === admin) return;
     if (this.one("SELECT 1 FROM kv WHERE k='admin_linked'")) return;
+    if (this.one("SELECT 1 FROM kv WHERE k='is_test'") || isTestName(p.name)) return;   // QA/test accounts never touch the admin's list
     const retry = this.one("SELECT v FROM kv WHERE k='admin_link_retry'");
     if (retry && now() < Number(retry.v)) return;
     if (this.isFriend(admin) || this.isBlocked(admin)) {
