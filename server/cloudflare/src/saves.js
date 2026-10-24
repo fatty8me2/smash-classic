@@ -103,7 +103,11 @@ export async function savesFetch(request, env) {
   if (!env.SAVES) return err(503, "cloud-saves-disabled");
   if (!env.R2_BUDGET) return err(503, "cloud-saves-disabled");   // no budget guard -> never touch R2
   try { return await savesInner(request, env); }
-  catch (e) { if (e instanceof BudgetDown) return unavailable(); throw e; }
+  catch (e) {
+    if (e instanceof BudgetDown) return unavailable();
+    console.error("saves: unexpected", e && e.stack || String(e));
+    return err(503, "cloud-saves-error", { retryAfter: 60 });
+  }
 }
 
 async function savesInner(request, env) {

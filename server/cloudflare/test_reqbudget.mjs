@@ -1,0 +1,24 @@
+// Pure unit tests for src/reqbudget.js helpers (no wrangler needed). Run: node test_reqbudget.mjs
+import { verdict, DayLedger, unitsOf, DEFAULT_DAILY_CAP } from "./src/reqbudget_core.js";
+import { ByteBucket } from "./src/limits.js";
+let bad = 0;
+const ok = (c, m) => { console.log((c ? "ok   " : "FAIL ") + m); if (!c) bad++; };
+let v = verdict(0);
+ok(v.relayNew && v.roomNew && v.relayFrames, "fresh day allows everything");
+v = verdict(50_000); ok(!v.relayNew && v.roomNew && v.relayFrames, "50% stops new relay only");
+v = verdict(70_000); ok(!v.roomNew && v.relayFrames, "70% stops new rooms");
+v = verdict(90_000); ok(!v.relayFrames, "90% drops relay frames");
+v = verdict(10, 20); ok(!v.relayNew && v.cap === 20, "custom cap honored");
+ok(verdict(1, NaN).cap === DEFAULT_DAILY_CAP && verdict(1, -5).cap === DEFAULT_DAILY_CAP, "bad cap falls back to default");
+ok(unitsOf(10, 400) === 30, "400 frames = 20 units");
+let t = Date.parse("2026-01-01T23:59:59Z");
+const l = new DayLedger(() => t);
+l.add(5); ok(l.get() === 5, "ledger adds");
+t += 2000; ok(l.get() === 0, "ledger resets at UTC midnight");
+l.add(-3); ok(l.get() === 0, "negative ignored");
+let now = 0; const b = new ByteBucket(400, 800, () => now);
+let pass = 0; for (let i = 0; i < 2000; i++) if (b.take(1)) pass++;
+ok(pass === 800, "room rate cap: burst 800 then drops");
+now = 1000; pass = 0; for (let i = 0; i < 2000; i++) if (b.take(1)) pass++;
+ok(pass === 400, "room rate cap: 400/s sustained");
+console.log(bad ? `${bad} FAILED` : "all passed"); process.exit(bad ? 1 : 0);

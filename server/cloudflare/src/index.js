@@ -59,9 +59,10 @@ import { linkFetch, LinkBox } from "./link.js";
 import { FixedWindow, ByteBucket, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN, RELAY_ABUSE_MS } from "./limits.js";
 import { savesFetch } from "./saves.js";
 import { R2Budget } from "./r2budget.js";
+import { ReqBudget, gate, noteRequest, noteRelayFrame, RELAY_ROOM_MSGS_PER_SEC } from "./reqbudget.js";
 import { OpsStats, adminStatsFetch, count, countVersion, flushDue } from "./stats.js";
 
-export { HubRoom, UserHub, Directory, LinkBox, R2Budget, OpsStats };
+export { HubRoom, UserHub, Directory, LinkBox, R2Budget, OpsStats, ReqBudget };
 
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;
@@ -83,6 +84,7 @@ function send(ws, data) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    noteRequest();
 
     if (url.pathname === "/admin/stats") {
       return adminStatsFetch(request, env, (p) => ctx.waitUntil(p));
@@ -123,6 +125,15 @@ export default {
     const role = url.searchParams.get("role");
     if (!CODE_RE.test(room) || (role !== "host" && role !== "join")) {
       return new Response("bad room or role", { status: 400 });
+    }
+    if (role === "host" && !gate(env, (p) => ctx.waitUntil(p)).roomNew) {
+      // Cost guard: daily request budget nearly used. Tell the client in a readable way; direct play is unaffected.
+      console.log("[smash] server busy: new room refused (daily request budget)");
+      const pair = new WebSocketPair();
+      pair[1].accept();
+      pair[1].send(JSON.stringify({ type: "error", reason: "server-busy" }));
+      pair[1].close(4000, "server-busy");
+      return new Response(null, { status: 101, webSocket: pair[0] });
     }
     const ip = request.headers.get("CF-Connecting-IP");
     if (role === "host" && ip && !roomCreates.hit(ip)) {
@@ -335,6 +346,10 @@ export class NetplayRoom extends DurableObject {
       if (this.relay === null) this.relay = (await this.ctx.storage.get("relay")) === true;
       if (this.legacy === null) this.legacy = (await this.ctx.storage.get("legacy")) === true;
       if (!this.relay) return;
+      if (!gate(this.env, (p) => this.ctx.waitUntil(p)).relayFrames) return;   // cost guard: hard stop
+      if (!this.roomRate) this.roomRate = new ByteBucket(RELAY_ROOM_MSGS_PER_SEC, RELAY_ROOM_MSGS_PER_SEC * 2);
+      if (!this.roomRate.take(1)) return;   // per-room frame rate cap
+      noteRelayFrame();
 
       const from = this.slotOf(ws);
       // Per-socket relay budget (in memory; resets if the room is evicted).
@@ -399,6 +414,12 @@ export class NetplayRoom extends DurableObject {
         break;
       }
       case "relay": {
+        if (!this.relay && !gate(this.env, (p) => this.ctx.waitUntil(p)).relayNew) {
+          console.log(`[smash] relay denied (daily request budget) room=${this.roomCode || "?"}`);
+          count("relay_denied");
+          send(ws, JSON.stringify({ type: "relay_denied", reason: "server-busy", detail: "Server busy, relay unavailable. Try a direct connection." }));
+          break;
+        }
         await this.ctx.storage.put("relay", true);
         if (!this.relay) {
           this.relayStart = Date.now();
