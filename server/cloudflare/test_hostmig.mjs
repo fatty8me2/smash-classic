@@ -81,7 +81,7 @@ async function room(n, opts) {
   // A game that doesn't know migration can't join a migrated room.
   const old = open(id, "join", { hm: false });
   check(await old.wait(() => old.closed), "non-hm joiner refused after a migration");
-  check(/changed hosts/.test(old.last("error")?.reason || ""), "with a readable reason");
+  check(/too old to follow the new host/.test(old.last("error")?.reason || ""), "with a readable reason");
 
   // The new host leaves too: the lowest remaining slot (0, the late joiner) leads.
   p[1].ws.close();

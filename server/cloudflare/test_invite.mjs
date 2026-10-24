@@ -19,7 +19,7 @@ check(!isValidInviteCode('<script>'), "markup rejected");
 check(normalizeInviteCode(" abcdef ") === "ABCDEF", "normalize trims and uppercases");
 const page = invitePage("ABCDEF");
 check(page.includes('href="retrohub://join/ABCDEF"') && page.includes("Open in RetroHub"), "page has protocol link and fallback");
-check(page.includes("https://github.com/fatty8me2/smash-classic/releases/latest/download/RetroHub-Setup.exe"), "page links setup exe");
+check(page.includes("https://github.com/fatty8me2/retrohub/releases/latest/download/RetroHub-Setup.exe"), "page links setup exe");
 check(page.includes('property="og:title" content="Join a RetroHub room"'), "OpenGraph title (no host)");
 check(page.includes('property="og:description"') && page.includes("twitter:card"), "OpenGraph description + twitter card");
 const hp = invitePage("ABCDEF", "Oli <b>&\"x");

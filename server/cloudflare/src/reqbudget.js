@@ -17,7 +17,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 
-import { DEFAULT_DAILY_CAP, FRAMES_PER_UNIT, utcDay, verdict, DayLedger, unitsOf } from "./reqbudget_core.js";
+import { DEFAULT_DAILY_CAP, FRAMES_PER_UNIT, FLUSH_MS, utcDay, verdict, DayLedger, unitsOf } from "./reqbudget_core.js";
 export * from "./reqbudget_core.js";
 
 // ---- per-isolate gate (module state) ----
