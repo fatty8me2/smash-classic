@@ -5,7 +5,7 @@
 // in. The code alphabet matches the netplay room codes (src/index.js CODE_RE).
 
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
-const SETUP_URL = "https://github.com/fatty8me2/smash-classic/releases/latest/download/RetroHub-Setup.exe";
+const SETUP_URL = "https://github.com/fatty8me2/retrohub/releases/latest/download/RetroHub-Setup.exe";
 
 export function isValidInviteCode(code) {
   return typeof code === "string" && CODE_RE.test(code);

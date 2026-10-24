@@ -13,7 +13,7 @@
   - Time sync keeps both sides even.
   - Every packet carries a state hash to detect desyncs.
 - **No port forwarding.** The lobby runs on Cloudflare (`server/cloudflare`). Players connect directly over UDP via STUN hole punching. When that's impossible, the match relays through Cloudflare.
-- **Install.** Download [RetroHub-Setup.exe](https://github.com/fatty8me2/smash-classic/releases/latest/download/RetroHub-Setup.exe) from the latest release and run it (per-user install, Start-menu shortcut, optional Desktop shortcut). The installer is unsigned, so Windows SmartScreen may warn: click **More info**, then **Run anyway**. Saves and settings survive upgrades and uninstall.
+- **Install.** Download [RetroHub-Setup.exe](https://github.com/fatty8me2/retrohub/releases/latest/download/RetroHub-Setup.exe) from the latest release and run it (per-user install, Start-menu shortcut, optional Desktop shortcut). The installer is unsigned, so Windows SmartScreen may warn: click **More info**, then **Run anyway**. Saves and settings survive upgrades and uninstall.
 - **Portable alternative.** Get `BattleShip-windows.zip` from [Releases](../../releases), extract it, and run `RetroHub.exe` (or `BattleShip.exe`). On first launch it asks for **your own** Super Smash Bros. (USA) v1.0 ROM. No game data ships with this project.
 
 Details: [docs/netplay_online.md](docs/netplay_online.md), [docs/rollback_design.md](docs/rollback_design.md).
