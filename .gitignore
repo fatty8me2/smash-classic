@@ -116,3 +116,5 @@ extract/
 test.zip
 server/cloudflare/wrangler.test.jsonc
 server/cloudflare/.wrangler/
+
+wt/
