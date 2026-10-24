@@ -263,7 +263,7 @@ export class NetplayRoom extends DurableObject {
           : "This room was hosted with an older version of the game. Ask the host to update, or host the room again.");
       }
       if (!legacy && !hm && this.hostSlot !== 0) {
-        return this.reject("This room changed hosts, which this version of the game can't follow. Update the game and join again.");
+        return this.reject("The host left and another player took over, but your game version is too old to follow the new host. Update the game (or RetroHub) and join again.");
       }
       slot = -1;
       for (let s = legacy ? 1 : 0; s < (legacy ? 2 : MAX_PLAYERS); s++) {

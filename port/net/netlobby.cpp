@@ -70,6 +70,9 @@ constexpr unsigned int kBeginRepeatMs = 10000;      // host keeps repeating BEGI
 constexpr unsigned int kStartStaleMs = kBeginRepeatMs; // client: no START for this long = the host gave up
 constexpr unsigned int kPeerTimeoutMs = 10000;
 constexpr int kMaxCodeRetries = 4;
+constexpr int kMaxFixedCodeRetries = 10;            // fixed room code: the old socket of a reconnecting host may linger
+constexpr unsigned int kFixedCodeRetryMs = 1500;
+constexpr unsigned int kJoinWaitForHostMs = 300000; // RetroHub guest waits this long for the host's room
 constexpr int kMaxPlayers = PORT_NETLOBBY_MAX_PLAYERS;
 
 enum LinkState {
@@ -183,6 +186,9 @@ struct LobbyAuto {
     std::string fixed_code;          // SSB64_LOBBY_CODE
     unsigned int join_deadline_ms = 0;
     unsigned int join_retry_ms = 0;
+    bool join_no_room = false;       // the last join failed with no-such-room (the host may not have created it yet)
+    unsigned int host_retry_ms = 0;  // fixed-code host: reconnect at this time after room-in-use (0 = none pending)
+    int host_retries = 0;
 };
 LobbyAuto sAuto;
 
@@ -921,10 +927,22 @@ void handle_server(const std::string &msg)
         }
     } else if (type == "error") {
         std::string reason = json_field(msg, "reason");
-        if (reason == "room-in-use" && sLobby.want_host && sLobby.code_retries++ < kMaxCodeRetries) {
+        if (reason == "room-in-use" && sLobby.want_host && !sAuto.fixed_code.empty()) {
+            /* The code is fixed (RetroHub launch): never switch to another one, the guests only know this one.
+             * A reconnecting host may still be holding the room for a moment - retry, then explain. */
+            if (sAuto.host_retries++ < kMaxFixedCodeRetries) {
+                port_ws_close();
+                sAuto.host_retry_ms = port_udp_now_ms() + kFixedCodeRetryMs;
+                sLobby.status = "Room " + sLobby.code + " is still held - retrying (" + std::to_string(sAuto.host_retries) + "/" +
+                                std::to_string(kMaxFixedCodeRetries) + ")...";
+            } else {
+                fail("Room " + sLobby.code + " is still in use by an earlier session. Close any other game using this room and try again.");
+            }
+        } else if (reason == "room-in-use" && sLobby.want_host && sLobby.code_retries++ < kMaxCodeRetries) {
             sLobby.code = new_code();
             connect_server();
         } else if (reason == "no-such-room") {
+            sAuto.join_no_room = true;
             fail("No room with code " + sLobby.code);
         } else if (reason == "room-full") {
             fail("Room " + sLobby.code + " already has four players");
@@ -1184,7 +1202,7 @@ void update_auto(void)
                                              : CVarGetInteger("gNetplay.Stage", 0);
         if (const char *code = env("SSB64_LOBBY_CODE")) {
             sAuto.fixed_code = code;
-            sAuto.join_deadline_ms = port_udp_now_ms() + 30000;
+            sAuto.join_deadline_ms = port_udp_now_ms() + kJoinWaitForHostMs;
         }
 
         if (sAuto.host) {
@@ -1192,6 +1210,10 @@ void update_auto(void)
             port_netlobby_host(sAuto.server.c_str(), fkind, stage, 3, 0, 2);
         }
         sLobby.my_fkind = fkind;
+    }
+    if (sAuto.host_retry_ms != 0 && sLobby.state == PORT_NETLOBBY_CREATING && elapsed(sAuto.host_retry_ms, 0)) {
+        sAuto.host_retry_ms = 0;
+        connect_server();
     }
     if (sAuto.host && !sAuto.code_written && sLobby.state == PORT_NETLOBBY_WAITING) {
         if (FILE *f = std::fopen(sAuto.code_file.c_str(), "w")) {
@@ -1203,11 +1225,16 @@ void update_auto(void)
     if (sAuto.join && !sAuto.fixed_code.empty()) {
         /* RetroHub launch: everyone starts at once, so the host's room may
          * not exist yet - retry "no such room" until the deadline. */
-        bool retry = (sLobby.state == PORT_NETLOBBY_IDLE) ||
-                     (sLobby.state == PORT_NETLOBBY_FAILED && !elapsed(sAuto.join_deadline_ms, 0));
+        bool waiting = sLobby.state == PORT_NETLOBBY_FAILED && sAuto.join_no_room && !elapsed(sAuto.join_deadline_ms, 0);
+        if (waiting) {
+            sLobby.status = "Waiting for host... (Cancel to leave)";
+        }
+        bool retry = (sLobby.state == PORT_NETLOBBY_IDLE) || waiting;
         if (retry && elapsed(sAuto.join_retry_ms, 0)) {
             port_netlobby_join(sAuto.server.c_str(), sAuto.fixed_code.c_str(), sLobby.my_fkind);
             sAuto.join_retry_ms = port_udp_now_ms() + 1500;
+            sAuto.join_no_room = false;
+            sLobby.status = "Waiting for host... (Cancel to leave)";
         }
         if (sLobby.state != PORT_NETLOBBY_IDLE && sLobby.state != PORT_NETLOBBY_FAILED &&
             sLobby.state != PORT_NETLOBBY_JOINING) {
@@ -1377,6 +1404,8 @@ extern "C" void port_netlobby_join(const char *server, const char *code, int fki
 
 extern "C" void port_netlobby_cancel(void)
 {
+    sAuto.join = false;         // a cancelled "Waiting for host..." must not retry
+    sAuto.host_retry_ms = 0;
     shutdown_net();
     set_state(PORT_NETLOBBY_IDLE, "Not connected");
 }
