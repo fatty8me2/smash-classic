@@ -661,8 +661,33 @@ export class UserHub extends DurableObject {
         }
         return { r: "ok", friend: this.me() };
       }
+      case "room_pair": {
+        // Called by HubRoom (which verified both members' account secrets): link us with b.uid, both ways.
+        if (from === p.uid) return { r: "none" };
+        const bad = this.autoPairCheck(from, b.name);
+        if (bad) return { r: bad };
+        let back = null;
+        try { back = await this.call(from, "auto_pair_back", { uid: p.uid, name: p.name, status: this.me().status }); } catch { /* peer unreachable */ }
+        if (!back || back.r !== "ok" || !back.friend) return { r: (back && back.r) || "none" };
+        if (!this.isFriend(from) && this.count("friends") < this.friendCap(p)) {
+          this.run("DELETE FROM requests WHERE uid=?", from);
+          const f = this.addFriendRow(from, back.friend.name, sanitizeStatus(back.friend.status));
+          this.push({ type: "friend_added", friend: f, auto: true });
+        }
+        return { r: "ok" };
+      }
+      case "auto_pair_back": {
+        const bad = this.autoPairCheck(from, null, true);
+        if (bad === "already") return { r: "ok", friend: this.me() };   // finish a one-sided link
+        if (bad) return { r: bad };
+        this.run("DELETE FROM requests WHERE uid=?", from);
+        const f = this.addFriendRow(from, b.name || codeOf(from), sanitizeStatus(b.status));
+        this.push({ type: "friend_added", friend: f, auto: true });
+        return { r: "ok", friend: this.me() };
+      }
       case "friend_removed": {
         if (!this.isFriend(from)) return { r: "none" };
+        this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '1')", "norelink:" + from);
         this.run("DELETE FROM friends WHERE uid=?", from);
         this.push({ type: "friend_removed", uid: from });
         return { r: "ok" };
@@ -771,6 +796,7 @@ export class UserHub extends DurableObject {
     const wasOnline = this.authedSockets().length > 0;
     ws.serializeAttachment({ uid, authed: true, status: { state: "online", updated: now() } });
     if (msg.test === true || isTestName(name)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('is_test', '1')");
+    if (typeof msg.auto_friend === "boolean") this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('auto_friend', ?)", msg.auto_friend ? "1" : "0");
     await this.autoLinkAdmin(p);
     if (!wasOnline) {
       // First socket up: announce ourselves and pull friends' current statuses before the welcome.
@@ -960,6 +986,7 @@ export class UserHub extends DurableObject {
         const uid = uidArg(msg.uid);
         if (!uid) return this.err(ws, "bad-request", type);
         if (!this.isFriend(uid)) return this.err(ws, "not-friends", type, undefined);
+        this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '1')", "norelink:" + uid);   // never auto re-add someone we removed
         this.run("DELETE FROM friends WHERE uid=?", uid);
         this.push({ type: "friend_removed", uid });
         try { await this.call(uid, "friend_removed", { uid: p.uid }); } catch { /* peer unreachable */ }
@@ -1070,6 +1097,23 @@ export class UserHub extends DurableObject {
     const t = Number(this.env.TEST_FRIEND_CAP);   // local tests only (never set in production)
     if (t > 0) return t;
     return this.env.ADMIN_UID && p.uid === this.env.ADMIN_UID ? ADMIN_MAX_FRIENDS : MAX_FRIENDS;
+  }
+
+  /* Room auto-friending (see hub.js): may this account be auto-linked with `other`? Returns null when yes, else a
+   * reason: test | off | blocked | already | skip (we removed them earlier) | full | rate. Consumes one rate token only
+   * when everything else passes (40 auto-links per hour per account). */
+  autoPairCheck(other, otherName, skipRate) {
+    const p = this.profile();
+    if (!UID_RE.test(other || "") || other === p.uid) return "skip";
+    if (this.one("SELECT 1 FROM kv WHERE k='is_test'") || isTestName(p.name) || isTestName(otherName)) return "test";
+    const t = this.one("SELECT v FROM kv WHERE k='auto_friend'");
+    if (t && t.v === "0") return "off";
+    if (this.isBlocked(other)) return "blocked";
+    if (this.isFriend(other)) return "already";
+    if (this.one("SELECT 1 FROM kv WHERE k=?", "norelink:" + other)) return "skip";
+    if (this.count("friends") >= this.friendCap(p)) return "full";
+    if (!skipRate && !this.hit("autopair", 40, 60 * 60 * 1000)) return "rate";
+    return null;
   }
 
   /* Every RetroHub user starts out friends with the admin (env ADMIN_UID), both

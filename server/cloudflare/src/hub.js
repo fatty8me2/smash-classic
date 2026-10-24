@@ -1,4 +1,4 @@
-// RetroHub lobby: GET /hub?room=CODE[-N]&role=host|join&name=NAME[&slot=K]
+﻿// RetroHub lobby: GET /hub?room=CODE[-N]&role=host|join&name=NAME[&slot=K]
 //
 // One Durable Object (HubRoom) per room code, up to 4 members, slot 0 = host.
 // See Hub/docs/ARCHITECTURE.md ("Lobby server: /hub endpoint").
@@ -29,6 +29,7 @@ import { DurableObject } from "cloudflare:workers";
 
 const ROOM_RE = /^[A-HJ-NP-Z2-9]{6}(-[0-9]{1,6})?$/;
 const ENDPOINT_RE = /^(-|[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5})$/;
+const UID_RE = /^[a-z2-7]{26}$/;
 const MAX_MEMBERS = 4;
 const MAX_NAME = 24;
 const MAX_TEXT_BYTES = 4096;
@@ -73,7 +74,7 @@ export class HubRoom extends DurableObject {
       if (ws === except) continue;
       const a = ws.deserializeAttachment();
       if (!a || typeof a.slot !== "number" || a.slot < 0) continue;
-      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs });
+      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs, uid: a.uid || null });
     }
     return out;
   }
@@ -100,7 +101,7 @@ export class HubRoom extends DurableObject {
   }
 
   attach(ws, m) {
-    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs });
+    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs, uid: m.uid || null });
   }
 
   sendPeers() {
@@ -109,6 +110,40 @@ export class HubRoom extends DurableObject {
       .map((m) => ({ slot: m.slot, public: m.endpoint.public, local: m.endpoint.local }));
     peers.sort((a, b) => a.slot - b.slot);
     this.broadcast({ type: "peers", peers });
+  }
+
+  /* Auto-friending. launch=false: `fresh` just identified; pair it with the host (host fresh: with every guest).
+   * launch=true: every verified pair in the room (rate limited to once per 10 s). Each pair is one call to the
+   * lower uid's UserHub, which checks blocks / caps / toggle / test flag on both sides. In-memory only. */
+  async pairAll(launch, fresh) {
+    if (launch) {
+      const t = Date.now();
+      if (this.lastLaunchPair && t - this.lastLaunchPair < 10000) return;
+      this.lastLaunchPair = t;
+    }
+    const ids = this.members().filter((m) => m.uid);
+    const pairs = [];
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const a = ids[i], b = ids[j];
+        if (launch || (a.uid === fresh || b.uid === fresh) && (a.slot === 0 || b.slot === 0)) pairs.push([a.uid, b.uid]);
+      }
+    }
+    if (!this.paired) this.paired = new Set();
+    for (const [x, y] of pairs) {
+      const [lo, hi] = x < y ? [x, y] : [y, x];
+      const key = lo + "|" + hi;
+      if (this.paired.has(key)) continue;
+      try {
+        const stub = this.env.USER_HUBS.get(this.env.USER_HUBS.idFromName(lo));
+        const res = await stub.fetch("https://userhub/i/room_pair", {
+          method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+          body: JSON.stringify({ uid: hi }),
+        });
+        const r = (await res.json()).r;
+        if (r === "ok" || r === "already") this.paired.add(key);
+      } catch { /* best effort */ }
+    }
   }
 
   async fetch(request) {
@@ -181,6 +216,29 @@ export class HubRoom extends DurableObject {
       case "msg": {
         if (msg.body === null || typeof msg.body !== "object") return;
         this.broadcast({ type: "msg", from: me.slot, body: msg.body }, ws);
+        // The host starting a game: everyone present who proved their account becomes friends with each other.
+        if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.pairAll(true);
+        break;
+      }
+      case "ident": {
+        // {type:"ident",uid,secret}: proves which account this seat is (checked against the account's own hub).
+        // Only used for automatic friending; never forwarded to other members. One DO call per seat.
+        if (me.uid || typeof msg.uid !== "string" || !UID_RE.test(msg.uid) || typeof msg.secret !== "string") return;
+        if (me.game) return;
+        let ok = false;
+        try {
+          const stub = this.env.USER_HUBS.get(this.env.USER_HUBS.idFromName(msg.uid));
+          const res = await stub.fetch("https://userhub/i/link_auth", {
+            method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+            body: JSON.stringify({ uid: msg.uid, secret: msg.secret }),
+          });
+          ok = (await res.json()).r === "ok";
+        } catch { /* unreachable: no auto friending */ }
+        const now = ws.deserializeAttachment();
+        if (!ok || !now || typeof now.slot !== "number" || now.slot < 0 || now.uid) return;
+        if (this.members().some((m) => m.uid === msg.uid)) return;   // one seat per account
+        ws.serializeAttachment({ ...now, uid: msg.uid });
+        await this.pairAll(false, msg.uid);
         break;
       }
       case "endpoint": {
@@ -192,6 +250,7 @@ export class HubRoom extends DurableObject {
           mig: !!me.mig,
           game: !!me.game,
           rs: !!me.rs,
+          uid: me.uid || null,
         });
         this.sendPeers();
         break;
