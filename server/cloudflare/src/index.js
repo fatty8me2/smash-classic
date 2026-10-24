@@ -222,7 +222,8 @@ export class NetplayRoom extends DurableObject {
     const pair = new WebSocketPair();
     pair[1].accept();
     pair[1].send(JSON.stringify({ type: "error", reason }));
-    pair[1].close(4000, reason);
+    // WebSocket close reasons are limited to 123 bytes (longer throws); the full text is in the error frame above.
+    pair[1].close(4000, reason.length <= 120 ? reason : reason.slice(0, 117) + "...");
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
