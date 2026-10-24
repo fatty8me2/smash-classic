@@ -100,6 +100,10 @@ export default {
       const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
       return dir.fetch("https://directory/alias", { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: await request.text() });
     }
+    if (url.pathname === "/__test/aliases" && env.TEST_ALIAS === "1" && request.method === "POST") {   // local tests only
+      const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+      return dir.fetch("https://directory/aliases", { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: await request.text() });
+    }
     if (url.pathname === "/friends") {
       return friendsFetch(request, env);
     }

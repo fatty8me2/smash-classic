@@ -400,6 +400,8 @@ export class UserHub extends DurableObject {
       if (!UID_RE.test(newU) || oldU === newU) continue;
       const fr = this.one("SELECT * FROM friends WHERE uid=?", oldU);
       const rq = this.one("SELECT * FROM requests WHERE uid=?", oldU);
+      // Cap full (and the new identity not already listed): keep the old row rather than silently losing the friend.
+      if (fr && !this.isFriend(newU) && newU !== p.uid && !this.isBlocked(newU) && this.count("friends") >= this.friendCap(p)) continue;
       if (fr) { this.run("DELETE FROM friends WHERE uid=?", oldU); this.push({ type: "friend_removed", uid: oldU }); }
       if (rq) { this.run("DELETE FROM requests WHERE uid=?", oldU); this.push({ type: "request_update", uid: oldU, result: "cancelled" }); }
       if (newU === p.uid || this.isBlocked(newU)) continue;
@@ -414,6 +416,22 @@ export class UserHub extends DurableObject {
         this.push({ type: "request", req: q, dir: rq.dir });
       }
     }
+  }
+
+  /* Remember old -> new for everyone who may still list the old uid. Idempotent, best effort. */
+  async postAlias(old, to) {
+    try {
+      if (this.env.TEST_ALIAS_FAIL_ONCE === "1" && !this.one("SELECT 1 FROM kv WHERE k='test_alias_failed'")) {
+        this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('test_alias_failed', '1')");
+        throw new Error("test alias failure");
+      }
+      const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+      const r = await dir.fetch("https://directory/alias", {
+        method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+        body: JSON.stringify({ old, to }),
+      });
+      return r.ok;
+    } catch { return false; }
   }
 
   retiredTo() {
@@ -775,6 +793,7 @@ export class UserHub extends DurableObject {
         if (!old || old === p.uid || typeof msg.secret !== "string") return this.err(ws, "bad-request", type);
         if (!this.hit("retire", 10, 3600 * 1000)) return this.err(ws, "rate-limited", type);
         if (this.one("SELECT 1 FROM kv WHERE k=?", "retire_done:" + old)) {
+          await this.postAlias(old, p.uid);   // idempotent retry: an earlier attempt may have failed after the marker
           ws.send(JSON.stringify({ type: "retired", uid: old })); // already completed: never replay (would re-block)
           return;
         }
@@ -833,15 +852,9 @@ export class UserHub extends DurableObject {
         }
         this.dedupeRows();
         if (failed) return this.err(ws, "bad-request", type, "retire-failed"); // snapshot kept on the old account: retry resumes
+        await this.postAlias(old, p.uid);   // alias first, then the marker: a failed POST is retried on the early-return path
         this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '1')", "retire_done:" + old);
         try { await this.call(old, "retire_done", { uid: p.uid, secret: msg.secret }); } catch { /* old stays inert; marker prevents replay */ }
-        try {   // remember old -> new for everyone who may still list the old uid
-          const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
-          await dir.fetch("https://directory/alias", {
-            method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
-            body: JSON.stringify({ old, to: p.uid }),
-          });
-        } catch { /* best effort */ }
         this.push({ type: "retired", uid: old });
         await this.broadcastPresence(true);
         break;
@@ -1012,6 +1025,8 @@ export class UserHub extends DurableObject {
 
   /* Friend-list cap for this account: the admin account gets the larger cap. */
   friendCap(p) {
+    const t = Number(this.env.TEST_FRIEND_CAP);   // local tests only (never set in production)
+    if (t > 0) return t;
     return this.env.ADMIN_UID && p.uid === this.env.ADMIN_UID ? ADMIN_MAX_FRIENDS : MAX_FRIENDS;
   }
 
