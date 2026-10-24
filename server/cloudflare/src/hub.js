@@ -34,6 +34,7 @@ const MAX_MEMBERS = 4;
 const MAX_NAME = 24;
 const MAX_TEXT_BYTES = 4096;
 const MAX_BINARY_BYTES = 1200;
+const SMASH_LINK_TTL_MS = 6 * 3600 * 1000;
 const isGameRoom = (room) => room.includes("-");
 
 function cleanName(raw) {
@@ -146,8 +147,32 @@ export class HubRoom extends DurableObject {
     }
   }
 
+  // Smash Classic's own lobby (/ws, NetplayRoom) with the same code announced itself (internal call): from now on a
+  // member leaving this room (and a new host) is passed on to it, so the two rosters and their host stay in step.
+  async smashLink(request) {
+    const body = await request.json().catch(() => ({}));
+    if (typeof body.room === "string" && ROOM_RE.test(body.room)) {
+      await this.ctx.storage.put("smash", { room: body.room, at: Date.now() });
+    }
+    return Response.json({ ok: true });
+  }
+
+  async syncSmash(gone, remap) {
+    const link = await this.ctx.storage.get("smash");
+    if (!link || Date.now() - link.at > SMASH_LINK_TTL_MS) return;
+    try {
+      await this.env.ROOMS.get(this.env.ROOMS.idFromName(link.room)).fetch("https://room/hubsync", {
+        method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+        body: JSON.stringify({ gone, remap }),
+      });
+    } catch { /* the game lobby is gone: nothing to keep in step */ }
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/smashlink" && request.method === "POST" && request.headers.get("x-rh-internal") === "1") {
+      return this.smashLink(request);
+    }
     const room = (url.searchParams.get("room") || "").toUpperCase();
     const role = url.searchParams.get("role");
     const name = cleanName(url.searchParams.get("name"));
@@ -273,6 +298,7 @@ export class HubRoom extends DurableObject {
     try { ws.serializeAttachment({ slot: -1 }); } catch { /* closed */ }
     if (me.slot !== 0) {
       this.sendMembers(ws);
+      if (!me.game) await this.syncSmash([me.slot], null);
       return;
     }
     const rest = this.members(ws);
@@ -283,7 +309,10 @@ export class HubRoom extends DurableObject {
       try { m.ws.close(4001, "host-left"); } catch { /* closed */ }
       try { m.ws.serializeAttachment({ slot: -1 }); } catch { /* closed */ }
     }
-    if (!keep.length) return;
+    if (!keep.length) {
+      if (!me.game) await this.syncSmash([0], null);
+      return;
+    }
     keep.sort((a, b) => a.slot - b.slot);
     const nh = keep[0];
     const from = nh.slot;
@@ -291,6 +320,7 @@ export class HubRoom extends DurableObject {
     this.broadcast({ type: "host_changed", from_slot: from, slot: 0, name: nh.name });
     this.sendMembers();
     this.sendPeers();
+    if (!me.game) await this.syncSmash([0], { from, to: 0 });
   }
 
   async webSocketError(ws) {
