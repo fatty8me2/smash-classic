@@ -108,19 +108,23 @@ var
   Names: TArrayOfString;
   I: Integer;
 begin
-  SetArrayLength(Names, 8);
+  SetArrayLength(Names, 11);
   Names[0] := 'GameCube';        Names[1] := 'Nintendo 64';
   Names[2] := 'Wii U';           Names[3] := '3DS';
   Names[4] := 'DS';              Names[5] := 'Game Boy Advance';
   Names[6] := 'Game Boy Color';  Names[7] := 'Game Boy';
-  for I := 0 to 7 do ForceDirectories(Root + '\' + Names[I]);
+  Names[8] := 'PlayStation';     Names[9] := 'PlayStation 2';
+  Names[10] := 'BIOS';
+  for I := 0 to 10 do ForceDirectories(Root + '\' + Names[I]);
   if not FileExists(Root + '\Put your games here.txt') then
     SaveStringToFile(Root + '\Put your games here.txt',
       'Put your games here.' + #13#10 + #13#10 +
       'Copy each game into the folder for its console. RetroHub scans this folder and its subfolders.' + #13#10 +
       'GameCube: .iso .gcm .rvz .wia .ciso .gcz' + #13#10 +
       'Nintendo 64: .z64 .v64 .n64    Wii U: .wua .wud .wux .rpx    3DS: .3ds .cci .cia .cxi' + #13#10 +
-      'DS: .nds    Game Boy Advance: .gba    Game Boy Color: .gbc    Game Boy: .gb' + #13#10 + #13#10 +
+      'DS: .nds    Game Boy Advance: .gba    Game Boy Color: .gbc    Game Boy: .gb' + #13#10 +
+      'PlayStation: .cue .chd .bin .pbp    PlayStation 2: .iso .chd .cso' + #13#10 +
+      'BIOS: PlayStation / PlayStation 2 BIOS files (RetroHub never ships them; copy your own dumps here)' + #13#10 + #13#10 +
       'Uninstalling RetroHub never deletes this folder.' + #13#10, False);
 end;
 
