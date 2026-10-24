@@ -35,6 +35,7 @@
 #include "bridge/framebuffer_capture.h"
 #include "enhancements/enhancements.h"
 #include "first_run.h"
+#include "hub_controls.h"
 #include "gui/UpdatePrompt.h"
 #include "gui/OnlineStatus.h"
 #include "gui/PortMenu.h"
@@ -1482,6 +1483,7 @@ int main(int argc, char* argv[]) {
 	// up as an opaque MSVC 0xE06D7363 throw.
 	try {
 
+	port_hub_controls_init(argc, argv);  /* RetroHub profile + exit combo; no-op without --from-hub */
 	// Initialize the game boot sequence (coroutines, thread init, etc.)
 	PortGameInit();
 
@@ -1502,6 +1504,10 @@ int main(int argc, char* argv[]) {
 	while (WindowIsRunning()) {
 		PortPushFrame();
 		frame++;
+		if (port_hub_controls_tick()) {  /* Back+Start held 1s (--from-hub) */
+			if (auto ctx = Ship::Context::GetInstance()) { if (auto win = ctx->GetWindow()) win->Close(); }
+			break;
+		}
 
 		if (!firstRunHintShown && frame == 60) {
 			auto cv = sContext->GetConsoleVariables();
