@@ -287,6 +287,28 @@ export class UserHub extends DurableObject {
     return res.json();
   }
 
+  /* Friend list for the welcome, with the presence lease applied: a friend whose directory lease expired
+   * (crashed client / killed process never sent "offline") is shown offline, not stuck "in_game". */
+  async friendsWithLease() {
+    const rows = this.all("SELECT * FROM friends ORDER BY name");
+    if (rows.length === 0) return [];
+    let on = null;
+    try {
+      const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+      const res = await (await dir.fetch("https://directory/online-of", {
+        method: "POST",
+        headers: { "x-rh-internal": "1", "content-type": "application/json" },
+        body: JSON.stringify({ uids: rows.map((r) => r.uid) }),
+      })).json();
+      on = new Set(res.uids || []);
+    } catch { /* directory unreachable: show stored statuses */ }
+    return rows.map((r) => {
+      const f = this.friendObj(r);
+      if (on && !on.has(r.uid) && f.status && f.status.state !== "offline") f.status = offlineStatus();
+      return f;
+    });
+  }
+
   friendObj(r) {
     return { uid: r.uid, code: r.code, name: r.name, status: JSON.parse(r.status), since: r.since };
   }
@@ -573,6 +595,9 @@ export class UserHub extends DurableObject {
       }
       case "request": {
         const name = cleanName(b.name) || "player";
+        // Blocked sender: fake "ok" so they cannot tell they are blocked (privacy). Their pending-request entry
+        // then looks accepted-but-unanswered until it is cleared; if they query the pair later they only ever see
+        // "removed". Accepted trade-off, documented in docs.
         if (this.isBlocked(from)) return { r: "ok", name: "player", code: p.code };
         if (this.isFriend(from)) {
           // They no longer have us (a removal never reached them) but we still list them: finish the link
@@ -750,7 +775,7 @@ export class UserHub extends DurableObject {
     this.run("DELETE FROM inbox WHERE at < ?", now() - INBOX_TTL);
     await this.applyAliases();
     this.dedupeRows();
-    const friends = this.all("SELECT * FROM friends ORDER BY name").map((r) => this.friendObj(r));
+    const friends = await this.friendsWithLease();
     const reqs = this.all("SELECT uid, dir, code, name, at FROM requests ORDER BY at");
     const strip = ({ uid: u, code, name: n, at }) => ({ uid: u, code, name: n, at });
     ws.send(JSON.stringify({
@@ -798,7 +823,11 @@ export class UserHub extends DurableObject {
           return;
         }
         const r = await this.call(old, "retire_begin", { uid: p.uid, secret: msg.secret });
-        if (r.r === "bad-secret" || r.r === "gone" || r.r === "none") {
+        if (r.r === "gone") {
+          // Another account already took over this identity: tell this one it is NOT the successor.
+          return this.err(ws, "bad-request", type, "retired-elsewhere");
+        }
+        if (r.r === "bad-secret" || r.r === "none") {
           if (r.r === "bad-secret") { try { ws.send(JSON.stringify({ type: "error", reason: "bad-request", ref: type, detail: "bad-secret", uid: old })); } catch {} return; }
           ws.send(JSON.stringify({ type: "retired", uid: old })); // nothing (more) to move
           return;
@@ -896,8 +925,6 @@ export class UserHub extends DurableObject {
           this.run("DELETE FROM requests WHERE uid=?", target);
           const f = this.addFriendRow(target, r.friend.name, sanitizeStatus(r.friend.status));
           this.push({ type: "friend_added", friend: f });
-        } else if (r.r === "already") {
-          this.err(ws, "already-friends", type);
         } else if (r.r === "full") {
           this.err(ws, "bad-request", type, "target-full");
         } else {
@@ -995,12 +1022,21 @@ export class UserHub extends DurableObject {
           expires_at: now() + INVITE_TTL,
         };
         const targets = [...new Set(msg.to.filter((u) => uidArg(u)))].slice(0, 50);
+        const results = [];
         for (const to of targets) {
-          if (!this.isFriend(to)) { this.err(ws, "not-friends", type, to); continue; }
-          if (!this.hit("invite", 20, 60 * 1000)) { this.err(ws, "rate-limited", type, to); break; }
+          if (!this.isFriend(to)) { this.err(ws, "not-friends", type, to); results.push({ uid: to, ok: false, reason: "not-friends" }); continue; }
+          if (!this.hit("invite", 20, 60 * 1000)) { this.err(ws, "rate-limited", type, to); results.push({ uid: to, ok: false, reason: "rate-limited" }); break; }
           const m = { id: crypto.randomUUID(), from: p.uid, from_name: p.name, to, kind: "invite", invite, at: now() };
-          try { await this.call(to, "msg", { uid: p.uid, msg: m }); } catch { /* unreachable */ }
+          // r:"ok" also covers a silent drop by a blocker (deliberately indistinguishable: privacy).
+          let ok = false, reason = "undeliverable";
+          try {
+            const r = await this.call(to, "msg", { uid: p.uid, msg: m });
+            ok = !!r && r.r === "ok";
+            if (r && r.r === "notfriend") reason = "not-friends";
+          } catch { /* unreachable */ }
+          results.push(ok ? { uid: to, ok: true } : { uid: to, ok: false, reason });
         }
+        try { ws.send(JSON.stringify({ type: "invite_result", lobby_code: lobby, results })); } catch { /* closing */ }
         break;
       }
       case "ack": {
@@ -1070,9 +1106,14 @@ export class UserHub extends DurableObject {
     const me = this.me();
     const r = await this.call(uid, "request_update", { uid: p.uid, result: "accepted", name: p.name, status: me.status, crossed });
     if (r.r === "full") return this.err(ws, "bad-request", "accept", "target-full");
+    if (r.r !== "ok") {
+      // Their outgoing request vanished (cancelled / account gone): drop ours, tell the client, refresh its list.
+      this.run("DELETE FROM requests WHERE uid=?", uid);
+      this.push({ type: "request_update", uid, result: "cancelled" });
+      return this.err(ws, "bad-request", "accept", "no-such-request");
+    }
     this.run("DELETE FROM requests WHERE uid=?", uid);
     this.push({ type: "request_update", uid, result: "accepted" });
-    if (r.r !== "ok") return; // their outgoing request vanished; just drop ours
     const f = this.addFriendRow(uid, r.friend.name, sanitizeStatus(r.friend.status));
     this.push({ type: "friend_added", friend: f });
   }
