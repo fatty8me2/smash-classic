@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -30,7 +31,8 @@ std::vector<Source> parse_expr(const std::string& expr) {
         std::string t = expr.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos);
         pos = (bar == std::string::npos) ? expr.size() + 1 : bar + 1;
         size_t at = t.find('@');
-        if (at != std::string::npos) t.resize(at);   // threshold: libultraship uses its own fixed one
+        int thr = 0;
+        if (at != std::string::npos) { thr = std::atoi(t.c_str() + at + 1); t.resize(at); }
         while (!t.empty() && t.front() == ' ') t.erase(t.begin());
         while (!t.empty() && t.back() == ' ') t.pop_back();
         int sign = 0;
@@ -38,6 +40,7 @@ std::vector<Source> parse_expr(const std::string& expr) {
         Source s;
         int b = button_index(t);
         if (b >= 0 && sign == 0) { s.idx = b; out.push_back(s); continue; }
+        s.threshold = std::clamp(thr, 0, 32767);
         int a = axis_index(t);
         if (a >= 0) { s.axis = true; s.idx = a; s.sign = sign == 0 ? 1 : sign; out.push_back(s); }
     }
@@ -78,8 +81,39 @@ Plan plan_from_json(const std::string& json) {
     }
     if (j.contains("port_order") && j["port_order"].is_array())
         for (const auto& k : j["port_order"]) if (k.is_string()) p.port_order.push_back(k.get<std::string>());
+    if (j.contains("axis_threshold") && j["axis_threshold"].is_number())
+        p.axis_threshold = std::clamp(j["axis_threshold"].get<int>(), 1, 32766);
+    // Thresholds: libultraship has one stick and one trigger threshold (percent of full scale), not one per term.
+    // Use the first axis term of each class (explicit "@N", else the profile default).
+    auto pct = [](int thr) { return std::clamp((int)std::lround(thr * 100.0 / 32767.0), 1, 99); };
+    for (const ButtonBind& b : p.buttons) {
+        if (!b.src.axis) continue;
+        int thr = b.src.threshold > 0 ? b.src.threshold : p.axis_threshold;
+        bool trig = b.src.idx >= 4;
+        if (trig && !p.trigger_thr_pct) p.trigger_thr_pct = pct(thr);
+        if (!trig && !p.stick_thr_pct) p.stick_thr_pct = pct(thr);
+    }
+    p.is_default = p.name == "default-n64";
     p.valid = true;
     return p;
+}
+
+std::vector<int> order_pads(const std::vector<std::string>& pads, const std::vector<std::string>& port_order) {
+    auto lower = [](std::string s) { for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch); return s; };
+    std::vector<int> out;
+    std::vector<bool> used(pads.size(), false);
+    for (const std::string& want : port_order) {
+        std::string w = lower(want);
+        bool has_serial = w.find('#') != std::string::npos;
+        for (size_t i = 0; i < pads.size(); i++) {
+            if (used[i]) continue;
+            std::string p = lower(pads[i]);
+            bool hit = has_serial ? p == w : (p == w || p.compare(0, w.size() + 1, w + "#") == 0);
+            if (hit) { used[i] = true; out.push_back((int)i); break; }
+        }
+    }
+    for (size_t i = 0; i < pads.size(); i++) if (!used[i]) out.push_back((int)i);
+    return out;
 }
 
 bool ExitCombo::update(const bool* held, int pads, double now) {

@@ -28,6 +28,7 @@ struct Source {
     bool axis = false;
     int idx = 0;
     int sign = 0;
+    int threshold = 0;   // "@N" (0..32767); 0 = not given (profile axis_threshold applies)
 };
 
 struct ButtonBind { uint32_t bitmask; Source src; };
@@ -43,7 +44,15 @@ struct Plan {
     int sensitivity_pct = 100;            // SetSensitivity
     bool rumble = false;
     std::vector<std::string> port_order;
+    int axis_threshold = 16384;           // profile default for axis terms without "@"
+    bool is_default = false;              // built-in "default-n64": keep BattleShip's own natural Smash layout
+    int stick_thr_pct = 0;                // GlobalSDLDeviceSettings stick threshold (0 = leave)
+    int trigger_thr_pct = 0;              // ... trigger threshold (0 = leave)
 };
+
+/* Pad ordering: given each connected pad's key ("guid" or "guid#serial") in the game's default order, returns
+ * indices (into `pads`) in port order: matches from `port_order` first, then the rest in default order. */
+std::vector<int> order_pads(const std::vector<std::string>& pads, const std::vector<std::string>& port_order);
 
 /* SDL name -> index (-1 unknown). */
 int button_index(const std::string& name);

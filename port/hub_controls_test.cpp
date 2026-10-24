@@ -21,6 +21,12 @@ int main() {
     CHECK(!plan_from_json("{bad").valid);
     CHECK(!plan_from_json(R"({"system":"gc"})").valid);
 
+    CHECK(e[2].threshold == 9000 && e[0].threshold == 0);
+    Plan dp = plan_from_json(R"({"name":"default-n64","system":"n64","buttons":{"z":"lefttrigger@16000","c_up":"righty-"},"axis_threshold":20000})");
+    CHECK(dp.is_default && dp.trigger_thr_pct == 49 && dp.stick_thr_pct == 61);
+    CHECK(order_pads({ "a#1", "b#2", "c" }, { "c", "b", "zz" }) == std::vector<int>({ 2, 1, 0 }));
+    CHECK(order_pads({ "a#1", "a#2" }, { "a#2", "a" }) == std::vector<int>({ 1, 0 }));
+
     ExitCombo c(1.0);
     bool on[1] = { true }, off[1] = { false };
     CHECK(!c.update(on, 1, 0.0));
