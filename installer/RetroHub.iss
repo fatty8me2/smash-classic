@@ -58,6 +58,13 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 Name: "{autoprograms}\RetroHub"; Filename: "{app}\RetroHub.exe"; WorkingDir: "{app}"; Tasks: startmenuicon
 Name: "{autodesktop}\RetroHub"; Filename: "{app}\RetroHub.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
+[Registry]
+; retrohub://join/<CODE> invite links (RetroHub also re-registers itself on every start).
+Root: HKCU; Subkey: "Software\Classes\retrohub"; ValueType: string; ValueData: "URL:RetroHub Invite"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\retrohub"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\retrohub\DefaultIcon"; ValueType: string; ValueData: "{app}\RetroHub.exe,0"
+Root: HKCU; Subkey: "Software\Classes\retrohub\shell\open\command"; ValueType: string; ValueData: """{app}\RetroHub.exe"" ""%1"""
+
 [Run]
 Filename: "{app}\RetroHub.exe"; Description: "{cm:LaunchProgram,RetroHub}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
