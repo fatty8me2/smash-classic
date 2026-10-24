@@ -229,9 +229,16 @@ export class NetplayRoom extends DurableObject {
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/hubsync" && request.method === "POST" && request.headers.get("x-rh-internal") === "1") {
+      return this.hubSync(await request.json().catch(() => ({})));
+    }
     const room = url.searchParams.get("room").toUpperCase();
     const role = url.searchParams.get("role");
     this.roomCode = room;
+    // &hs=K: the slot this player holds in the RetroHub room with the same code (RetroHub launches only).
+    // The two rosters are tied together through it (see hubSync and HubRoom's smash link).
+    const hsParam = url.searchParams.get("hs");
+    const hs = hsParam !== null && /^[0-3]$/.test(hsParam) ? Number(hsParam) : -1;
     const legacy = Number(url.searchParams.get("v") || 1) < 2;
     const hm = !legacy && url.searchParams.get("hm") === "1";
 
@@ -267,7 +274,8 @@ export class NetplayRoom extends DurableObject {
         return this.reject("The host left and another player took over, but your game version is too old to follow the new host. Update the game (or RetroHub) and join again.");
       }
       slot = -1;
-      for (let s = legacy ? 1 : 0; s < (legacy ? 2 : MAX_PLAYERS); s++) {
+      if (hs >= 0 && !legacy && !this.socketAt(hs)) slot = hs;   // same slot number as in the RetroHub room
+      for (let s = legacy ? 1 : 0; slot < 0 && s < (legacy ? 2 : MAX_PLAYERS); s++) {
         if (!this.socketAt(s)) { slot = s; break; }
       }
       if (slot < 0) return this.reject("room-full");
@@ -277,7 +285,13 @@ export class NetplayRoom extends DurableObject {
       this.ctx.acceptWebSocket(pair[1], hm ? [role, `s${slot}`, "hm"] : [role, `s${slot}`]);
       this.addSocket(pair[1], slot);
     }
-    pair[1].serializeAttachment({ endpoint: null, toks: {} });
+    pair[1].serializeAttachment({ endpoint: null, toks: {}, hs });
+    if (hs >= 0 && !legacy && !this.hubLinked) {
+      this.hubLinked = true;
+      this.ctx.waitUntil(this.env.HUB_ROOMS.get(this.env.HUB_ROOMS.idFromName(room))
+        .fetch("https://hub/smashlink", { method: "POST", headers: { "x-rh-internal": "1" }, body: JSON.stringify({ room }) })
+        .catch(() => {}));
+    }
     if (!legacy) this.issuePairTokens(pair[1], slot);
     pair[1].send(JSON.stringify(legacy
       ? { type: "welcome", room, role }
@@ -439,10 +453,12 @@ export class NetplayRoom extends DurableObject {
   async webSocketClose(ws, code) {
     const slot = this.slotOf(ws);
     this.removeSocket(ws);
-    try {
-      ws.close(code === 1005 ? 1000 : code, "closed");
-    } catch {
-      // already closed
+    if (!this.closedByUs) {
+      try {
+        ws.close(code === 1005 ? 1000 : code, "closed");
+      } catch {
+        // already closed
+      }
     }
     if (slot < 0) return;   // webSocketError then webSocketClose: already handled
     if (this.buckets) this.buckets.delete(ws);
@@ -494,7 +510,10 @@ export class NetplayRoom extends DurableObject {
     }
     // Promote the lowest remaining slot. Every in-memory change happens before the
     // first await, so a join or a second close arriving meanwhile sees exactly one host.
-    const next = rest[0].slot;
+    // A RetroHub room change in flight (hubSync) names the player RetroHub made host: follow it when that player is here.
+    const pref = this.preferHs !== undefined && this.preferHs !== null
+      ? rest.find(({ ws: socket }) => socket.deserializeAttachment()?.hs === this.preferHs) : null;
+    const next = pref ? pref.slot : rest[0].slot;
     this.hostSlot = next;
     const moved = JSON.stringify({ type: "host", slot: next, prev: slot });
     for (const { ws: socket } of rest) {
@@ -503,6 +522,33 @@ export class NetplayRoom extends DurableObject {
     }
     this.announce();
     await this.ctx.storage.put("host", next);
+  }
+
+  // RetroHub's room changed (HubRoom -> here): {gone:[hub slots that left], remap:{from,to}|null (a new RetroHub host is
+  // renumbered to slot 0)}. Players that left the RetroHub room leave this one too, and the host follows RetroHub's.
+  async hubSync(body) {
+    const gone = Array.isArray(body.gone) ? body.gone.filter((n) => Number.isInteger(n)) : [];
+    const remap = body.remap && Number.isInteger(body.remap.from) && Number.isInteger(body.remap.to) ? body.remap : null;
+    const leaving = [];
+    for (const { ws } of this.members()) {
+      const a = ws.deserializeAttachment() || {};
+      if (a.hs === undefined || a.hs < 0) continue;
+      if (gone.includes(a.hs)) { leaving.push(ws); continue; }
+      if (remap && a.hs === remap.from) ws.serializeAttachment({ ...a, hs: remap.to });
+    }
+    this.preferHs = remap ? remap.to : null;
+    this.closedByUs = true;      // the sockets are closed here, webSocketClose only does the bookkeeping
+    try {
+      for (const ws of leaving) {
+        try { ws.send(JSON.stringify({ type: "error", reason: "You left the RetroHub room" })); } catch { /* closing */ }
+        try { ws.close(4001, "left-hub"); } catch { /* already closed */ }
+        await this.webSocketClose(ws, 4001);
+      }
+    } finally {
+      this.preferHs = null;
+      this.closedByUs = false;
+    }
+    return Response.json({ ok: true, left: leaving.length });
   }
 
   announceWithout(gone) {

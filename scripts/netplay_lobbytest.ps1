@@ -65,6 +65,8 @@ param(
     [int]$MigratePlayers = 0,   # players the new host waits for before its scripted start (SSB64_LOBBY_MIGRATE_PLAYERS)
     [string]$HostDie = "",      # "start" or "begin": the host process kills itself right after its first START / BEGIN
     [int]$LateLast = 0,         # with -Kill: launch the last client this many seconds after the others (it joins the migrated room)
+    [switch]$HubLink,           # tie the lobby to a RetroHub room (/hub, same code; each game passes SSB64_LOBBY_HUBSLOT)
+    [string]$HubLeave = "",     # with -HubLink: "slot@seconds,..." that RetroHub member leaves its room (its game must leave the lobby)
     [int]$ExpectMatches = 0,    # every survivor's log must show at least this many started matches
     [string]$OutDir = "$PSScriptRoot\..\build\us\lobby-test"
 )
@@ -97,6 +99,9 @@ $names = @('host', 'client', 'client2', 'client3')
 $fighters = @($HostFighter)
 for ($i = 1; $i -lt $Players; $i++) { $fighters += (($ClientFighter + $i - 1) % 12) }
 
+$hubCode = ""
+if ($HubLink) { $alpha = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; $hubCode = -join (1..6 | ForEach-Object { $alpha[(Get-Random -Maximum 32)] }) }
+
 function Start-Peer([int]$index) {
     $role = $names[$index]
     $isLast = ($index -eq ($Players - 1))
@@ -114,6 +119,7 @@ function Start-Peer([int]$index) {
         SSB64_LOBBY_RELAY_PEER = $(if ($RelayPeer -ge 0 -and $index -ne $RelayPeer) { "$RelayPeer" } else { "" })
     }
     if ($RelayPeer -ge 0 -and $index -eq $RelayPeer) { $vars['SSB64_LOBBY_FORCE_RELAY'] = "1" }
+    if ($HubLink) { $vars['SSB64_LOBBY_CODE'] = $hubCode; $vars['SSB64_LOBBY_HUBSLOT'] = "$index" }
     if ($index -eq 0) {
         $vars['SSB64_LOBBY_HOST'] = $Server; $vars['SSB64_LOBBY_AUTOSTART'] = '1'
         if ($HostDie) { $vars['SSB64_LOBBY_TEST_DIE'] = $HostDie }
@@ -145,6 +151,15 @@ function Start-Peer([int]$index) {
     return [System.Diagnostics.Process]::Start($psi)
 }
 
+$killed = @{}
+$hubProc = $null
+if ($HubLink) {
+    $hubProc = Start-Process -FilePath "node" -ArgumentList "`"$PSScriptRoot\hub_members.mjs`" $Server $hubCode $Players `"$HubLeave`"" `
+        -RedirectStandardOutput "$out\hub.log" -RedirectStandardError "$out\hub.err" -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+    Write-Output "RetroHub room $hubCode with $Players members"
+    foreach ($item in ($HubLeave -split ',' | Where-Object { $_ })) { $killed[$names[[int](($item -split '@')[0])]] = $true }
+}
 $procs = @()
 $procs += Start-Peer 0
 Start-Sleep -Seconds 2
@@ -159,7 +174,6 @@ foreach ($item in ($Kill -split ',' | Where-Object { $_ })) {
     $parts = $item -split '@'
     $killPlan += [pscustomobject]@{ Slot = [int]$parts[0]; At = [int]$parts[1]; Done = $false }
 }
-$killed = @{}
 $resumePlan = @()
 if ($killPlan.Count -gt 0) {
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -210,6 +224,7 @@ if ($HostDie) { $killed[$names[0]] = $true; Write-Output ("host exited by itself
 foreach ($p in $procs) { if (-not $p.HasExited) { $p.CloseMainWindow() | Out-Null } }
 Start-Sleep -Seconds 3
 foreach ($p in $procs) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
+if ($hubProc) { Stop-Process -Id $hubProc.Id -Force -ErrorAction SilentlyContinue; Write-Output "--- hub"; Get-Content "$out\hub.log" }
 if ($wrangler) { & taskkill /PID $wrangler.Id /T /F | Out-Null }
 
 $used = $names[0..($Players - 1)]

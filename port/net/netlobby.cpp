@@ -384,6 +384,11 @@ void connect_server(void)
         url.pop_back();
     }
     url += "/ws?room=" + sLobby.code + "&role=" + (sLobby.want_host ? "host" : "join") + "&v=2&hm=1";
+    if (const char *hs = env("SSB64_LOBBY_HUBSLOT")) {      // RetroHub launch: ask for the slot we hold in its room
+        if (hs[0] >= '0' && hs[0] <= '3' && hs[1] == 0) {
+            url += std::string("&hs=") + hs;
+        }
+    }
     sLobby.ws_welcomed = false;
     sLobby.endpoint_sent = false;
     sLobby.connect_ms = port_udp_now_ms();
