@@ -20,6 +20,10 @@
 //   attachments, so it is hibernation-safe; the DO is single-threaded so there
 //   is never more than one slot 0.
 // S->C extra: host_changed{from_slot,slot,name}
+// Distinct failure reasons (&caps=reasons; older clients keep the legacy reasons so their retry logic is unchanged):
+//   bad-slot         join asked for slot 0 or a slot that is already taken (legacy: room-full)
+//   host-reconnecting game room (-N) with guests but no host right now (legacy: no-such-room); clients retry
+//   host-left-game   sent as error{reason} just before the 4001 close when the host of a game room leaves: game over
 
 import { DurableObject } from "cloudflare:workers";
 
@@ -69,7 +73,7 @@ export class HubRoom extends DurableObject {
       if (ws === except) continue;
       const a = ws.deserializeAttachment();
       if (!a || typeof a.slot !== "number" || a.slot < 0) continue;
-      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game });
+      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs });
     }
     return out;
   }
@@ -96,7 +100,7 @@ export class HubRoom extends DurableObject {
   }
 
   attach(ws, m) {
-    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game });
+    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs });
   }
 
   sendPeers() {
@@ -113,7 +117,9 @@ export class HubRoom extends DurableObject {
     const role = url.searchParams.get("role");
     const name = cleanName(url.searchParams.get("name"));
     const slotParam = url.searchParams.get("slot");
-    const mig = (url.searchParams.get("caps") || "").split(",").includes("hostmig");
+    const caps = (url.searchParams.get("caps") || "").split(",");
+    const mig = caps.includes("hostmig");
+    const rs = caps.includes("reasons");
 
     const members = this.members();
     const taken = new Set(members.map((m) => m.slot));
@@ -122,10 +128,10 @@ export class HubRoom extends DurableObject {
       if (taken.has(0)) return this.reject("room-in-use");
       slot = 0;
     } else {
-      if (!taken.has(0)) return this.reject("no-such-room");
+      if (!taken.has(0)) return this.reject(rs && isGameRoom(room) && members.length > 0 ? "host-reconnecting" : "no-such-room");
       if (slotParam !== null) {
         slot = Number(slotParam);
-        if (slot === 0 || taken.has(slot)) return this.reject("room-full");
+        if (slot === 0 || taken.has(slot)) return this.reject(rs ? "bad-slot" : "room-full");
       } else {
         for (let s = 1; s < MAX_MEMBERS; s++) {
           if (!taken.has(s)) { slot = s; break; }
@@ -136,7 +142,7 @@ export class HubRoom extends DurableObject {
 
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
-    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room) });
+    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs });
     pair[1].send(JSON.stringify({ type: "welcome", room, slot }));
     this.sendMembers();
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -185,6 +191,7 @@ export class HubRoom extends DurableObject {
           endpoint: { public: clean(msg.public), local: clean(msg.local) },
           mig: !!me.mig,
           game: !!me.game,
+          rs: !!me.rs,
         });
         this.sendPeers();
         break;
@@ -213,6 +220,7 @@ export class HubRoom extends DurableObject {
     const keep = me.game ? [] : rest.filter((m) => m.mig);
     for (const m of rest) {
       if (keep.includes(m)) continue;
+      if (me.game && m.rs) { try { m.ws.send(JSON.stringify({ type: "error", reason: "host-left-game" })); } catch { /* closed */ } }
       try { m.ws.close(4001, "host-left"); } catch { /* closed */ }
       try { m.ws.serializeAttachment({ slot: -1 }); } catch { /* closed */ }
     }
