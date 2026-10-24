@@ -97,6 +97,19 @@ const notFriends = async (a, b) => !(await listOf(a)).includes(b.uid) && !(await
   s2h.ws.close(); s2q.ws.close();
 }
 
+// 3b. toggling off live (prefs) after the hello
+{
+  const H = await user("Hosty7"), P = await user("Liveoff");
+  P.ws.send(JSON.stringify({ type: "prefs", auto_friend: false }));
+  await sleep(300);
+  const c = room();
+  const sh = await seat(H, c, "host"), sp = await seat(P, c, "join");
+  launch(sh);
+  await sleep(600);
+  check(await notFriends(H, P), "prefs auto_friend:false is honoured");
+  sh.ws.close(); sp.ws.close();
+}
+
 // 4. blocks
 {
   const H = await user("Hosty4"), K = await user("Blocker");

@@ -1072,6 +1072,10 @@ export class UserHub extends DurableObject {
         try { ws.send(JSON.stringify({ type: "invite_result", lobby_code: lobby, results })); } catch { /* closing */ }
         break;
       }
+      case "prefs": {
+        if (typeof msg.auto_friend === "boolean") this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('auto_friend', ?)", msg.auto_friend ? "1" : "0");
+        break;
+      }
       case "ack": {
         if (!Array.isArray(msg.ids)) return this.err(ws, "bad-request", type);
         for (const id of msg.ids.slice(0, MAX_INBOX)) {
