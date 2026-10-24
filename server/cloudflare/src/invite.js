@@ -4,6 +4,8 @@
 // the link, the page explains how to get RetroHub and shows the code to type
 // in. The code alphabet matches the netplay room codes (src/index.js CODE_RE).
 
+// Plain 6-char codes only: netplay rooms are never "-N" suffixed (src/index.js CODE_RE is strict), so an invite link
+// never carries a suffix. (friends.js LOBBY_RE tolerates "-N" on presence/invites, but nothing emits it.)
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const SETUP_URL = "https://github.com/fatty8me2/retrohub/releases/latest/download/RetroHub-Setup.exe";
 
