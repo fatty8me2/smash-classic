@@ -12,6 +12,7 @@
 // requires the x-rh-internal header on them.
 
 import { DurableObject } from "cloudflare:workers";
+import { meter, gate, PRESENCE_LEASE_MS, presenceAlarmMs } from "./reqbudget.js";
 import { FixedWindow, onlineTargets, FRIENDS_MSGS_PER_MIN } from "./limits.js";
 
 const UID_RE = /^[a-z2-7]{26}$/;
@@ -36,7 +37,7 @@ const MAX_INBOX = 200;
 const INBOX_TTL = 30 * 24 * 3600 * 1000;
 const MAX_HISTORY = 200;
 const INVITE_TTL = 30 * 60 * 1000;
-export const ONLINE_LEASE_MS = 3 * 60 * 1000;
+export const ONLINE_LEASE_MS = PRESENCE_LEASE_MS;   // 10 min (was 3): the refresh alarm fires every lease/3 (see reqbudget_core.js)
 const RANK = { offline: 0, online: 1, in_lobby: 2, in_game: 3 };
 
 const now = () => Date.now();
@@ -124,6 +125,7 @@ export class Directory extends DurableObject {
   }
 
   async fetch(request) {
+    meter(this.env, this.ctx, "do");
     if (request.headers.get("x-rh-internal") !== "1") return new Response("forbidden", { status: 403 });
     const url = new URL(request.url);
     if (url.pathname === "/lookup") {
@@ -373,12 +375,15 @@ export class UserHub extends DurableObject {
   // without waking this object, so a timer does the refresh).
   async scheduleLease() {
     try {
-      if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + ONLINE_LEASE_MS / 3);
+      if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + presenceAlarmMs(ONLINE_LEASE_MS));
     } catch { /* storage alarm unavailable */ }
   }
 
   async alarm() {
+    meter(this.env, this.ctx, "alarm");
     if (this.authedSockets().length === 0) return;
+    // Cost guard: at >=90% of the daily budget stop refreshing presence (no reschedule; leases lapse harmlessly).
+    if (!gate(this.env).relayFrames) return;
     await this.setOnline(true);
   }
 
@@ -474,6 +479,7 @@ export class UserHub extends DurableObject {
   // ---- fetch (WebSocket upgrade + internal routes) -----------------------
 
   async fetch(request) {
+    meter(this.env, this.ctx, "do");
     const url = new URL(request.url);
     if (url.pathname === "/ws") {
       if (request.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
@@ -689,6 +695,7 @@ export class UserHub extends DurableObject {
   // ---- WebSocket handlers ------------------------------------------------
 
   async webSocketMessage(ws, message) {
+    meter(this.env, this.ctx, "ws");   // incoming messages bill 20:1 (keepalives are auto-answered and free)
     if (typeof message !== "string") return;
     const att = ws.deserializeAttachment();
     if (!att) return;

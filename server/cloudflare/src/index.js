@@ -59,7 +59,7 @@ import { linkFetch, LinkBox } from "./link.js";
 import { FixedWindow, ByteBucket, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN, RELAY_ABUSE_MS } from "./limits.js";
 import { savesFetch } from "./saves.js";
 import { R2Budget } from "./r2budget.js";
-import { ReqBudget, gate, noteRequest, noteRelayFrame, RELAY_ROOM_MSGS_PER_SEC } from "./reqbudget.js";
+import { ReqBudget, gate, meter, noteRequest, noteRelayFrame, RELAY_ROOM_MSGS_PER_SEC } from "./reqbudget.js";
 import { OpsStats, adminStatsFetch, count, countVersion, flushDue } from "./stats.js";
 
 export { HubRoom, UserHub, Directory, LinkBox, R2Budget, OpsStats, ReqBudget };
@@ -81,6 +81,16 @@ function send(ws, data) {
   }
 }
 
+// "server-busy" answer for a refused WebSocket (readable by the client); plain 503 when it is not an upgrade.
+function busySocket(request) {
+  if (request.headers.get("Upgrade") !== "websocket") return new Response("server busy", { status: 503 });
+  const pair = new WebSocketPair();
+  pair[1].accept();
+  pair[1].send(JSON.stringify({ type: "error", reason: "server-busy" }));
+  pair[1].close(4000, "server-busy");
+  return new Response(null, { status: 101, webSocket: pair[0] });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -93,6 +103,8 @@ export default {
       return Response.json({ ok: true, service: "smash-netplay", netplay: 2, maxPlayers: MAX_PLAYERS, hostMigration: 1 });
     }
     if (url.pathname === "/hub") {
+      // Cost guard: no NEW hub rooms once 70% of the daily budget is used (joins into existing rooms still work).
+      if (url.searchParams.get("role") === "host" && !gate(env, (p) => ctx.waitUntil(p)).roomNew) return busySocket(request);
       return hubFetch(request, env);
     }
     if (url.pathname.startsWith("/j/")) {
@@ -107,6 +119,9 @@ export default {
       return dir.fetch("https://directory/aliases", { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: await request.text() });
     }
     if (url.pathname === "/friends") {
+      // Cost guard: at 90% of the daily budget refuse NEW friends sockets (existing ones keep working until the DO
+      // limits would be hit; each connected account otherwise costs presence alarms + messages).
+      if (!gate(env, (p) => ctx.waitUntil(p)).relayFrames) return busySocket(request);
       return friendsFetch(request, env);
     }
     if (url.pathname.startsWith("/link/")) {
@@ -228,6 +243,7 @@ export class NetplayRoom extends DurableObject {
   }
 
   async fetch(request) {
+    meter(this.env, this.ctx, "do");
     const url = new URL(request.url);
     const room = url.searchParams.get("room").toUpperCase();
     const role = url.searchParams.get("role");

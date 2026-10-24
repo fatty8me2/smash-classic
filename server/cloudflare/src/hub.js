@@ -26,6 +26,7 @@
 //   host-left-game   sent as error{reason} just before the 4001 close when the host of a game room leaves: game over
 
 import { DurableObject } from "cloudflare:workers";
+import { meter, gate } from "./reqbudget.js";
 
 const ROOM_RE = /^[A-HJ-NP-Z2-9]{6}(-[0-9]{1,6})?$/;
 const ENDPOINT_RE = /^(-|[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5})$/;
@@ -112,6 +113,7 @@ export class HubRoom extends DurableObject {
   }
 
   async fetch(request) {
+    meter(this.env, this.ctx, "do");
     const url = new URL(request.url);
     const room = (url.searchParams.get("room") || "").toUpperCase();
     const role = url.searchParams.get("role");
@@ -149,12 +151,14 @@ export class HubRoom extends DurableObject {
   }
 
   async webSocketMessage(ws, message) {
+    meter(this.env, this.ctx, "ws");   // incoming messages bill 20:1 (keepalives are auto-answered and free)
     const me = ws.deserializeAttachment();
     if (!me || typeof me.slot !== "number" || me.slot < 0) return;   // departed / being closed
 
     if (typeof message !== "string") {
       // Relayed game packet: byte0 = destination slot.
       if (message.byteLength < 1 || message.byteLength > MAX_BINARY_BYTES) return;
+      if (!gate(this.env).relayFrames) return;   // cost guard: >=90% of the daily budget, stop relaying game packets
       const src = new Uint8Array(message);
       const dest = src[0];
       const out = new Uint8Array(src.length);
