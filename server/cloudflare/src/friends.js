@@ -114,6 +114,9 @@ export class Directory extends DurableObject {
     this.sql.exec("CREATE TABLE IF NOT EXISTS online (uid TEXT PRIMARY KEY)");
     // `at` makes the flag a lease: entries older than ONLINE_LEASE_MS count as offline.
     try { this.sql.exec("ALTER TABLE online ADD COLUMN at INTEGER NOT NULL DEFAULT 0"); } catch { /* already added */ }
+    // Retired identity -> the identity that replaced it (written when a retire completes). Lets anyone who still
+    // lists the old uid (a failed fan-out, an offline peer) be swapped to the current uid on their next hello.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS alias (old TEXT PRIMARY KEY, new TEXT NOT NULL, at INTEGER NOT NULL DEFAULT 0)");
   }
 
   async fetch(request) {
@@ -140,6 +143,33 @@ export class Directory extends DurableObject {
       if (on) this.sql.exec("INSERT OR REPLACE INTO online (uid, at) VALUES (?, ?)", uid, Date.now());
       else this.sql.exec("DELETE FROM online WHERE uid=?", uid);
       return json({ ok: true });
+    }
+    if (url.pathname === "/alias" && request.method === "POST") {
+      const { old, to } = await request.json();
+      if (!UID_RE.test(old) || !UID_RE.test(to) || old === to) return json({ ok: false }, 400);
+      // never create a cycle: if `to` already resolves to `old`, refuse
+      let cur = to;
+      for (let i = 0; i < 8 && cur; i++) {
+        if (cur === old) return json({ ok: false }, 409);
+        const r = this.sql.exec("SELECT new FROM alias WHERE old=?", cur).toArray()[0];
+        cur = r ? r.new : null;
+      }
+      this.sql.exec("INSERT OR REPLACE INTO alias (old, new, at) VALUES (?, ?, ?)", old, to, Date.now());
+      return json({ ok: true });
+    }
+    if (url.pathname === "/aliases" && request.method === "POST") {
+      const { uids } = await request.json();
+      const map = {};
+      for (const u of (Array.isArray(uids) ? uids : []).filter((x) => UID_RE.test(x)).slice(0, 500)) {
+        let cur = u, hops = 0;
+        for (; hops < 8; hops++) {
+          const r = this.sql.exec("SELECT new FROM alias WHERE old=?", cur).toArray()[0];
+          if (!r) break;
+          cur = r.new;
+        }
+        if (cur !== u) map[u] = cur;
+      }
+      return json({ map });
     }
     if (url.pathname === "/online-of" && request.method === "POST") {
       const { uids } = await request.json();
@@ -347,6 +377,43 @@ export class UserHub extends DurableObject {
     this.run("DELETE FROM requests WHERE uid IN (SELECT uid FROM blocked)");
     this.run("DELETE FROM requests WHERE uid IN (SELECT uid FROM friends)");
     this.run("DELETE FROM requests WHERE dir='out' AND uid IN (SELECT uid FROM requests WHERE dir='in')");
+    // an outgoing request nobody answered for 60 days is stale (the target is gone or never coming back)
+    this.run("DELETE FROM requests WHERE dir='out' AND at < ?", now() - 60 * 86400 * 1000);
+  }
+
+  /* Swap every retired identity still sitting in our lists for the identity that replaced it (Directory alias map),
+   * so one person never shows up twice because an older fan-out missed us. Friends keep their slot, requests their direction. */
+  async applyAliases() {
+    const p = this.profile();
+    const uids = [...this.all("SELECT uid FROM friends"), ...this.all("SELECT uid FROM requests")].map((r) => r.uid);
+    if (!uids.length) return;
+    let map;
+    try {
+      const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+      const r = await dir.fetch("https://directory/aliases", {
+        method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+        body: JSON.stringify({ uids: [...new Set(uids)] }),
+      });
+      map = (await r.json()).map || {};
+    } catch { return; }
+    for (const [oldU, newU] of Object.entries(map)) {
+      if (!UID_RE.test(newU) || oldU === newU) continue;
+      const fr = this.one("SELECT * FROM friends WHERE uid=?", oldU);
+      const rq = this.one("SELECT * FROM requests WHERE uid=?", oldU);
+      if (fr) { this.run("DELETE FROM friends WHERE uid=?", oldU); this.push({ type: "friend_removed", uid: oldU }); }
+      if (rq) { this.run("DELETE FROM requests WHERE uid=?", oldU); this.push({ type: "request_update", uid: oldU, result: "cancelled" }); }
+      if (newU === p.uid || this.isBlocked(newU)) continue;
+      if (fr && !this.isFriend(newU) && this.count("friends") < this.friendCap(p)) {
+        let back = null;
+        try { back = await this.call(newU, "alias_link", { uid: p.uid, name: p.name, status: this.me().status }); } catch { /* keep one-sided */ }
+        if (back && (back.r === "blocked" || back.r === "none")) continue;   // they cannot list us (blocked / no such account)
+        this.push({ type: "friend_added", friend: this.addFriendRow(newU, fr.name, null) });
+      } else if (rq && !this.isFriend(newU) && !this.one("SELECT 1 FROM requests WHERE uid=?", newU)) {
+        const q = { uid: newU, code: codeOf(newU), name: rq.name, at: rq.at };
+        this.run("INSERT OR REPLACE INTO requests (uid, dir, code, name, at) VALUES (?, ?, ?, ?, ?)", newU, rq.dir, q.code, q.name, q.at);
+        this.push({ type: "request", req: q, dir: rq.dir });
+      }
+    }
   }
 
   retiredTo() {
@@ -454,6 +521,16 @@ export class UserHub extends DurableObject {
           req = reqOut ? "out" : "in";
         }
         return { r: "ok", linked, req };
+      }
+      case "alias_link": {
+        // A friend whose old uid was swapped for ours in their list asks us to list them back (two-sided friendship).
+        if (this.isBlocked(from)) return { r: "blocked" };
+        if (!this.isFriend(from)) {
+          if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
+          const f = this.addFriendRow(from, b.name, sanitizeStatus(b.status));
+          this.push({ type: "friend_added", friend: f });
+        }
+        return { r: "ok" };
       }
       case "link_auth": {
         // Secret check for /link/* (see link.js). Optionally rate-limits link-code creation.
@@ -653,6 +730,7 @@ export class UserHub extends DurableObject {
     }
 
     this.run("DELETE FROM inbox WHERE at < ?", now() - INBOX_TTL);
+    await this.applyAliases();
     this.dedupeRows();
     const friends = this.all("SELECT * FROM friends ORDER BY name").map((r) => this.friendObj(r));
     const reqs = this.all("SELECT uid, dir, code, name, at FROM requests ORDER BY at");
@@ -702,7 +780,7 @@ export class UserHub extends DurableObject {
         }
         const r = await this.call(old, "retire_begin", { uid: p.uid, secret: msg.secret });
         if (r.r === "bad-secret" || r.r === "gone" || r.r === "none") {
-          if (r.r === "bad-secret") return this.err(ws, "bad-request", type, "bad-secret");
+          if (r.r === "bad-secret") { try { ws.send(JSON.stringify({ type: "error", reason: "bad-request", ref: type, detail: "bad-secret", uid: old })); } catch {} return; }
           ws.send(JSON.stringify({ type: "retired", uid: old })); // nothing (more) to move
           return;
         }
@@ -757,6 +835,13 @@ export class UserHub extends DurableObject {
         if (failed) return this.err(ws, "bad-request", type, "retire-failed"); // snapshot kept on the old account: retry resumes
         this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '1')", "retire_done:" + old);
         try { await this.call(old, "retire_done", { uid: p.uid, secret: msg.secret }); } catch { /* old stays inert; marker prevents replay */ }
+        try {   // remember old -> new for everyone who may still list the old uid
+          const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+          await dir.fetch("https://directory/alias", {
+            method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+            body: JSON.stringify({ old, to: p.uid }),
+          });
+        } catch { /* best effort */ }
         this.push({ type: "retired", uid: old });
         await this.broadcastPresence(true);
         break;

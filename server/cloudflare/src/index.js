@@ -96,6 +96,10 @@ export default {
     if (url.pathname.startsWith("/j/")) {
       return inviteFetch(request, url.pathname);
     }
+    if (url.pathname === "/__test/alias" && env.TEST_ALIAS === "1" && request.method === "POST") {   // local tests only (never set in production)
+      const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+      return dir.fetch("https://directory/alias", { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: await request.text() });
+    }
     if (url.pathname === "/friends") {
       return friendsFetch(request, env);
     }
