@@ -31,6 +31,7 @@ const SUITE = [
   { file: "test_presence.mjs", kind: "http" },
   { file: "test_relay.mjs", kind: "ws" },
   { file: "test_retire.mjs", kind: "ws", vars: { TEST_RETIRE_FAIL_AFTER: "1", ADMIN_UID: ADMIN } },
+  { file: "test_ask.mjs", kind: "self", env: { ASK_TEST_PORT: "10061" } },
   { file: "test_room4.mjs", kind: "ws" },
   { file: "test_roster_sync.mjs", kind: "ws" },
 ];
