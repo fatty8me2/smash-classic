@@ -243,7 +243,7 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     # Cheat database + curated featured cheats (read from <exe dir>\data at run time).
     $DataDst = Join-Path $StageDir "data"
     New-Item -ItemType Directory -Path $DataDst -Force | Out-Null
-    foreach ($d in "cheats_db.bin", "cheats_featured.json") {
+    foreach ($d in "cheats_db.bin", "cheats_featured.json", "changelog.json") {
         $src = Join-Path $HubRoot "data\$d"
         if (-not (Test-Path $src)) { Fail "missing RetroHub data file $src" }
         Copy-Item $src $DataDst
