@@ -1348,6 +1348,27 @@ export class UserHub extends DurableObject {
         try { ws.send(JSON.stringify({ type: "invite_result", lobby_code: lobby, results })); } catch { /* closing */ }
         break;
       }
+      case "ask": {
+        // "Ask to join": a friend whose room is full/in game/unknown asks the host to send an invite. One message per
+        // (asker, target) per 60 s plus 10 asks/min overall; never stored in history, delivered like an invite.
+        const to = uidArg(msg.to);
+        if (!to || to === p.uid) return this.err(ws, "bad-request", type);
+        if (!this.isFriend(to)) return this.err(ws, "not-friends", type, to);
+        if (!this.hit("ask", 10, 60 * 1000) || !this.hit("ask:" + to, 1, 60 * 1000)) {
+          try { ws.send(JSON.stringify({ type: "ask_result", to, ok: false, reason: "rate-limited" })); } catch { /* closing */ }
+          break;
+        }
+        const m = { id: crypto.randomUUID(), from: p.uid, from_name: p.name, to, kind: "ask",
+                    ask: { game_id: clean(msg.game_id, 64), game_title: clean(msg.game_title, 64), system: clean(msg.system, 32) }, at: now() };
+        let ok = false, reason = "undeliverable";
+        try {
+          const r = await this.call(to, "msg", { uid: p.uid, msg: m });
+          ok = !!r && r.r === "ok";
+          if (r && r.r === "notfriend") reason = "not-friends";
+        } catch { /* unreachable */ }
+        try { ws.send(JSON.stringify(ok ? { type: "ask_result", to, ok: true } : { type: "ask_result", to, ok: false, reason })); } catch { /* closing */ }
+        break;
+      }
       case "prefs": {
         if (typeof msg.auto_friend === "boolean") this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('auto_friend', ?)", msg.auto_friend ? "1" : "0");
         break;
