@@ -234,12 +234,20 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     Set-Content -Path (Join-Path $HubRoot "VERSION") -Value $RelVer -NoNewline -Encoding ascii
     cmake -S $HubRoot -B $HubBuild | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "RetroHub configure failed" }
-    cmake --build $HubBuild --config Release --target RetroHub n64run retrorun
+    cmake --build $HubBuild --config Release
     if ($LASTEXITCODE -ne 0) { Fail "RetroHub build failed" }
     $HubBin = Join-Path $HubBuild "bin\Release"
     Copy-Item (Join-Path $HubBin "RetroHub.exe") $StageDir
     Copy-Item (Join-Path $HubBin "n64run.exe") $StageDir
     Copy-Item (Join-Path $HubBin "retrorun.exe") $StageDir
+    # Cheat database + curated featured cheats (read from <exe dir>\data at run time).
+    $DataDst = Join-Path $StageDir "data"
+    New-Item -ItemType Directory -Path $DataDst -Force | Out-Null
+    foreach ($d in "cheats_db.bin", "cheats_featured.json") {
+        $src = Join-Path $HubRoot "data\$d"
+        if (-not (Test-Path $src)) { Fail "missing RetroHub data file $src" }
+        Copy-Item $src $DataDst
+    }
     # libretro cores for GBA / GB / GBC / DS (mGBA MPL-2.0, SameBoy MIT, Gambatte GPL-2.0, melonDS DS GPL-3.0+)
     $CoreSrc = Join-Path $HubRoot "deps\cores"
     if (-not (Test-Path (Join-Path $CoreSrc "mgba_libretro.dll")) -or -not (Test-Path (Join-Path $CoreSrc "melondsds_libretro.dll"))) {
@@ -257,6 +265,9 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     $SameBoyRb = Join-Path $HubBin "cores\sameboy_rb_libretro.dll"
     if (-not (Test-Path $SameBoyRb)) { Fail "sameboy_rb_libretro.dll not built (expected $SameBoyRb); build RetroHub with MinGW gcc (see RetroHub CLAUDE.md)" }
     Copy-Item $SameBoyRb $CoreDst -Force
+    # Every other core RetroHub builds from source (e.g. beetle_psx_libretro.dll for PS1, MinGW).
+    Get-ChildItem -Path (Join-Path $HubBin "cores") -File -Filter "*_libretro.dll" | ForEach-Object { Copy-Item $_.FullName $CoreDst -Force }
+    if (-not (Test-Path (Join-Path $CoreDst "beetle_psx_libretro.dll"))) { Fail "beetle_psx_libretro.dll not built (PS1); build RetroHub with MinGW gcc" }
     Get-ChildItem -Path (Join-Path $CoreSrc "info") -File -Filter "*.info" -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName (Join-Path $CoreDst "info") }
     Copy-Item (Join-Path $HubBin "SDL2.dll") $StageDir -Force
 
