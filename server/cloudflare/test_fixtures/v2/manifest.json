@@ -1,0 +1,83 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "rev": 2,
+    "full": true,
+    "account": {
+      "used": 32818,
+      "protUsed": 32781,
+      "cap": 52428800,
+      "protCap": 20971520,
+      "largeCap": 52396019,
+      "devices": 2,
+      "pool": "ok",
+      "paused": false,
+      "recovery": false
+    },
+    "games": {
+      "n64/smash-64": {
+        "playedAt": 1760000100,
+        "device": "PC-DESK",
+        "pin": false,
+        "rev": 2,
+        "files": {
+          "battery/ssb64.sra": {
+            "cur": 1,
+            "cloud": "synced",
+            "vers": [
+              {
+                "ver": 1,
+                "sha": "1234e2b34a2f7303e44a65c546423b14c2f7983aad3a0e9cd4a9a37b1f576324",
+                "size": 32768,
+                "stored": 32768,
+                "enc": "none",
+                "mtime": 1760000000,
+                "dev": "d-fixture01",
+                "devName": "PC-DESK",
+                "ts": 1792945341,
+                "class": "battery"
+              }
+            ]
+          },
+          "meta.json": {
+            "cur": 1,
+            "cloud": "synced",
+            "vers": [
+              {
+                "ver": 1,
+                "sha": "e398848a61f020158676ca16bba062c68140e4d068a39df12497f477a20c4f73",
+                "size": 13,
+                "stored": 13,
+                "enc": "none",
+                "mtime": 1760000001,
+                "dev": "d-fixture01",
+                "devName": "PC-DESK",
+                "ts": 1792945341,
+                "class": "settings"
+              }
+            ]
+          },
+          "states/auto.state": {
+            "cur": 1,
+            "cloud": "synced",
+            "vers": [
+              {
+                "ver": 1,
+                "sha": "51b23de012a701912400c8fd4c5b84d6b2f680bfeafa48d438c66e31603ff22f",
+                "size": 20000,
+                "stored": 37,
+                "enc": "deflate",
+                "mtime": 1760000002,
+                "dev": "d-fixture01",
+                "devName": "PC-DESK",
+                "ts": 1792945341,
+                "class": "state"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

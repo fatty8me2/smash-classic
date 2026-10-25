@@ -1,0 +1,25 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "rev": 2,
+    "results": [
+      {
+        "path": "meta.json",
+        "ver": 1,
+        "cloud": "synced"
+      },
+      {
+        "path": "battery/ssb64.sra",
+        "ver": 1,
+        "cloud": "synced"
+      },
+      {
+        "path": "states/auto.state",
+        "ver": 1,
+        "cloud": "synced"
+      }
+    ],
+    "evicted": []
+  }
+}

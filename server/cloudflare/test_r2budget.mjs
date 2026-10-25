@@ -6,6 +6,7 @@ import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import { client as v2client } from "./test_v2_lib.mjs";
 
 const PORT = Number(process.env.BUDGET_TEST_PORT) || 8793;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -169,6 +170,39 @@ async function phase3() {
   check((await put(B, "ok", Buffer.from("q"))).status === 200, "reads reset on a new day");
 }
 
+// v2 (versioned blobs) share the same guards: Class A/B per blob, storage cap, per-account table, fail closed.
+const PH4 = { BUDGET_TEST: "1", BUDGET_STORAGE_MAX: "3000", BUDGET_A_MAX: "5", BUDGET_B_MAX: "3" };
+async function phase4() {
+  const api = v2client(BASE);
+  const A = await account();
+  const blob = (n, b) => Buffer.alloc(n, b);
+  let r = await api.push(A, "n64/g", [{ path: "battery/a.sav", data: blob(1000, 1) }, { path: "battery/b.sav", data: blob(1000, 2) }]);
+  check(r.commit.data.results.every((x) => x.cloud === "synced"), "v2: two blobs committed");
+  let st = await status();
+  check(st.a === 2 && st.total === 2000, `v2: one Class A op per blob (a=${st.a}), bytes tracked (${st.total})`);
+  const a0 = st.a;
+  r = await api.push(A, "n64/g", [{ path: "battery/c.sav", data: blob(1000, 1) }]);
+  check(r.ups.length === 0 && (await status()).a === a0 && (await status()).total === 2000, "v2: dedup costs no Class A and no bytes");
+  const ac = await test("/saves/_test/acct");
+  check(JSON.stringify(ac.acct.map((x) => [x.uid, x.used, x.n])) === JSON.stringify(ac.real.map((x) => [x.uid, x.used, x.n])), "v2: per-account table matches the index (blobs included)");
+  const big = await api.plan(A, "n64/g", [{ path: "battery/big.sav", sha: sha(blob(1500, 9)), size: 1500, stored: 1500, enc: "none", mtime: 1, base: 0 }]);
+  check(big.status === 507 && big.data.error === "cloud-saves-full", "v2: global storage cap -> 507 cloud-saves-full");
+  const gs = [];
+  for (let i = 0; i < 5; i++) gs.push((await api.blobGet(A, "n64/g", "battery/a.sav")).status);
+  check(gs.slice(0, 3).every((x) => x === 200) && gs[3] === 429 && gs[4] === 429, `v2: Class B cap (3) -> 429 after 3 blob GETs (${gs})`);
+  check((await api.manifest(A)).status === 200, "v2: manifest costs no R2 op and still answers");
+  await test("/saves/_test/month?m=2099-03");
+  check((await api.blobGet(A, "n64/g", "battery/a.sav")).status === 200, "v2: new month resets the op counters");
+  for (let i = 0; i < 5; i++) await api.push(A, "n64/g", [{ path: `battery/s${i}.sav`, data: blob(10, 20 + i) }]);
+  const pa = await api.plan(A, "n64/g", [{ path: "battery/z.sav", sha: sha(blob(10, 99)), size: 10, stored: 10, enc: "none", mtime: 1, base: 0 }]);
+  check(pa.status === 429 && pa.data.error === "cloud-saves-paused", "v2: Class A cap -> plan answers 429 cloud-saves-paused");
+  await test("/saves/_test/fail?on=1");
+  const fr = [await api.manifest(A), await api.blobGet(A, "n64/g", "battery/a.sav"), await api.status(A)];
+  check(fr.every((x) => x.status === 429 && x.data.error === "cloud-saves-unavailable"), `v2: budget DO failure refuses everything (${fr.map((x) => x.status)})`);
+  await test("/saves/_test/fail?on=0");
+  check((await api.manifest(A)).status === 200, "v2: recovers once the DO is healthy");
+}
+
 async function main() {
   await start(PH1);
   const A = await account(), B = await account(), C = await account();
@@ -241,6 +275,9 @@ async function main() {
   stop(); await sleep(1500);
   await start(PH3);
   await phase3();
+  stop(); await sleep(1500);
+  await start(PH4);
+  await phase4();
 }
 
 main().catch((e) => { fails++; console.log("ERROR:", e); }).finally(() => {

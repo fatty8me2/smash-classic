@@ -1,0 +1,20 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "rev": 2,
+    "full": false,
+    "account": {
+      "used": 32818,
+      "protUsed": 32781,
+      "cap": 52428800,
+      "protCap": 20971520,
+      "largeCap": 52396019,
+      "devices": 2,
+      "pool": "ok",
+      "paused": false,
+      "recovery": false
+    },
+    "games": {}
+  }
+}

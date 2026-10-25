@@ -1,0 +1,39 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "rev": 1,
+    "ticket": "bd69386f9b7d4dd395d64c911ad5abcaf10c746b",
+    "expires": 1792945941,
+    "files": [
+      {
+        "path": "battery/ssb64.sra",
+        "class": "battery",
+        "action": "upload",
+        "sha": "1234e2b34a2f7303e44a65c546423b14c2f7983aad3a0e9cd4a9a37b1f576324",
+        "stored": 32768,
+        "enc": "none"
+      },
+      {
+        "path": "meta.json",
+        "class": "settings",
+        "action": "upload",
+        "sha": "e398848a61f020158676ca16bba062c68140e4d068a39df12497f477a20c4f73",
+        "stored": 13,
+        "enc": "none"
+      },
+      {
+        "path": "states/auto.state",
+        "class": "state",
+        "action": "upload",
+        "sha": "51b23de012a701912400c8fd4c5b84d6b2f680bfeafa48d438c66e31603ff22f",
+        "stored": 37,
+        "enc": "deflate"
+      }
+    ],
+    "account": {
+      "used": 0,
+      "pool": "ok"
+    }
+  }
+}

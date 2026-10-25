@@ -1,0 +1,35 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "rev": 2,
+    "ticket": "d4319c5e111d4ef6bb4cc9d9cca55652cce0822b",
+    "expires": 1792945941,
+    "files": [
+      {
+        "path": "battery/ssb64.sra",
+        "class": "battery",
+        "action": "same",
+        "ver": 1
+      },
+      {
+        "path": "battery/copy.sra",
+        "class": "battery",
+        "action": "have",
+        "sha": "1234e2b34a2f7303e44a65c546423b14c2f7983aad3a0e9cd4a9a37b1f576324",
+        "stored": 32768,
+        "enc": "none"
+      },
+      {
+        "path": "battery/other.sra",
+        "class": "battery",
+        "action": "conflict",
+        "current": null
+      }
+    ],
+    "account": {
+      "used": 32818,
+      "pool": "ok"
+    }
+  }
+}

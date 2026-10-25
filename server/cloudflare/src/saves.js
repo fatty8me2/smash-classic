@@ -18,19 +18,20 @@
 //
 // If the SAVES R2 binding is absent every /saves route answers 503 {error:"cloud-saves-disabled"}.
 
+import { cleanKey } from "./saves_pool.js";
+import { savesV2Fetch } from "./saves_v2.js";
+
 const UID_RE = /^[a-z2-7]{26}$/;
 export const MAX_OBJECT = 16 * 1024 * 1024;
 export const QUOTA = 200 * 1024 * 1024;   // per account (env SAVES_QUOTA overrides, for tests)
 export const MAX_FILES = 1500;
-const MAX_KEY = 240;
-const MAX_SEGMENTS = 8;
 const SKEW_MS = 5 * 60 * 1000;
-const HEX64 = /^[0-9a-f]{64}$/;
+export const HEX64 = /^[0-9a-f]{64}$/;
 
-function json(obj, status = 200, extra = {}) {
+export function json(obj, status = 200, extra = {}) {
   return new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json", ...extra } });
 }
-const err = (status, code, extra = {}) => json({ ok: false, error: code, ...extra }, status);
+export const err = (status, code, extra = {}) => json({ ok: false, error: code, ...extra }, status);
 
 const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
 
@@ -47,32 +48,19 @@ function safeEq(a, b) {
   return d === 0;
 }
 
-// Relative path inside the account's vault, "/" separated, validated hard.
-export function cleanKey(raw) {
-  if (typeof raw !== "string" || !raw || raw.length > MAX_KEY) return null;
-  const segs = raw.split("/");
-  if (segs.length > MAX_SEGMENTS) return null;
-  for (const s of segs) {
-    if (!s || s === "." || s === "..") return null;
-    if (s.length > 120 || /[\x00-\x1f\x7f\\:*?"<>|]/.test(s)) return null;
-    if (/[. ]$/.test(s)) return null;
-  }
-  if (segs[0].toLowerCase() === "_identity") return null; // the account secret never goes to the cloud
-  if (/\.hubtmp$/i.test(raw)) return null;
-  return segs.join("/");
-}
+export { cleanKey };
 
-async function authenticate(request, env, url, write) {
+export async function authenticate(request, env, url, write, cls) {
   const h = request.headers.get("Authorization") || "";
   const m = /^RHSIG uid=([a-z2-7]{26}),ts=(\d{10,16}),sig=([0-9a-f]{64})$/.exec(h);
   if (!m) return { res: err(401, "unauthorized") };
   const [, uid, ts, sig] = m;
-  if (Math.abs(Date.now() - Number(ts)) > SKEW_MS) return { res: err(401, "stale-timestamp") };
+  if (Math.abs(Date.now() - Number(ts)) > SKEW_MS) return { res: err(401, "stale-timestamp", { serverTime: Date.now() }) };
   const hub = env.USER_HUBS.get(env.USER_HUBS.idFromName(uid));
   const r = await hub.fetch("https://userhub/i/saves_auth", {
     method: "POST",
     headers: { "x-rh-internal": "1", "content-type": "application/json" },
-    body: JSON.stringify({ uid, write }),
+    body: JSON.stringify({ uid, write, cls }),
   });
   const a = await r.json();
   if (a.r === "limited") return { res: err(429, "rate-limited", { retryAfter: 60 }) };
@@ -85,8 +73,8 @@ async function authenticate(request, env, url, write) {
 
 // Every R2 call goes through the global R2Budget Durable Object first (src/r2budget.js). If it errors or is
 // unreachable the operation is refused: fail CLOSED.
-class BudgetDown extends Error {}
-async function budget(env, body) {
+export class BudgetDown extends Error {}
+export async function budget(env, body) {
   try {
     const r = await env.R2_BUDGET.get(env.R2_BUDGET.idFromName("global")).fetch("https://budget/b", {
       method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -116,6 +104,7 @@ async function savesInner(request, env) {
   const url = new URL(request.url);
   const route = url.pathname;
   const method = request.method;
+  if (route.startsWith("/saves/v2/")) return savesV2Fetch(request, env, url);
   const isObj = route === "/saves/obj";
   if (!(route === "/saves/list" && method === "GET") && !(isObj && ["GET", "PUT", "DELETE"].includes(method))) {
     return err(route.startsWith("/saves/") ? 405 : 404, "not-found");
@@ -234,12 +223,13 @@ async function testHooks(request, env) {
   const u = new URL(request.url);
   if (!u.pathname.startsWith("/saves/_test/")) return null;
   const op = u.pathname.slice("/saves/_test/".length);
+  if (op.startsWith("v2/")) return json(await budget(env, { ...Object.fromEntries(u.searchParams), op: "test_v2_" + op.slice(3) }));   // v2 hooks (uid, active, total...)
   if (op === "rawput") {   // write straight into R2 behind the index's back (reconcile tests)
     await env.SAVES.put(u.searchParams.get("rkey"), "x".repeat(Number(u.searchParams.get("n") || 10)), { customMetadata: { sha: "0".repeat(64), mtime: "1" } });
     return json({ ok: true });
   }
   const body = { month: { op: "test_month", month: u.searchParams.get("m") }, day: { op: "test_day", day: u.searchParams.get("d") },
     fail: { op: "test_fail", on: u.searchParams.get("on") === "1" }, commitfail: { op: "test_commit_fail", n: u.searchParams.get("n") },
-    reconcile: { op: "test_reconcile" }, sum: { op: "test_sum" } }[op] || { op: "status" };
+    reconcile: { op: "test_reconcile" }, sum: { op: "test_sum" }, acct: { op: "test_acct" } }[op] || { op: "status" };
   return json(await budget(env, body));
 }

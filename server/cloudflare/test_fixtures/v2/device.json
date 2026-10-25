@@ -1,0 +1,14 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "devices": [
+      {
+        "dev": "d-fixture01",
+        "name": "PC-DESK",
+        "first": 1792945341,
+        "lastSeen": 1792945341
+      }
+    ]
+  }
+}

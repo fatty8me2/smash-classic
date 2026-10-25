@@ -1,0 +1,8 @@
+{
+  "status": 401,
+  "body": {
+    "ok": false,
+    "error": "stale-timestamp",
+    "serverTime": 1792945341157
+  }
+}

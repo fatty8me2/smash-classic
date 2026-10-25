@@ -1,0 +1,21 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "rev": 5,
+    "ticket": null,
+    "expires": 0,
+    "files": [
+      {
+        "path": "states/huge2.state",
+        "class": "state",
+        "action": "skip",
+        "reason": "too-large"
+      }
+    ],
+    "account": {
+      "used": 90000,
+      "pool": "ok"
+    }
+  }
+}

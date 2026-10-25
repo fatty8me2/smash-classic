@@ -1,0 +1,24 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "rev": 1,
+    "account": {
+      "used": 0,
+      "protUsed": 0,
+      "cap": 52428800,
+      "protCap": 20971520,
+      "largeCap": 52428800,
+      "devices": 0,
+      "pool": "ok",
+      "paused": false,
+      "recovery": false
+    },
+    "limits": {
+      "maxBlob": 16777216,
+      "planFiles": 200,
+      "putsPerDay": 1500,
+      "getsPerDay": 6000
+    }
+  }
+}

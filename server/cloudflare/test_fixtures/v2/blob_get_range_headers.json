@@ -1,0 +1,15 @@
+{
+  "status": 206,
+  "headers": {
+    "content-length": "768",
+    "content-range": "bytes 32000-32767/32768",
+    "content-type": "application/octet-stream",
+    "x-rh-enc": "none",
+    "x-rh-mtime": "1760000000",
+    "x-rh-plain-sha": "1234e2b34a2f7303e44a65c546423b14c2f7983aad3a0e9cd4a9a37b1f576324",
+    "x-rh-sha": "1234e2b34a2f7303e44a65c546423b14c2f7983aad3a0e9cd4a9a37b1f576324",
+    "x-rh-size": "32768",
+    "x-rh-stored": "32768",
+    "x-rh-ver": "1"
+  }
+}

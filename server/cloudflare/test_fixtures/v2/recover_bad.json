@@ -1,0 +1,7 @@
+{
+  "status": 404,
+  "body": {
+    "ok": false,
+    "error": "bad-recovery-code"
+  }
+}

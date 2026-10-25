@@ -1,0 +1,15 @@
+{
+  "status": 507,
+  "body": {
+    "ok": false,
+    "error": "too-big-protected",
+    "files": [
+      {
+        "path": "battery/big.sra",
+        "class": "battery",
+        "action": "skip",
+        "reason": "too-big-protected"
+      }
+    ]
+  }
+}

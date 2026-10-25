@@ -1,0 +1,20 @@
+{
+  "status": 412,
+  "body": {
+    "ok": false,
+    "error": "conflict",
+    "current": {
+      "ver": 3,
+      "sha": "1234e2b34a2f7303e44a65c546423b14c2f7983aad3a0e9cd4a9a37b1f576324",
+      "size": 32768,
+      "stored": 32768,
+      "enc": "none",
+      "mtime": 1760000000,
+      "dev": "",
+      "devName": "",
+      "ts": 1792945341,
+      "class": "battery",
+      "cloud": "synced"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "status": 404,
+  "body": {
+    "ok": false,
+    "error": "not-found",
+    "evicted": true
+  }
+}

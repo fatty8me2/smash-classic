@@ -1,0 +1,9 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "lease": true,
+    "until": 1792946061,
+    "tookOver": false
+  }
+}

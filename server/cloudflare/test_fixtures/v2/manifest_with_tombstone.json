@@ -1,0 +1,34 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "rev": 5,
+    "full": true,
+    "account": {
+      "used": 90000,
+      "protUsed": 0,
+      "cap": 100000,
+      "protCap": 30000,
+      "largeCap": 100000,
+      "devices": 0,
+      "pool": "ok",
+      "paused": false,
+      "recovery": false
+    },
+    "games": {
+      "n64/g1": {
+        "playedAt": 100,
+        "device": "",
+        "pin": false,
+        "rev": 5,
+        "files": {
+          "states/a.state": {
+            "cur": 1,
+            "cloud": "evicted",
+            "vers": []
+          }
+        }
+      }
+    }
+  }
+}

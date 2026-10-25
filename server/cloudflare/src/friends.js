@@ -592,7 +592,12 @@ export class UserHub extends DurableObject {
         // Cloud saves: hand the Worker the HMAC key (sha256hex of the secret) after rate limiting this account.
         if (from !== p.uid) return { r: "none" };
         const w = !!b.write;
-        if (!this.hit(w ? "saves:w" : "saves:r", w ? 120 : 600, 60000)) return { r: "limited" };
+        const V2 = { pc: 30, put: 120, get: 300, meta: 60 };   // v2 per-account per-minute limits (docs/CLOUD_SAVES_V2.md 3.6)
+        if (b.cls && V2[b.cls]) {
+          const ov = Number(this.env && this.env["SAVES_RATE_" + b.cls.toUpperCase()]);   // tests only; unset in production
+          if (!this.hit("saves2:" + b.cls, ov > 0 ? ov : V2[b.cls], 60000)) return { r: "limited" };
+        }
+        else if (!this.hit(w ? "saves:w" : "saves:r", w ? 120 : 600, 60000)) return { r: "limited" };
         return { r: "ok", key: p.secret_hash };
       }
       case "presence": {

@@ -1,0 +1,8 @@
+{
+  "status": 429,
+  "body": {
+    "ok": false,
+    "error": "account-daily-limit",
+    "retryAfter": 27455
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "rev": 5,
+    "results": [
+      {
+        "path": "states/a.state",
+        "ver": 1,
+        "cloud": "synced"
+      }
+    ],
+    "evicted": [
+      {
+        "game": "n64/g1",
+        "path": "states/a.state"
+      }
+    ]
+  }
+}

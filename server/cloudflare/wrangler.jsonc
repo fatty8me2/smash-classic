@@ -7,7 +7,10 @@
   "compatibility_date": "2026-09-23",
   "workers_dev": true,
   // RetroHub admin: every user is auto-friended with this account once (src/friends.js autoLinkAdmin)
-  "vars": { "ADMIN_UID": "4ooju7u7o3zy67l2qqaotuj5n4" },
+  // Cloud saves v2 rollout switches (docs/CLOUD_SAVES_V2.md section 7.6; all optional, these are the defaults):
+  //   SAVES_V2 "0" turns every /saves/v2 route off (v1 keeps working); ACCOUNT_CAP / PROT_CAP in bytes (50 MB / 20 MB);
+  //   POOL_TIGHT / POOL_FULL = fractions of the global 7 GB storage guard at which the large pools shrink / stop.
+  "vars": { "ADMIN_UID": "4ooju7u7o3zy67l2qqaotuj5n4", "SAVES_V2": "1", "ACCOUNT_CAP": "52428800", "PROT_CAP": "20971520", "POOL_TIGHT": "0.7", "POOL_FULL": "0.9" },
   "durable_objects": {
     "bindings": [
       { "name": "ROOMS", "class_name": "NetplayRoom" },

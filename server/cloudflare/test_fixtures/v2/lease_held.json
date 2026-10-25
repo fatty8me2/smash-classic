@@ -1,0 +1,13 @@
+{
+  "status": 423,
+  "body": {
+    "ok": false,
+    "error": "lease-held",
+    "held": {
+      "dev": "d-fixture01",
+      "name": "PC-DESK",
+      "since": 1792945341,
+      "until": 1792946061
+    }
+  }
+}

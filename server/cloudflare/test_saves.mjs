@@ -22,7 +22,7 @@ let proc = null, persist = null;
 async function startServer() {
   const cfg = readFileSync("wrangler.jsonc", "utf8").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
   const j = JSON.parse(cfg);
-  if (!NOR2) j.r2_buckets = [{ binding: "SAVES", bucket_name: "retrohub-saves-test" }];
+  if (NOR2) delete j.r2_buckets; else j.r2_buckets = [{ binding: "SAVES", bucket_name: "retrohub-saves-test" }];
   writeFileSync("wrangler.test.jsonc", JSON.stringify(j, null, 1));
   persist = mkdtempSync(join(tmpdir(), "rh-r2-"));
   const port = NOR2 ? PORT + 1 : PORT;

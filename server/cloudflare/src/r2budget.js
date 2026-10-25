@@ -17,6 +17,7 @@
 // Callers must FAIL CLOSED when this DO errors.
 
 import { DurableObject } from "cloudflare:workers";
+import { initV2, v2Handle, v1Written, v1Deleted, v1OverCap, isBlobKey } from "./r2budget_v2.js";
 
 const GB = 1024 * 1024 * 1024;
 export const DEFAULT_CAPS = { storage: 7 * GB, a: 700_000, b: 7_000_000, rows: 70_000 };
@@ -38,6 +39,7 @@ export class R2Budget extends DurableObject {
     this.sql.exec(`CREATE INDEX IF NOT EXISTS files_uid ON files(uid)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS files_pend ON files(pts) WHERE pend IS NOT NULL`);   // pending scans touch only pending rows
     this.sql.exec(`CREATE TABLE IF NOT EXISTS accts (uid TEXT PRIMARY KEY, used INTEGER NOT NULL, n INTEGER NOT NULL)`);
+    initV2(this);   // cloud saves v2 tables + one-time column adds (schema tag in meta)
     const r = this.sql.exec(`SELECT v FROM meta WHERE k='st'`).toArray()[0];
     this.st = Object.assign({ month: "", day: "", a: 0, b: 0, total: 0, rows: 0, reads: 0, ms: 0, last_try: 0, dirty: 0, recent_expire: 0,
       lock_until: 0, test_month: "", test_day: "", test_fail: 0, test_commit_fail: 0 }, r ? JSON.parse(r.v) : {});
@@ -148,8 +150,8 @@ export class R2Budget extends DurableObject {
       }
       for (const k of have.keys()) { changed = true; this.q(`DELETE FROM files WHERE rkey=?`, k); }
       if (changed) {
-        this.q(`DELETE FROM accts`);
-        this.q(`INSERT INTO accts SELECT uid, SUM(size), COUNT(*) FROM files GROUP BY uid`);
+        this.q(`UPDATE accts SET used=0, n=0`);   // keep the v2 columns (versions, rev, devices...) of each account
+        this.q(`INSERT INTO accts(uid,used,n) SELECT uid, SUM(size), COUNT(*) FROM files GROUP BY uid ON CONFLICT(uid) DO UPDATE SET used=excluded.used, n=excluded.n`);
       }
       this.st.total = rows.reduce((t, r) => t + r[2], 0); this.st.dirty = 0; this.mark();
     }
@@ -175,13 +177,13 @@ export class R2Budget extends DurableObject {
 
     switch (q.op) {
       case "list": {
-        const files = this.q(`SELECT rkey,size,etag,hetag,sha,mtime FROM files WHERE uid=? AND etag IS NOT NULL ORDER BY rkey`, q.uid)
+        const files = this.q(`SELECT rkey,size,etag,hetag,sha,mtime FROM files WHERE uid=? AND etag IS NOT NULL AND dead IS NULL AND rkey NOT LIKE ? ORDER BY rkey`, q.uid, `saves/${q.uid}/o/%`)
           .map((r) => ({ key: r.rkey.slice(`saves/${q.uid}/`.length), size: r.size, etag: r.hetag || r.etag, sha: r.sha || "", mtime: r.mtime || "0" }));
         return J({ r: "ok", files, used: files.reduce((s, f) => s + f.size, 0), quota: QUOTA });
       }
       case "get": {            // one Class B op (R2 get); the index supplies size/etag so no head is needed
         const row = this.row(q.rkey);
-        if (!row || !row.etag) return J({ r: "none" });
+        if (!row || !row.etag || row.dead != null) return J({ r: "none" });
         const t = today(); if (t) return t;
         if (this.spend(0, 1)) return J({ r: "paused" });
         this.mark();
@@ -195,15 +197,17 @@ export class R2Budget extends DurableObject {
         if (this.locked(now)) return J({ r: "busy" });
         const row = this.row(q.rkey);
         const exists = !!(row && row.etag);
-        if (row && row.pend != null) return J({ r: "busy" });
+        if (row && (row.pend != null || row.dead != null)) return J({ r: "busy" });
         if (q.ifNone === "*" && exists) return J({ r: "conflict", current: this.pub(row) });
         if (q.ifMatch && (!exists || (q.ifMatch !== row.etag && q.ifMatch !== row.hetag))) return J({ r: "conflict", current: exists ? this.pub(row) : null });
         if (exists && row.sha === q.sha && row.size === q.len) return J({ r: "unchanged", etag: row.hetag || row.etag });
         const old = exists ? row.size : 0;
-        const ac = this.q(`SELECT used, n FROM accts WHERE uid=?`, q.uid)[0] || { used: 0, n: 0 };
+        const ac = this.q(`SELECT used, n, v2, vused FROM accts WHERE uid=?`, q.uid)[0] || { used: 0, n: 0 };
         const used = { s: ac.used, n: ac.n };
-        if (!exists && used.n >= MAXF) return J({ r: "toomany", max: MAXF });
-        if (used.s - old + q.len > QUOTA) return J({ r: "quota", used: used.s, quota: QUOTA });
+        const migrated = !!ac.v2;     // migrated accounts are governed by the v2 caps (blobs inflate n and used)
+        if (migrated) { if (v1OverCap(this, q.uid, q.len, old)) return J({ r: "quota", used: ac.vused, quota: ac.vused }); }
+        else if (!exists && used.n >= MAXF) return J({ r: "toomany", max: MAXF });
+        if (!migrated && used.s - old + q.len > QUOTA) return J({ r: "quota", used: used.s, quota: QUOTA });
         if (this.st.total + q.len - old > c.storage) return J({ r: "full" });
         if (this.spend(1, 0)) return J({ r: "paused" });
         const tok = now * 1000 + Math.floor(Math.random() * 1000);
@@ -228,6 +232,7 @@ export class R2Budget extends DurableObject {
             ON CONFLICT(rkey) DO UPDATE SET size=excluded.size, etag=excluded.etag, hetag=excluded.hetag, sha=excluded.sha,
             mtime=excluded.mtime, pend=NULL, pts=NULL`, q.rkey, q.uid, q.size, q.etag, q.hetag, q.sha, q.mtime);
         }
+        if (!isBlobKey(q.rkey)) v1Written(this, q.uid, q.rkey, q.size, q.sha, q.mtime, now);
         return J({ r: "ok" });
       }
       case "put_abort": {
@@ -241,7 +246,7 @@ export class R2Budget extends DurableObject {
         if (this.st.rows >= c.rows * 1.25 || this.st.reads >= c.reads * 1.25) return J({ r: "busytoday" });
         this.expirePending(now);
         const row = this.row(q.rkey);
-        if (!row || !row.etag) return J({ r: "none" });
+        if (!row || !row.etag || row.dead != null) return J({ r: "none" });
         if (row.pend != null) return J({ r: "busy" });   // upload in flight: deleting now would untrack it
         if (q.ifMatch && q.ifMatch !== row.etag && q.ifMatch !== row.hetag) return J({ r: "conflict", current: this.pub(row) });
         return J({ r: "ok" });
@@ -249,7 +254,7 @@ export class R2Budget extends DurableObject {
       case "del_commit": {
         const row = this.row(q.rkey);
         if (row && row.pend != null) { this.st.dirty = 1; this.mark(); return J({ r: "ok" }); }   // an upload slipped in
-        if (row) { this.adj(row.uid, -row.size, -1); this.q(`DELETE FROM files WHERE rkey=?`, q.rkey); }
+        if (row) { this.adj(row.uid, -row.size, -1); this.q(`DELETE FROM files WHERE rkey=?`, q.rkey); v1Deleted(this, row.uid, q.rkey, now); }
         return J({ r: "ok" });
       }
       case "status":
@@ -261,7 +266,7 @@ export class R2Budget extends DurableObject {
       case "test_reconcile": await this.maybeReconcile(now, true); return J({ r: "ok", total: this.st.total });
       case "test_acct": return J({ r: "ok", acct: this.q(`SELECT uid, used, n FROM accts ORDER BY uid`), real: this.q(`SELECT uid, SUM(COALESCE(pend,size)) AS used, COUNT(*) AS n FROM files GROUP BY uid ORDER BY uid`) });
       case "test_sum": return J({ r: "ok", sum: this.q(`SELECT COALESCE(SUM(COALESCE(pend,size)),0) AS s FROM files`)[0].s });
-      default: return J({ r: "bad-op" });
+      default: return (q.op.startsWith("v2_") || q.op.startsWith("test_v2_")) ? (v2Handle(this, q, now) || J({ r: "bad-op" })) : J({ r: "bad-op" });
     }
   }
 }
