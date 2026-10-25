@@ -19,9 +19,10 @@ const nm = (base) => `${base}${RUN}`.slice(0, 16);
 const key = (s, o) => normalizeUsername(s, o).key;
 check("case-insensitive", key("Kai99") === key("kAI99"));
 check("separators ignored", key("a_b.c-d1") === key("abcd1"));
-check("I/l/1 folded", key("BIll") === key("B1ll") && key("Bill") === key("BlII"));
+check("digit look-alikes folded: 1->l, 5->s", key("B1ll") === key("Blll") && key("Ro5e") === key("Rose"));
+check("i and l are NOT folded", key("Kai99") !== key("Kal99") && key("BIll") !== key("Bll1"));
 check("O/0 folded", key("R0bot9") === key("Robot9"));
-check("rn/m and vv/w folded", key("corner") === key("comer") && key("vvolf") === key("wolf"));
+check("rn/m and vv/w are NOT folded", key("corner") !== key("comer") && key("vvolf") !== key("wolf"));
 check("NFKC fullwidth folds to ascii", normalizeUsername("ｋａｉｘ９").display === "kaix9");
 check("non-ascii homoglyph rejected", normalizeUsername("Kаi99").reason === "invalid-chars");   // Cyrillic a
 check("length 3..16", normalizeUsername("ab").reason === "too-short" && normalizeUsername("a".repeat(17)).reason === "too-long" && normalizeUsername("abc").ok && normalizeUsername("a".repeat(16)).ok);

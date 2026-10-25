@@ -2,8 +2,9 @@
 // The registry itself lives in the Directory Durable Object (friends.js); see RetroHub/docs/ACCOUNTS.md.
 //
 //   display  = NFKC form of what the player typed (case kept), 3-16 chars of [A-Za-z0-9_.-]
-//   key      = the uniqueness key: lowercase, separators (_ . -) removed, look-alike letters folded
-//              (I/l/1 -> l, O/0 -> o, rn -> m, vv -> w). Two names with the same key are "the same name".
+//   key      = the uniqueness key: lowercase, separators (_ . -) removed, digit look-alikes folded (0->o, 1->l, 5->s).
+//              i and l are NOT folded ("Kai" and "Kal" are different names). Non-ASCII look-alikes (Cyrillic/Greek) can
+//              never be claimed at all: only [A-Za-z0-9_.-] is accepted after NFKC.
 
 export const NAME_MIN = 3;
 export const NAME_MAX = 16;
@@ -18,13 +19,9 @@ export function foldKey(s) {
   return s
     .toLowerCase()
     .replace(/[_.-]/g, "")
-    .replace(/[il1|]/g, "l")
-    .replace(/[o0]/g, "o")
-    .replace(/rn/g, "m")
-    .replace(/vv/g, "w")
-    .replace(/[s5]/g, "s")
-    .replace(/[z2]/g, "z")
-    .replace(/[b8]/g, "b");
+    .replace(/0/g, "o")
+    .replace(/1/g, "l")
+    .replace(/5/g, "s");
 }
 
 const RESERVED_WORDS = [
@@ -37,8 +34,10 @@ const RESERVED_WORDS = [
 const BAD_WORDS = [
   "fuck", "shit", "cunt", "nigger", "nigga", "faggot", "bitch", "whore", "rapist", "nazi", "hitler", "kike", "retard",
 ];
-const RESERVED = new Set(RESERVED_WORDS.map(foldKey));
-const BAD = BAD_WORDS.map(foldKey);
+// Reserved/profanity checks are stricter than uniqueness: leetspeak 1/l also counts as i here ("Adm1n"), so impersonation is blocked.
+const strong = (s) => foldKey(s).replace(/l/g, "i");
+const RESERVED = new Set(RESERVED_WORDS.map(strong));
+const BAD = BAD_WORDS.map(strong);
 
 /**
  * Validate and normalize a proposed username.
@@ -65,8 +64,9 @@ export function normalizeUsername(raw, opts = {}) {
   const key = foldKey(display);
   if (key.length < NAME_MIN) return { ok: false, reason: "too-short" };
   if (!opts.test) {
-    if (RESERVED.has(key)) return { ok: false, reason: "reserved" };
-    if (BAD.some((w) => key.includes(w))) return { ok: false, reason: "profanity" };
+    const sk = strong(display);
+    if (RESERVED.has(sk)) return { ok: false, reason: "reserved" };
+    if (BAD.some((w) => sk.includes(w))) return { ok: false, reason: "profanity" };
   }
   return { ok: true, display, key };
 }
