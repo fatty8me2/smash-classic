@@ -20,7 +20,16 @@
 //
 // Storage: LinkBox Durable Object, one per code (keyed by sha256(code)), plus one per
 // client IP for redeem rate limiting. Auth reuses the UserHub secret check (/i/link_auth).
-// Env: LINK_TTL_SECONDS (default 600), LINK_REDEEM_LIMIT (default 20 per 10 min per IP).
+// Env: LINK_TTL_SECONDS (default 600), LINK_REDEEM_LIMIT (default 10 attempts per hour per IP),
+//      LINK_GLOBAL_LIMIT (default 300 failed redeems per hour across all IPs).
+//
+// Security (brute force). The 12-char permanent code is 31^12 = 2^59.4 combinations; the 8-char temporary code
+// is 31^8 = 2^39.6 but lives 10 minutes and is single use. Guessing is bounded three ways: (1) per IP, 10 redeem
+// attempts per hour; exceeding it locks that IP out for an hour, doubling on every further strike (cap 24 h,
+// strikes decay after 24 h of quiet); (2) globally, 300 failed redeems per hour across ALL IPs, after which every
+// redeem answers 429 until the window ends (stops botnets; legit users retry later); (3) the lookup is by
+// sha256(code) (a Durable Object per hash) and the stored hash is compared in constant time before any bundle is
+// returned. At 300 guesses/hour a 2^59 space takes ~10^14 years; 2^39.6 against a live 10-minute code is < 10^-8.
 
 import { DurableObject } from "cloudflare:workers";
 
@@ -31,7 +40,10 @@ const CODE_RE = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$|^[ABCDEFGHJKMNPQRSTUVWXY
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const B64_RE = /^[A-Za-z0-9+/]{1,4096}={0,2}$/;
 const MAX_BODY = 8192;
-const REDEEM_WINDOW_MS = 10 * 60 * 1000;
+// Brute-force defence for /link/redeem (see "Security" below).
+const REDEEM_WINDOW_MS = 60 * 60 * 1000;          // per-IP window: LINK_REDEEM_LIMIT (default 10) attempts per hour
+const LOCK_MAX_MS = 24 * 60 * 60 * 1000;          // lockout backoff cap
+const GLOBAL_WINDOW_MS = 60 * 60 * 1000;          // global window: LINK_GLOBAL_LIMIT (default 300) FAILED redeems per hour
 
 const now = () => Date.now();
 
@@ -84,7 +96,27 @@ function ttlMs(env) {
 
 function redeemLimit(env) {
   const n = Number(env.LINK_REDEEM_LIMIT);
-  return Number.isFinite(n) && n > 0 ? n : 20;
+  return Number.isFinite(n) && n > 0 ? n : 10;
+}
+
+function globalLimit(env) {
+  const n = Number(env.LINK_GLOBAL_LIMIT);
+  return Number.isFinite(n) && n > 0 ? n : 300;
+}
+
+// Constant-time string equality (length is public: always 64 hex chars here).
+export function timingSafeEqualStr(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+
+function rateLimited(retryAfterMs) {
+  const secs = Math.max(1, Math.ceil((retryAfterMs || 60000) / 1000));
+  return new Response(JSON.stringify({ error: "rate-limited", retryAfter: secs }), {
+    status: 429, headers: { "content-type": "application/json", "retry-after": String(secs) },
+  });
 }
 
 async function readBody(request) {
@@ -142,7 +174,7 @@ export async function linkFetch(request, env) {
     for (let i = 0; i < 3; i++) {
       const code = newCode();
       const boxKey = await sha256hex(code);
-      const r = await boxCall(env, boxKey, "reserve", { uid: body.uid, expires, username });
+      const r = await boxCall(env, boxKey, "reserve", { uid: body.uid, expires, username, hash: boxKey });
       if (r.ok) {
         // One open code per account: a fresh code revokes the previous unredeemed one.
         try {
@@ -177,7 +209,7 @@ export async function linkFetch(request, env) {
       return json({ ok: true });
     }
     const username = typeof af.username === "string" ? af.username : "";
-    const r = await boxCall(env, body.box, "keep", { uid: body.uid, salt: body.salt, iv: body.iv, ct: body.ct, username });
+    const r = await boxCall(env, body.box, "keep", { uid: body.uid, salt: body.salt, iv: body.iv, ct: body.ct, username, hash: body.box });
     if (!r.ok) return json({ error: "code-in-use" }, 409);
     if (af.keep && af.keep !== body.box) await boxCall(env, af.keep, "revoke", { uid: body.uid });
     await hubSet(body.box);
@@ -201,10 +233,15 @@ export async function linkFetch(request, env) {
   if (url.pathname === "/link/redeem") {
     const code = normalizeCode(body.code);
     if (!code) return json({ error: "invalid" }, 404);
-    const lim = await boxCall(env, `rl:${ip}`, "hit", { limit: redeemLimit(env), windowMs: REDEEM_WINDOW_MS });
-    if (!lim.ok) return json({ error: "rate-limited" }, 429);
-    const r = await boxCall(env, await sha256hex(code), "take", {});
+    const gl = await boxCall(env, "rl:global", "peek", { limit: globalLimit(env), windowMs: GLOBAL_WINDOW_MS });
+    if (!gl.ok) return rateLimited(gl.retryAfter);
+    const lim = await boxCall(env, `rl:${ip}`, "hit", { limit: redeemLimit(env), windowMs: REDEEM_WINDOW_MS, backoff: true });
+    if (!lim.ok) return rateLimited(lim.retryAfter);
+    const hash = await sha256hex(code);
+    const r = await boxCall(env, hash, "take", { hash });
     if (r.status === "ok") return json({ salt: r.salt, iv: r.iv, ct: r.ct, username: r.username || null });
+    // Failed guess: count it against the global budget too.
+    await boxCall(env, "rl:global", "hit", { limit: globalLimit(env), windowMs: GLOBAL_WINDOW_MS });
     if (r.status === "pending") return json({ error: "pending" }, 409);
     return json({ error: "invalid" }, 404);
   }
@@ -220,8 +257,11 @@ export class LinkBox extends DurableObject {
     this.sql = ctx.storage.sql;
     this.sql.exec("CREATE TABLE IF NOT EXISTS link (id INTEGER PRIMARY KEY CHECK (id = 1), uid TEXT NOT NULL, expires INTEGER NOT NULL, salt TEXT, iv TEXT, ct TEXT)");
     try { this.sql.exec("ALTER TABLE link ADD COLUMN username TEXT"); } catch { /* already added */ }
+    try { this.sql.exec("ALTER TABLE link ADD COLUMN hash TEXT"); } catch { /* already added */ }
     try { this.sql.exec("ALTER TABLE link ADD COLUMN keep INTEGER NOT NULL DEFAULT 0"); } catch { /* already added */ }
     this.sql.exec("CREATE TABLE IF NOT EXISTS rl (id INTEGER PRIMARY KEY CHECK (id = 1), start INTEGER NOT NULL, n INTEGER NOT NULL)");
+    try { this.sql.exec("ALTER TABLE rl ADD COLUMN strikes INTEGER NOT NULL DEFAULT 0"); } catch { /* already added */ }
+    try { this.sql.exec("ALTER TABLE rl ADD COLUMN locked_until INTEGER NOT NULL DEFAULT 0"); } catch { /* already added */ }
   }
 
   async fetch(request) {
@@ -229,14 +269,27 @@ export class LinkBox extends DurableObject {
     const route = new URL(request.url).pathname;
     const b = (await request.json().catch(() => ({}))) || {};
     const t = now();
-    if (route === "/hit") {
-      const row = this.sql.exec("SELECT start, n FROM rl WHERE id = 1").toArray()[0];
+    if (route === "/hit" || route === "/peek") {
+      const peek = route === "/peek";
+      let row = this.sql.exec("SELECT start, n, strikes, locked_until FROM rl WHERE id = 1").toArray()[0];
+      if (row && row.locked_until > t) return json({ ok: false, retryAfter: row.locked_until - t });
+      // Strikes decay after 24 h of quiet.
+      const strikes = row && t - Math.max(row.start, row.locked_until) < LOCK_MAX_MS ? row.strikes : 0;
       if (!row || t - row.start >= b.windowMs) {
-        this.sql.exec("INSERT OR REPLACE INTO rl (id, start, n) VALUES (1, ?, 1)", t);
+        if (peek) return json({ ok: true });
+        this.sql.exec("INSERT OR REPLACE INTO rl (id, start, n, strikes, locked_until) VALUES (1, ?, 1, ?, 0)", t, strikes);
         return json({ ok: true });
       }
-      if (row.n >= b.limit) return json({ ok: false });
-      this.sql.exec("UPDATE rl SET n = n + 1 WHERE id = 1");
+      if (row.n >= b.limit) {
+        if (peek) return json({ ok: false, retryAfter: row.start + b.windowMs - t });
+        if (b.backoff) {
+          const lock = Math.min(LOCK_MAX_MS, b.windowMs * Math.pow(2, strikes));
+          this.sql.exec("UPDATE rl SET strikes = ?, locked_until = ?, start = ?, n = 0 WHERE id = 1", strikes + 1, t + lock, t + lock);
+          return json({ ok: false, retryAfter: lock });
+        }
+        return json({ ok: false, retryAfter: row.start + b.windowMs - t });
+      }
+      if (!peek) this.sql.exec("UPDATE rl SET n = n + 1 WHERE id = 1");
       return json({ ok: true });
     }
 
@@ -249,12 +302,12 @@ export class LinkBox extends DurableObject {
 
     if (route === "/reserve") {
       if (live) return json({ ok: false, error: "exists" });
-      this.sql.exec("INSERT INTO link (id, uid, expires, username) VALUES (1, ?, ?, ?)", b.uid, b.expires, b.username || null);
+      this.sql.exec("INSERT INTO link (id, uid, expires, username, hash) VALUES (1, ?, ?, ?, ?)", b.uid, b.expires, b.username || null, b.hash || null);
       return json({ ok: true });
     }
     if (route === "/keep") {
       if (live && live.uid !== b.uid) return json({ ok: false, error: "exists" });
-      this.sql.exec("INSERT OR REPLACE INTO link (id, uid, expires, salt, iv, ct, username, keep) VALUES (1, ?, 0, ?, ?, ?, ?, 1)", b.uid, b.salt, b.iv, b.ct, b.username || null);
+      this.sql.exec("INSERT OR REPLACE INTO link (id, uid, expires, salt, iv, ct, username, hash, keep) VALUES (1, ?, 0, ?, ?, ?, ?, ?, 1)", b.uid, b.salt, b.iv, b.ct, b.username || null, b.hash || null);
       return json({ ok: true });
     }
     if (route === "/revoke") {
@@ -269,6 +322,7 @@ export class LinkBox extends DurableObject {
     }
     if (route === "/take") {
       if (!live) return json({ status: "invalid" });
+      if (live.hash && !timingSafeEqualStr(String(b.hash || ""), live.hash)) return json({ status: "invalid" });
       if (!live.ct) return json({ status: "pending" });
       if (!live.keep) this.sql.exec("DELETE FROM link WHERE id = 1");
       return json({ status: "ok", salt: live.salt, iv: live.iv, ct: live.ct, username: live.username || null });

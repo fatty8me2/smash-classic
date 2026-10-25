@@ -19,6 +19,9 @@ if (!out) { console.error("--out required"); process.exit(2); }
 process.chdir(join(dirname(fileURLToPath(import.meta.url)), ".."));   // test_v2_lib reads wrangler.jsonc from the cwd
 const vars = {};
 if (opt("account-cap")) vars.ACCOUNT_CAP = opt("account-cap");
+// QA only (the worker reads SAVES_RATE_META as a test override; unset in production): the scripted two-PC runs make more than the
+// 60/min per-account manifest calls a real player ever would.
+if (opt("rate-meta")) vars.SAVES_RATE_META = opt("rate-meta");
 if (opt("prot-cap")) vars.PROT_CAP = opt("prot-cap");
 const srv = await startServer({ port, vars });
 const accounts = [];

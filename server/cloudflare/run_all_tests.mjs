@@ -26,6 +26,7 @@ const SUITE = [
   { file: "test_invite.mjs", kind: "http" },
   { file: "test_limits.mjs", kind: "ws" },
   { file: "test_link.mjs", kind: "http", vars: { LINK_TTL_SECONDS: "3", LINK_REDEEM_LIMIT: "5" } },
+  { file: "test_link_bruteforce.mjs", kind: "http", vars: { LINK_REDEEM_LIMIT: "5", LINK_GLOBAL_LIMIT: "12" } },
   { file: "test_usernames.mjs", kind: "http" },
   { file: "test_presence.mjs", kind: "http" },
   { file: "test_relay.mjs", kind: "ws" },
