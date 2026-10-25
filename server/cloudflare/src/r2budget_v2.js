@@ -7,8 +7,6 @@
 //   games(uid,gkey,played_at,device,pin,lease_*,rev)
 //   vers(uid,gkey,path,ver,sha,size,stored,enc,mtime,dev,ts,class,rkey,state,prot)   state cur|prev|evicted
 //   tickets(id,uid,exp,body)                       plan -> blob PUTs -> commit
-//   recov(uid,hash,salt,iv,ct,ts)                  opaque recovery-code slot (see docs)
-//   rl_ip(k,start,n)                               rate limit for the unauthenticated /recover route
 // accts gains: vused vprot rev day a_ops b_ops v2 active. files gains: dead (blob/object deleted in R2 next).
 // Blobs are content addressed per account: saves/<uid>/o/<plain sha>[.z]. They are rows of `files` too, so the
 // weekly reconcile, st.total and the global storage guard keep working unchanged.
@@ -46,8 +44,6 @@ export function initV2(d) {
     class TEXT NOT NULL, rkey TEXT, state TEXT NOT NULL, prot INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(uid,gkey,path,ver))`);
   s.exec(`CREATE INDEX IF NOT EXISTS vers_rkey ON vers(uid,rkey)`);
   s.exec(`CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, uid TEXT NOT NULL, exp INTEGER NOT NULL, body TEXT NOT NULL)`);
-  s.exec(`CREATE TABLE IF NOT EXISTS recov (uid TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, salt TEXT, iv TEXT, ct TEXT, ts INTEGER NOT NULL DEFAULT 0)`);
-  s.exec(`CREATE TABLE IF NOT EXISTS rl_ip (k TEXT PRIMARY KEY, start INTEGER NOT NULL, n INTEGER NOT NULL)`);
   const cur = s.exec(`SELECT v FROM meta WHERE k='schema'`).toArray()[0];
   if (!cur || Number(cur.v) < SCHEMA) {      // migration tag: one-time column adds on the pre-v2 tables
     const add = (t, def) => { try { s.exec(`ALTER TABLE ${t} ADD COLUMN ${def}`); } catch { /* already there */ } };
@@ -214,7 +210,6 @@ function accountBlock(d, uid, a, c) {
     largeCap: largeCap(p.state, a.vprot, c.accountCap, p.frac),
     devices: d.q(`SELECT COUNT(*) n FROM devices WHERE uid=?`, uid)[0].n,
     pool: p.state, paused: d.over() || d.st.a >= cs.a || d.st.b >= cs.b,
-    recovery: d.q(`SELECT 1 FROM recov WHERE uid=?`, uid).length > 0,
   };
 }
 
@@ -574,7 +569,7 @@ export function idleSweep(d, c, nowS, dels, force = false) {
 function removeAll(d, uid, nowS, dels) {
   for (const v of d.q(`SELECT DISTINCT rkey FROM vers WHERE uid=? AND rkey IS NOT NULL`, uid)) markDead(d, v.rkey, nowS, dels);
   d.q(`DELETE FROM vers WHERE uid=?`, uid); d.q(`DELETE FROM games WHERE uid=?`, uid); d.q(`DELETE FROM devices WHERE uid=?`, uid);
-  d.q(`DELETE FROM tickets WHERE uid=?`, uid); d.q(`DELETE FROM recov WHERE uid=?`, uid);
+  d.q(`DELETE FROM tickets WHERE uid=?`, uid);
   d.q(`UPDATE accts SET vused=0, vprot=0, rev=rev+1 WHERE uid=?`, uid);
 }
 
@@ -678,43 +673,6 @@ function opLease(d, q, now) {
   return J({ r: "ok", lease: true, until: nowS + LEASE_SECS, tookOver: !!(row && row.lease_dev && row.lease_dev !== q.dev && row.lease_until > nowS) });
 }
 
-// ---- recovery code (one "add/recover this account" mechanism: a long-lived variant of the link code) ----
-// The client derives everything from the code. lookup hash = sha256hex("rh-recover:" + normalized code) is all the
-// server keeps to find the slot; the identity bundle {salt, iv, ct} is the same opaque PBKDF2/AES-GCM ciphertext the
-// link flow uses, so the server never sees the code, the key or the identity. Replacing/removing it revokes the code.
-function opRecoverySet(d, q, now) {
-  const e = enter(d, q, now, { write: false, cost: 2 }); if (e.res) return e.res;
-  const { uid, nowS } = e;
-  const b = q.body || {};
-  if (b.remove === true) { d.q(`DELETE FROM recov WHERE uid=?`, uid); return J({ r: "ok", removed: true }); }
-  if (typeof b.hash !== "string" || !HEX64.test(b.hash)) return E(400, "bad-sha");
-  for (const k of ["salt", "iv", "ct"]) if (typeof b[k] !== "string" || !B64_RE.test(b[k])) return E(400, "bad-body");
-  const clash = d.q(`SELECT uid FROM recov WHERE hash=?`, b.hash)[0];
-  if (clash && clash.uid !== uid) return E(409, "code-in-use");
-  d.q(`INSERT INTO recov(uid,hash,salt,iv,ct,ts) VALUES(?,?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET hash=excluded.hash, salt=excluded.salt, iv=excluded.iv, ct=excluded.ct, ts=excluded.ts`,
-    uid, b.hash, b.salt, b.iv, b.ct, nowS);
-  return J({ r: "ok" });
-}
-// Unauthenticated (the new PC has no identity yet): throttled per client IP and globally.
-function opRecover(d, q, now) {
-  d.roll();
-  if (d.env.SAVES_V2 === "0") return E(503, "cloud-saves-disabled");
-  const nowS = sec(now);
-  const lim = (k, limit, win) => {
-    const r = d.q(`SELECT start,n FROM rl_ip WHERE k=?`, k)[0];
-    if (!r || nowS - r.start >= win) { d.q(`INSERT OR REPLACE INTO rl_ip(k,start,n) VALUES(?,?,1)`, k, nowS); return true; }
-    if (r.n >= limit) return false;
-    d.q(`UPDATE rl_ip SET n=n+1 WHERE k=?`, k); return true;
-  };
-  if (!lim("ip:" + (q.ip || "local"), num(d.env.RECOVER_PER_HOUR, 10), 3600) || !lim("all", num(d.env.RECOVER_GLOBAL_PER_HOUR, 200), 3600)) {
-    return E(429, "rate-limited", { retryAfter: 3600 });
-  }
-  if (typeof q.hash !== "string" || !HEX64.test(q.hash)) return E(404, "bad-recovery-code");
-  const r = d.q(`SELECT salt,iv,ct FROM recov WHERE hash=?`, q.hash)[0];
-  if (!r) return E(404, "bad-recovery-code");
-  return J({ r: "ok", salt: r.salt, iv: r.iv, ct: r.ct });
-}
-
 // ---- v1 write-through for migrated accounts ----
 export function v1Written(d, uid, rkey, size, sha, mtime, now) {
   if (isBlobKey(rkey)) return;
@@ -779,8 +737,6 @@ function v2Switch(d, q, now) {
     case "v2_restore": return opRestore(d, q, now);
     case "v2_game": return opGame(d, q, now);
     case "v2_lease": return opLease(d, q, now);
-    case "v2_recovery": return opRecoverySet(d, q, now);
-    case "v2_recover": return opRecover(d, q, now);
     case "v2_del_done": return opDelDone(d, q, now);
     // test hooks (BUDGET_TEST=1 only; the Worker never forwards them otherwise)
     case "test_v2_active": d.q(`UPDATE accts SET active=? WHERE uid=?`, Number(q.active) || 0, q.uid); return J({ r: "ok" });

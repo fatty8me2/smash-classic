@@ -26,6 +26,7 @@ const SUITE = [
   { file: "test_invite.mjs", kind: "http" },
   { file: "test_limits.mjs", kind: "ws" },
   { file: "test_link.mjs", kind: "http", vars: { LINK_TTL_SECONDS: "3", LINK_REDEEM_LIMIT: "5" } },
+  { file: "test_usernames.mjs", kind: "http" },
   { file: "test_presence.mjs", kind: "http" },
   { file: "test_relay.mjs", kind: "ws" },
   { file: "test_retire.mjs", kind: "ws", vars: { TEST_RETIRE_FAIL_AFTER: "1", ADMIN_UID: ADMIN } },
@@ -34,7 +35,8 @@ const SUITE = [
 ];
 
 const filter = process.argv[2] || "";
-let port = 10100;
+const PB = Number(process.env.SUITE_PORT_BASE) || 0;   // set to move every port (e.g. 10300); default keeps the historic ports
+let port = PB ? PB + 42 : 10100;
 const results = [];
 function run(file, args, env) {
   return new Promise((resolve) => {
@@ -52,11 +54,12 @@ for (const t of SUITE) {
   const args = [...(t.args || [])];
   try {
     if (t.kind === "ws" || t.kind === "http") {
-      const p = port++;
+      const p = PB ? PB + 42 + (port++ - PB - 42) % 8 : port++;
       srv = await startServer({ port: p, vars: t.vars || {} });
       args.push(t.kind === "ws" ? `ws://127.0.0.1:${p}` : `http://127.0.0.1:${p}`);
     }
-    const env = { ...(t.env || {}), WRANGLER_REGISTRY_PATH: "C:\\rhq\\regsuite", TEMP: "C:\\rhq\\t", TMP: "C:\\rhq\\t" };
+    const shifted = {}; for (const [k, v] of Object.entries(t.env || {})) shifted[k] = PB ? String(PB + ((Number(v) % 100) % 50)) : v;
+    const env = { ...shifted, WRANGLER_REGISTRY_PATH: "C:\\rhq\\regsuite", TEMP: "C:\\rhq\\t", TMP: "C:\\rhq\\t" };
     const r = await run(t.file, args, env);
     const failed = (r.code !== 0 && !/ALL PASSED/.test(r.out)) || /\bFAIL\b|\bFAILED\b|TIMEOUT|ERROR:/.test(r.out.replace(/ALL PASSED/g, ""));
     results.push({ label, ok: !failed });

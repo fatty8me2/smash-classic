@@ -1,9 +1,0 @@
-{
-  "status": 200,
-  "body": {
-    "ok": true,
-    "salt": "c2FsdHNhbHRzYWx0",
-    "iv": "aXZpdml2aXZp",
-    "ct": "Zml4dHVyZS1jaXBoZXJ0ZXh0"
-  }
-}

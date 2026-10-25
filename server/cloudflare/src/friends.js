@@ -699,11 +699,11 @@ export class UserHub extends DurableObject {
         if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
         if (b.count && !this.hit(`link:${from}`, 5, 60 * 60 * 1000)) return { r: "rate" };
         // username: shown on the new PC ("Linking as NAME"); prev: the still-open code of this account, revoked when a new one is made.
-        return { r: "ok", username: this.kvGet("username"), prev: b.count ? this.kvGet("last_link") : undefined };
+        return { r: "ok", username: this.kvGet("username"), prev: b.count ? this.kvGet("last_link") : undefined, keep: this.kvGet("last_keep") || undefined };
       }
       case "link_set": {
         if (b.secret && p.secret_hash !== (await sha256hex(String(b.secret)))) return { r: "bad-secret" };
-        this.kvSet("last_link", String(b.box || "").slice(0, 80));
+        this.kvSet(b.kind === "keep" ? "last_keep" : "last_link", String(b.box || "").slice(0, 80));
         return { r: "ok" };
       }
       case "uname_revoked": {

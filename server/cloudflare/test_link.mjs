@@ -117,5 +117,50 @@ for (let i = 0; i < 7; i++) {
 check("redeem rate-limited per IP", redeemRl >= 1, `429s=${redeemRl}`);
 }
 
+// ---- persistent account code (/link/keep) ----------------------------------
+{
+  const { createHash, randomBytes } = await import("node:crypto");
+  const hex = (s) => createHash("sha256").update(s).digest("hex");
+  const mk = () => rnd(12, "ABCDEFGHJKMNPQRSTUVWXYZ23456789");
+  const fmt = (c) => `${c.slice(0, 4)}-${c.slice(4, 8)}-${c.slice(8)}`;
+  const K = await newAccount();
+  const K2 = await newAccount();
+  const auth = (a) => ({ uid: a.uid, secret: a.secret });
+  const c1 = mk();
+  const b1 = { ...bundle(), ct: randomBytes(60).toString("base64") };
+  check("keep rejects wrong secret", (await post("/link/keep", { uid: K.uid, secret: "x".repeat(20), box: hex(c1), ...b1 })).status === 403);
+  check("keep rejects bad box hash", (await post("/link/keep", { ...auth(K), box: "nope", ...b1 })).status === 400);
+  check("keep rejects bad ciphertext", (await post("/link/keep", { ...auth(K), box: hex(c1), ...b1, ct: "!!" })).status === 400);
+  const k1 = await post("/link/keep", { ...auth(K), box: hex(c1), ...b1 });
+  check("keep stores the persistent code", k1.status === 200 && k1.data?.ok === true, `status=${k1.status}`);
+  const rd1 = await post("/link/redeem", { code: fmt(c1).toLowerCase() });
+  check("redeem 12-char code returns bundle + username", rd1.status === 200 && rd1.data?.ct === b1.ct && rd1.data?.salt === b1.salt && rd1.data?.iv === b1.iv && "username" in rd1.data, JSON.stringify(rd1.data).slice(0, 80));
+  check("redeem response has no uid", !JSON.stringify(rd1.data).includes(K.uid));
+  const rd2 = await post("/link/redeem", { code: c1 });
+  check("persistent code can be redeemed again", rd2.status === 200 && rd2.data?.ct === b1.ct);
+  check("another account cannot claim the same code", (await post("/link/keep", { ...auth(K2), box: hex(c1), ...b1 })).status === 409);
+  const c2 = mk();
+  const b2 = { ...bundle(), ct: "QUJDRA==" };
+  check("keep replaces the previous code", (await post("/link/keep", { ...auth(K), box: hex(c2), ...b2 })).status === 200);
+  check("old persistent code is revoked", (await post("/link/redeem", { code: c1 })).status === 404);
+  check("new persistent code works", (await post("/link/redeem", { code: c2 })).data?.ct === "QUJDRA==");
+  check("wrong 12-char code -> 404 invalid", (await post("/link/redeem", { code: mk() })).data?.error === "invalid");
+  const tmp = await post("/link/create", auth(K));
+  check("creating a temporary code leaves the persistent one alone", tmp.status === 200 && (await post("/link/redeem", { code: c2 })).status === 200);
+  if (LOCAL) {
+    await new Promise((r) => setTimeout(r, 3500));   // LINK_TTL_SECONDS=3
+    check("persistent code does not expire", (await post("/link/redeem", { code: c2 })).status === 200);
+  }
+  check("remove revokes the persistent code", (await post("/link/keep", { ...auth(K), remove: true })).status === 200 && (await post("/link/redeem", { code: c2 })).status === 404);
+  check("remove without secret is refused", (await post("/link/keep", { uid: K.uid, secret: "y".repeat(20), remove: true })).status === 403);
+  // per-IP redeem limit applies to persistent codes too
+  if (LOCAL) {
+    const ipH = ip();
+    let n429 = 0;
+    for (let i = 0; i < 7; i++) if ((await post("/link/redeem", { code: mk() }, { "cf-connecting-ip": ipH })).status === 429) n429++;
+    check("redeem of 12-char codes is rate limited per IP", n429 >= 1, `429s=${n429}`);
+  }
+}
+
 console.log(failures ? `${failures} FAILED` : "ALL PASSED");
 process.exit(failures ? 1 : 0);

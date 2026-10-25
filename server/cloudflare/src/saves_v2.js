@@ -24,8 +24,6 @@ const ROUTES = {
   "POST /saves/v2/lease": { cls: "meta", op: "v2_lease", body: 8192, action: "take" },
   "POST /saves/v2/lease/beat": { cls: "meta", op: "v2_lease", body: 8192, action: "beat" },
   "POST /saves/v2/lease/release": { cls: "meta", op: "v2_lease", body: 8192, action: "release" },
-  "POST /saves/v2/recovery": { cls: "pc", op: "v2_recovery", body: 8192 },
-  "POST /saves/v2/recover": { cls: null, op: "v2_recover", body: 8192, public: true },
 };
 
 const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");

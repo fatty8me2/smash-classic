@@ -8,6 +8,15 @@
 //   /link/put     {uid, secret, code, salt, iv, ct}  -> {ok}            (old PC uploads the bundle)
 //   /link/redeem  {code}                       -> {salt, iv, ct}         (new PC; single use)
 //                                               or {error:"pending"|"invalid"}
+//   /link/keep    {uid, secret, box, salt, iv, ct}  -> {ok}               (PERSISTENT account code)
+//   /link/keep    {uid, secret, remove:true}   -> {ok}                    (revoke the persistent code)
+//
+// Two code kinds share one mechanism. 8 chars (XXXX-XXXX): temporary, single use, 10 min.
+// 12 chars (XXXX-XXXX-XXXX): persistent "add/recover this account" code. The CLIENT generates it and
+// sends only box = sha256hex(normalized 12-char code) plus the opaque encrypted bundle; the server never
+// sees the code. Redeeming a persistent code returns {salt,iv,ct,username} and does NOT consume it. One
+// persistent code per account: a new /link/keep (or remove) revokes the previous one. A hash already used
+// by another account -> 409 code-in-use. Auth and the per-uid rate limit (5/h) are shared with /link/create.
 //
 // Storage: LinkBox Durable Object, one per code (keyed by sha256(code)), plus one per
 // client IP for redeem rate limiting. Auth reuses the UserHub secret check (/i/link_auth).
@@ -18,7 +27,8 @@ import { DurableObject } from "cloudflare:workers";
 const UID_RE = /^[a-z2-7]{26}$/;
 // 31 unambiguous characters (no I, L, O, 0, 1). Rejection sampling keeps it uniform.
 const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-const CODE_RE = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/;
+const CODE_RE = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$|^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{12}$/;
+const HEX64_RE = /^[0-9a-f]{64}$/;
 const B64_RE = /^[A-Za-z0-9+/]{1,4096}={0,2}$/;
 const MAX_BODY = 8192;
 const REDEEM_WINDOW_MS = 10 * 60 * 1000;
@@ -47,7 +57,7 @@ function newCode() {
   return out.join("");
 }
 
-// Accepts "ABCD-EFGH", "abcd efgh", "ABCDEFGH" and returns the canonical 8 chars or null.
+// Accepts "ABCD-EFGH", "abcd efgh", "ABCDEFGH" (or the 12-char form) and returns the canonical code or null.
 function normalizeCode(raw) {
   if (typeof raw !== "string") return null;
   const s = raw.replace(/[\s-]/g, "").toUpperCase();
@@ -148,6 +158,32 @@ export async function linkFetch(request, env) {
     return json({ error: "busy" }, 503);
   }
 
+  if (url.pathname === "/link/keep") {
+    const removing = body.remove === true;
+    if (!removing && (typeof body.box !== "string" || !HEX64_RE.test(body.box) || !B64_RE.test(body.salt || "") || !B64_RE.test(body.iv || "") || !B64_RE.test(body.ct || ""))) {
+      return json({ error: "bad-request" }, 400);
+    }
+    const af = await authFull(env, body.uid, body.secret, !removing);
+    const a = af.r || "none";
+    if (a === "rate") return json({ error: "rate-limited" }, 429);
+    if (a !== "ok") return json({ error: "auth" }, 403);
+    const hubSet = (box) => env.USER_HUBS.get(env.USER_HUBS.idFromName(body.uid)).fetch("https://userhub/i/link_set", {
+      method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+      body: JSON.stringify({ uid: body.uid, secret: body.secret, kind: "keep", box }),
+    });
+    if (removing) {
+      if (af.keep) await boxCall(env, af.keep, "revoke", { uid: body.uid });
+      await hubSet("");
+      return json({ ok: true });
+    }
+    const username = typeof af.username === "string" ? af.username : "";
+    const r = await boxCall(env, body.box, "keep", { uid: body.uid, salt: body.salt, iv: body.iv, ct: body.ct, username });
+    if (!r.ok) return json({ error: "code-in-use" }, 409);
+    if (af.keep && af.keep !== body.box) await boxCall(env, af.keep, "revoke", { uid: body.uid });
+    await hubSet(body.box);
+    return json({ ok: true });
+  }
+
   if (url.pathname === "/link/put") {
     const a = await auth(env, body.uid, body.secret, false);
     if (a !== "ok") return json({ error: "auth" }, 403);
@@ -177,13 +213,14 @@ export async function linkFetch(request, env) {
 }
 
 // One row per link code (state: reserved -> bundle stored -> taken/expired), or one row
-// per IP for rate limiting. Single-use: the bundle is deleted on the first successful take.
+// per IP for rate limiting. Temporary rows are single-use (deleted on the first take); keep rows persist until revoked.
 export class LinkBox extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec("CREATE TABLE IF NOT EXISTS link (id INTEGER PRIMARY KEY CHECK (id = 1), uid TEXT NOT NULL, expires INTEGER NOT NULL, salt TEXT, iv TEXT, ct TEXT)");
     try { this.sql.exec("ALTER TABLE link ADD COLUMN username TEXT"); } catch { /* already added */ }
+    try { this.sql.exec("ALTER TABLE link ADD COLUMN keep INTEGER NOT NULL DEFAULT 0"); } catch { /* already added */ }
     this.sql.exec("CREATE TABLE IF NOT EXISTS rl (id INTEGER PRIMARY KEY CHECK (id = 1), start INTEGER NOT NULL, n INTEGER NOT NULL)");
   }
 
@@ -204,15 +241,20 @@ export class LinkBox extends DurableObject {
     }
 
     const row = this.sql.exec("SELECT * FROM link WHERE id = 1").toArray()[0] || null;
-    if (row && row.expires <= t) {
+    if (row && !row.keep && row.expires <= t) {
       this.sql.exec("DELETE FROM link WHERE id = 1");
       if (route !== "/reserve") return json({ ok: false, error: "invalid", status: "invalid" });
     }
-    const live = row && row.expires > t ? row : null;
+    const live = row && (row.keep || row.expires > t) ? row : null;
 
     if (route === "/reserve") {
       if (live) return json({ ok: false, error: "exists" });
       this.sql.exec("INSERT INTO link (id, uid, expires, username) VALUES (1, ?, ?, ?)", b.uid, b.expires, b.username || null);
+      return json({ ok: true });
+    }
+    if (route === "/keep") {
+      if (live && live.uid !== b.uid) return json({ ok: false, error: "exists" });
+      this.sql.exec("INSERT OR REPLACE INTO link (id, uid, expires, salt, iv, ct, username, keep) VALUES (1, ?, 0, ?, ?, ?, ?, 1)", b.uid, b.salt, b.iv, b.ct, b.username || null);
       return json({ ok: true });
     }
     if (route === "/revoke") {
@@ -228,7 +270,7 @@ export class LinkBox extends DurableObject {
     if (route === "/take") {
       if (!live) return json({ status: "invalid" });
       if (!live.ct) return json({ status: "pending" });
-      this.sql.exec("DELETE FROM link WHERE id = 1");
+      if (!live.keep) this.sql.exec("DELETE FROM link WHERE id = 1");
       return json({ status: "ok", salt: live.salt, iv: live.iv, ct: live.ct, username: live.username || null });
     }
     return new Response("not found", { status: 404 });

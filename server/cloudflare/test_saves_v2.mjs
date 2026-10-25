@@ -35,7 +35,7 @@ const classA = async (api) => (await api.hook("status")).a;
 const files = (m, g) => (m.games[g] ? m.games[g].files : {});
 
 // =====================================================================================================================
-// A: endpoints, auth, dedup, retention, restore, CAS, tickets, leases, devices, recovery, isolation, rate limits
+// A: endpoints, auth, dedup, retention, restore, CAS, tickets, leases, devices, isolation, rate limits
 // =====================================================================================================================
 phases.push(["A", async () => withServer(BASE_PORT, { SAVES_RATE_PC: "1000", SAVES_RATE_PUT: "1000", SAVES_RATE_GET: "1000", SAVES_RATE_META: "1000" }, async (srv, api) => {
   console.log("--- phase A: endpoints ---");
@@ -262,27 +262,6 @@ phases.push(["A", async () => withServer(BASE_PORT, { SAVES_RATE_PC: "1000", SAV
   const pcSame = await api.plan(A, G, [{ path: "battery/ssb64.sra", sha: sha(ssb), size: 2000, stored: 2000, enc: "none", mtime: 100, base: 1 }], { dev: d2 });
   check(pcSame.data.files[0].action === "same", "second PC compares against the same cloud versions");
 
-  // ---- recovery slot (opaque identity bundle behind a long-lived code) ----
-  const code = "ABCD-EFGH-JKMN-PQRS-TUVW-XYZ2-3456-789A";
-  const hash = sha("rh-recover:" + code.replace(/-/g, ""));
-  const bundle = { hash, salt: "c2FsdHNhbHRzYWx0", iv: "aXZpdml2aXZp", ct: randomBytes(120).toString("base64") };
-  check((await api.status(A)).data.account.recovery === false, "no recovery slot at first");
-  check((await api.call(A, "POST", "/saves/v2/recovery", { json: { ...bundle, hash: "short" } })).status === 400, "recovery: bad hash -> 400");
-  check((await api.call(A, "POST", "/saves/v2/recovery", { json: { ...bundle, ct: "!!" } })).status === 400, "recovery: bad ciphertext -> 400");
-  check((await api.call(A, "POST", "/saves/v2/recovery", { json: bundle })).status === 200, "recovery slot stored");
-  check((await api.status(A)).data.account.recovery === true, "status says a recovery slot exists");
-  const red = await api.call(null, "POST", "/saves/v2/recover", { raw: Buffer.from(JSON.stringify({ hash })) });
-  check(red.status === 200 && red.data.ct === bundle.ct && red.data.salt === bundle.salt && red.data.iv === bundle.iv && !JSON.stringify(red.data).includes(A.uid), "unauthenticated redeem returns only the opaque bundle (no uid)");
-  const redBad = await api.call(null, "POST", "/saves/v2/recover", { raw: Buffer.from(JSON.stringify({ hash: sha("nope") })) });
-  check(redBad.status === 404 && redBad.data.error === "bad-recovery-code", "unknown code -> 404 bad-recovery-code");
-  check((await api.call(B, "POST", "/saves/v2/recovery", { json: { ...bundle, ct: "QUJD" } })).status === 409, "the same code cannot be claimed by another account");
-  const nb = { ...bundle, hash: sha("rh-recover:NEWCODE"), ct: "QUJDRA==" };
-  await api.call(A, "POST", "/saves/v2/recovery", { json: nb });
-  check((await api.call(null, "POST", "/saves/v2/recover", { raw: Buffer.from(JSON.stringify({ hash })) })).status === 404, "replacing the slot revokes the old code");
-  check((await api.call(null, "POST", "/saves/v2/recover", { raw: Buffer.from(JSON.stringify({ hash: nb.hash })) })).data.ct === "QUJDRA==", "the new code works");
-  await api.call(A, "POST", "/saves/v2/recovery", { json: { remove: true } });
-  check((await api.call(null, "POST", "/saves/v2/recover", { raw: Buffer.from(JSON.stringify({ hash: nb.hash })) })).status === 404, "removing the slot revokes the code");
-
   // ---- orphaned blobs (lost CAS races, abandoned tickets) are collected after an hour ----
   await api.hook("v2/expire_ticket", { uid: A.uid });
   await api.hook("v2/age_blobs", { uid: A.uid });
@@ -462,7 +441,7 @@ phases.push(["C", async () => withServer(BASE_PORT + 2, { BUDGET_STORAGE_MAX: "1
 // D: budgets - fail closed, request share, Class A / storage guards, daily per-account limits, kill switch
 // =====================================================================================================================
 phases.push(["D", async () => {
-  await withServer(BASE_PORT + 3, { BUDGET_A_MAX: "3", BUDGET_STORAGE_MAX: "100000", DAY_PUT_MAX: "100", RECOVER_PER_HOUR: "3" }, async (srv, api) => {
+  await withServer(BASE_PORT + 3, { BUDGET_A_MAX: "3", BUDGET_STORAGE_MAX: "100000", DAY_PUT_MAX: "100" }, async (srv, api) => {
     console.log("--- phase D1: R2 budget guards ---");
     const A = await account(srv.BASE);
     const fl = (n, base = 0) => Array.from({ length: n }, () => rnd(100)).map((b, i) => ({ path: `battery/f${base + i}.sav`, data: b }));
@@ -478,10 +457,6 @@ phases.push(["D", async () => {
     const B2 = await account(srv.BASE);
     const pb = await api.plan(B2, "n64/d2", [{ path: "states/s.state", sha: sha(rnd(3)), size: 200000, stored: 200000, enc: "none", mtime: 1, base: 0 }]);
     check(pb.status === 429 || pb.status === 507, "global storage / budget guards stop a huge upload");
-    // recovery redeem throttle
-    const hh = async (h) => (await api.call(null, "POST", "/saves/v2/recover", { raw: Buffer.from(JSON.stringify({ hash: h })) })).status;
-    const sts = [await hh(sha("a")), await hh(sha("b")), await hh(sha("c")), await hh(sha("d"))];
-    check(sts.slice(0, 3).every((x) => x === 404) && sts[3] === 429, "recover is throttled per IP (3/hour here) -> 429");
   });
   await withServer(BASE_PORT + 11, {}, async (srv, api) => {
     console.log("--- phase D0: per-account per-minute rate limits (default limits) ---");
@@ -551,7 +526,6 @@ phases.push(["D", async () => {
     const A = await account(srv.BASE);
     const r = await api.status(A);
     check(r.status === 503 && r.data.error === "cloud-saves-disabled", "SAVES_V2=0 -> 503 cloud-saves-disabled");
-    check((await api.call(null, "POST", "/saves/v2/recover", { raw: Buffer.from("{}") })).status === 503, "also for the unauthenticated recover route");
     const put = await v1put(srv.BASE, A, "x/y/battery/a.sav", Buffer.from("hello"));
     check(put.status === 200, "v1 keeps working with SAVES_V2=0");
   });

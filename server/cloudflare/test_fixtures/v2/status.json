@@ -11,8 +11,7 @@
       "largeCap": 52428800,
       "devices": 0,
       "pool": "ok",
-      "paused": false,
-      "recovery": false
+      "paused": false
     },
     "limits": {
       "maxBlob": 16777216,

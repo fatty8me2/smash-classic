@@ -12,8 +12,7 @@
       "largeCap": 52396019,
       "devices": 2,
       "pool": "ok",
-      "paused": false,
-      "recovery": false
+      "paused": false
     },
     "games": {}
   }

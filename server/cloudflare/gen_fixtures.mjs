@@ -57,9 +57,6 @@ async function main1() {
     save("err_bad_plan", await api.plan(A, G, [{ path: "../x", sha: sha("x"), size: 1, stored: 1, enc: "none", mtime: 1, base: 0 }]));
     save("err_ticket_expired", await api.commit(A, "0".repeat(40), d1));
     save("device_limit_hint", await api.device(A, "BAD", "x"));
-    save("recovery_set", await api.call(A, "POST", "/saves/v2/recovery", { json: { hash: sha("rh-recover:FIXTURE"), salt: "c2FsdHNhbHRzYWx0", iv: "aXZpdml2aXZp", ct: "Zml4dHVyZS1jaXBoZXJ0ZXh0" } }));
-    save("recover_ok", await api.call(null, "POST", "/saves/v2/recover", { raw: Buffer.from(JSON.stringify({ hash: sha("rh-recover:FIXTURE") })) }));
-    save("recover_bad", await api.call(null, "POST", "/saves/v2/recover", { raw: Buffer.from(JSON.stringify({ hash: sha("rh-recover:NOPE") })) }));
   } finally { srv.stop(); await sleep(500); }
 }
 
