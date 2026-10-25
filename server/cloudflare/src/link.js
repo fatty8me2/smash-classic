@@ -102,6 +102,18 @@ async function auth(env, uid, secret, count) {
   return r.r || "none";
 }
 
+// Same check as auth(), but returns the whole reply ({r, username, prev}).
+async function authFull(env, uid, secret, count) {
+  if (!UID_RE.test(uid) || typeof secret !== "string" || secret.length < 16 || secret.length > 128) return { r: "none" };
+  const stub = env.USER_HUBS.get(env.USER_HUBS.idFromName(uid));
+  const res = await stub.fetch("https://userhub/i/link_auth", {
+    method: "POST",
+    headers: { "x-rh-internal": "1", "content-type": "application/json" },
+    body: JSON.stringify({ uid, secret, count: !!count }),
+  });
+  return res.json();
+}
+
 export async function linkFetch(request, env) {
   if (request.method !== "POST") return json({ error: "method" }, 405);
   const url = new URL(request.url);
@@ -111,14 +123,27 @@ export async function linkFetch(request, env) {
   const ip = request.headers.get("cf-connecting-ip") || "local";
 
   if (url.pathname === "/link/create") {
-    const a = await auth(env, body.uid, body.secret, true);
+    const af = await authFull(env, body.uid, body.secret, true);
+    const a = af.r || "none";
     if (a === "rate") return json({ error: "rate-limited" }, 429);
     if (a !== "ok") return json({ error: "auth" }, 403);
+    const username = typeof af.username === "string" ? af.username : "";
     const expires = now() + ttlMs(env);
     for (let i = 0; i < 3; i++) {
       const code = newCode();
-      const r = await boxCall(env, await sha256hex(code), "reserve", { uid: body.uid, expires });
-      if (r.ok) return json({ code: `${code.slice(0, 4)}-${code.slice(4)}`, expires_at: expires });
+      const boxKey = await sha256hex(code);
+      const r = await boxCall(env, boxKey, "reserve", { uid: body.uid, expires, username });
+      if (r.ok) {
+        // One open code per account: a fresh code revokes the previous unredeemed one.
+        try {
+          if (af.prev && af.prev !== boxKey) await boxCall(env, af.prev, "revoke", { uid: body.uid });
+          await env.USER_HUBS.get(env.USER_HUBS.idFromName(body.uid)).fetch("https://userhub/i/link_set", {
+            method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+            body: JSON.stringify({ uid: body.uid, secret: body.secret, box: boxKey }),
+          });
+        } catch { /* best effort */ }
+      }
+      if (r.ok) return json({ code: `${code.slice(0, 4)}-${code.slice(4)}`, expires_at: expires, username: username || null });
     }
     return json({ error: "busy" }, 503);
   }
@@ -143,7 +168,7 @@ export async function linkFetch(request, env) {
     const lim = await boxCall(env, `rl:${ip}`, "hit", { limit: redeemLimit(env), windowMs: REDEEM_WINDOW_MS });
     if (!lim.ok) return json({ error: "rate-limited" }, 429);
     const r = await boxCall(env, await sha256hex(code), "take", {});
-    if (r.status === "ok") return json({ salt: r.salt, iv: r.iv, ct: r.ct });
+    if (r.status === "ok") return json({ salt: r.salt, iv: r.iv, ct: r.ct, username: r.username || null });
     if (r.status === "pending") return json({ error: "pending" }, 409);
     return json({ error: "invalid" }, 404);
   }
@@ -158,6 +183,7 @@ export class LinkBox extends DurableObject {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec("CREATE TABLE IF NOT EXISTS link (id INTEGER PRIMARY KEY CHECK (id = 1), uid TEXT NOT NULL, expires INTEGER NOT NULL, salt TEXT, iv TEXT, ct TEXT)");
+    try { this.sql.exec("ALTER TABLE link ADD COLUMN username TEXT"); } catch { /* already added */ }
     this.sql.exec("CREATE TABLE IF NOT EXISTS rl (id INTEGER PRIMARY KEY CHECK (id = 1), start INTEGER NOT NULL, n INTEGER NOT NULL)");
   }
 
@@ -186,7 +212,11 @@ export class LinkBox extends DurableObject {
 
     if (route === "/reserve") {
       if (live) return json({ ok: false, error: "exists" });
-      this.sql.exec("INSERT INTO link (id, uid, expires) VALUES (1, ?, ?)", b.uid, b.expires);
+      this.sql.exec("INSERT INTO link (id, uid, expires, username) VALUES (1, ?, ?, ?)", b.uid, b.expires, b.username || null);
+      return json({ ok: true });
+    }
+    if (route === "/revoke") {
+      if (live && live.uid === b.uid) this.sql.exec("DELETE FROM link WHERE id = 1");
       return json({ ok: true });
     }
     if (route === "/put") {
@@ -199,7 +229,7 @@ export class LinkBox extends DurableObject {
       if (!live) return json({ status: "invalid" });
       if (!live.ct) return json({ status: "pending" });
       this.sql.exec("DELETE FROM link WHERE id = 1");
-      return json({ status: "ok", salt: live.salt, iv: live.iv, ct: live.ct });
+      return json({ status: "ok", salt: live.salt, iv: live.iv, ct: live.ct, username: live.username || null });
     }
     return new Response("not found", { status: 404 });
   }

@@ -13,6 +13,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { meter, gate, PRESENCE_LEASE_MS, presenceAlarmMs } from "./reqbudget.js";
+import { normalizeUsername, lookupKey, reasonToError, HOLD_MS, LEGACY_WINDOW_MS } from "./usernames.js";
 import { FixedWindow, onlineTargets, FRIENDS_MSGS_PER_MIN } from "./limits.js";
 
 const UID_RE = /^[a-z2-7]{26}$/;
@@ -122,12 +123,123 @@ export class Directory extends DurableObject {
     // Retired identity -> the identity that replaced it (written when a retire completes). Lets anyone who still
     // lists the old uid (a failed fan-out, an offline peer) be swapped to the current uid on their next hello.
     this.sql.exec("CREATE TABLE IF NOT EXISTS alias (old TEXT PRIMARY KEY, new TEXT NOT NULL, at INTEGER NOT NULL DEFAULT 0)");
+    // Username registry (see usernames.js, docs/ACCOUNTS.md). One row per claimed name; a DO is single threaded,
+    // so every claim is atomic and the first one wins. `ord` = the account's registration order (dir rowid).
+    this.sql.exec("CREATE TABLE IF NOT EXISTS uname (key TEXT PRIMARY KEY, uid TEXT NOT NULL UNIQUE, display TEXT NOT NULL, ord INTEGER NOT NULL DEFAULT 0, legacy INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL)");
+    // A name given up by a rename/release stays reserved for its old owner for HOLD_MS.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS uname_hold (key TEXT PRIMARY KEY, uid TEXT NOT NULL, until INTEGER NOT NULL)");
+    // Accounts whose migrated name lost a collision: they must pick a new one.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS uname_needs (uid TEXT PRIMARY KEY, at INTEGER NOT NULL)");
+  }
+
+  /* Username registry operations. `b.test` = caller is a test account. Returns a plain object. */
+  uname(route, b) {
+    const t = Date.now();
+    const holdOf = (key) => {
+      const h = this.sql.exec("SELECT uid, until FROM uname_hold WHERE key=?", key).toArray()[0];
+      if (h && h.until <= t) { this.sql.exec("DELETE FROM uname_hold WHERE key=?", key); return null; }
+      return h || null;
+    };
+    const mine = (uid) => this.sql.exec("SELECT * FROM uname WHERE uid=?", uid).toArray()[0] || null;
+    const ordOf = (uid) => {
+      const r = this.sql.exec("SELECT rowid AS o FROM dir WHERE uid=?", uid).toArray()[0];
+      return r ? r.o : 1e12;
+    };
+    const putHold = (key, uid) => {
+      this.sql.exec("INSERT OR REPLACE INTO uname_hold (key, uid, until) VALUES (?, ?, ?)", key, uid, t + (Number(b.holdMs) > 0 ? Number(b.holdMs) : HOLD_MS));
+      // at most 5 live holds per account: drop the oldest
+      this.sql.exec("DELETE FROM uname_hold WHERE uid=? AND key NOT IN (SELECT key FROM uname_hold WHERE uid=? ORDER BY until DESC LIMIT 5)", uid, uid);
+    };
+    if (route === "lookup") {
+      const n = normalizeUsername(b.name, { test: true });
+      const key = normalizeUsername(b.name, { test: false }).key || n.key;
+      if (!key) return { uid: null };
+      const r = this.sql.exec("SELECT uid, display FROM uname WHERE key=?", key).toArray()[0];
+      return { uid: r ? r.uid : null, display: r ? r.display : null };
+    }
+    if (route === "status") {
+      const m = mine(b.uid);
+      if (m) return { status: "ok", username: m.display };
+      if (this.sql.exec("SELECT 1 FROM uname_needs WHERE uid=?", b.uid).toArray()[0]) return { status: "needs_new_name" };
+      return { status: "none" };
+    }
+    if (route === "check" || route === "claim") {
+      const v = normalizeUsername(b.name, { test: !!b.test });
+      if (!v.ok) return { ok: false, reason: v.reason };
+      const row = this.sql.exec("SELECT uid FROM uname WHERE key=?", v.key).toArray()[0];
+      if (row && row.uid !== b.uid) return { ok: false, reason: "taken" };
+      const h = holdOf(v.key);
+      if (h && h.uid !== b.uid) return { ok: false, reason: "held" };
+      if (route === "check") return { ok: true, display: v.display, yours: !!(row || h) };
+      const old = mine(b.uid);
+      if (old && old.key !== v.key) {
+        this.sql.exec("DELETE FROM uname WHERE uid=?", b.uid);
+        putHold(old.key, b.uid);
+      } else if (old) {
+        this.sql.exec("UPDATE uname SET display=?, legacy=0 WHERE uid=?", v.display, b.uid);
+        return { ok: true, username: v.display, previous: old.display };
+      }
+      this.sql.exec("DELETE FROM uname_hold WHERE key=? AND uid=?", v.key, b.uid);
+      this.sql.exec("INSERT INTO uname (key, uid, display, ord, legacy, at) VALUES (?, ?, ?, ?, 0, ?)", v.key, b.uid, v.display, ordOf(b.uid), t);
+      this.sql.exec("DELETE FROM uname_needs WHERE uid=?", b.uid);
+      return { ok: true, username: v.display, previous: old ? old.display : null };
+    }
+    if (route === "legacy") {
+      // Migration of an existing account's display name. Oldest account (registration order) wins a collision.
+      const m = mine(b.uid);
+      if (m) return { status: "ok", username: m.display };
+      const v = normalizeUsername(b.name, { test: false });
+      const needs = () => {
+        this.sql.exec("INSERT OR REPLACE INTO uname_needs (uid, at) VALUES (?, ?)", b.uid, t);
+        return { status: "needs_new_name" };
+      };
+      if (!v.ok) return needs();
+      const ord = ordOf(b.uid);
+      const row = this.sql.exec("SELECT * FROM uname WHERE key=?", v.key).toArray()[0];
+      let displaced = null;
+      if (row) {
+        const window = Number(b.window) > 0 ? Number(b.window) : LEGACY_WINDOW_MS;
+        if (row.legacy === 1 && row.ord > ord && t - row.at < window) {
+          this.sql.exec("DELETE FROM uname WHERE key=?", v.key);
+          this.sql.exec("INSERT OR REPLACE INTO uname_needs (uid, at) VALUES (?, ?)", row.uid, t);
+          displaced = row.uid;
+        } else return needs();
+      } else {
+        const h = holdOf(v.key);
+        if (h && h.uid !== b.uid) return needs();
+      }
+      this.sql.exec("INSERT INTO uname (key, uid, display, ord, legacy, at) VALUES (?, ?, ?, ?, 1, ?)", v.key, b.uid, v.display, ord, t);
+      return { status: "ok", username: v.display, displaced };
+    }
+    if (route === "release") {
+      // hold:true (default) = the name stays reserved for the owner; hold:false = account deletion, free at once.
+      const m = mine(b.uid);
+      if (!m) return { ok: true, released: null };
+      this.sql.exec("DELETE FROM uname WHERE uid=?", b.uid);
+      if (b.hold !== false) putHold(m.key, b.uid);
+      return { ok: true, released: m.display };
+    }
+    if (route === "transfer") {
+      // Identity retire (old uid replaced by new uid): the name follows the person.
+      const m = mine(b.from);
+      if (!m) return { ok: true, moved: false };
+      this.sql.exec("DELETE FROM uname WHERE uid=?", b.from);
+      if (mine(b.to)) { putHold(m.key, b.to); return { ok: true, moved: false }; }
+      this.sql.exec("INSERT INTO uname (key, uid, display, ord, legacy, at) VALUES (?, ?, ?, ?, 0, ?)", m.key, b.to, m.display, ordOf(b.to), t);
+      this.sql.exec("DELETE FROM uname_needs WHERE uid=?", b.to);
+      return { ok: true, moved: true, username: m.display };
+    }
+    return null;
   }
 
   async fetch(request) {
     meter(this.env, this.ctx, "do");
     if (request.headers.get("x-rh-internal") !== "1") return new Response("forbidden", { status: 403 });
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/uname/") && request.method === "POST") {
+      const out = this.uname(url.pathname.slice(7), (await request.json()) || {});
+      return out ? json(out) : new Response("not found", { status: 404 });
+    }
     if (url.pathname === "/lookup") {
       const prefix = url.searchParams.get("prefix") || "";
       const row = this.sql.exec("SELECT uid FROM dir WHERE prefix=?", prefix).toArray()[0];
@@ -586,6 +698,18 @@ export class UserHub extends DurableObject {
         // Secret check for /link/* (see link.js). Optionally rate-limits link-code creation.
         if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
         if (b.count && !this.hit(`link:${from}`, 5, 60 * 60 * 1000)) return { r: "rate" };
+        // username: shown on the new PC ("Linking as NAME"); prev: the still-open code of this account, revoked when a new one is made.
+        return { r: "ok", username: this.kvGet("username"), prev: b.count ? this.kvGet("last_link") : undefined };
+      }
+      case "link_set": {
+        if (b.secret && p.secret_hash !== (await sha256hex(String(b.secret)))) return { r: "bad-secret" };
+        this.kvSet("last_link", String(b.box || "").slice(0, 80));
+        return { r: "ok" };
+      }
+      case "uname_revoked": {
+        // Another (older) account won our migrated name: ask the player for a new one.
+        this.setUsernameLocal(null, "needs_new_name");
+        this.push({ type: "username", username: null, status: "needs_new_name" });
         return { r: "ok" };
       }
       case "saves_auth": {
@@ -799,10 +923,13 @@ export class UserHub extends DurableObject {
       ws.close(4005, "retired");
       return;
     }
+    const isTestAcct = msg.test === true || isTestName(name) || !!this.one("SELECT 1 FROM kv WHERE k='is_test'");
+    const un = await this.helloUsername(msg, name, isTestAcct);
+    const shownName = un.username || name;   // a claimed username always wins over whatever name a device sends
     let renamed = false;
-    if (p.name !== name) {
-      this.run("UPDATE profile SET name=? WHERE id=1", name);
-      p.name = name;
+    if (p.name !== shownName) {
+      this.run("UPDATE profile SET name=? WHERE id=1", shownName);
+      p.name = shownName;
       renamed = true;
     }
     const wasOnline = this.authedSockets().length > 0;
@@ -825,6 +952,9 @@ export class UserHub extends DurableObject {
     ws.send(JSON.stringify({
       type: "welcome",
       code: p.code,
+      username: un.username || null,
+      username_status: un.status,
+      ...(un.error ? { username_error: un.error } : {}),
       friends,
       requests: {
         incoming: reqs.filter((r) => r.dir === "in").map(strip),
@@ -834,6 +964,85 @@ export class UserHub extends DurableObject {
       inbox: this.all("SELECT json FROM inbox ORDER BY at").map((r) => JSON.parse(r.json)),
     }));
     await this.broadcastPresence(renamed);
+  }
+
+  // ---- usernames (registry = Directory, see usernames.js / docs/ACCOUNTS.md) ----
+
+  isTestAccount() { return !!this.one("SELECT 1 FROM kv WHERE k='is_test'"); }
+  kvGet(k) { const r = this.one("SELECT v FROM kv WHERE k=?", k); return r ? r.v : null; }
+  kvSet(k, v) { this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", k, v); }
+
+  async dirU(route, body) {
+    const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+    const res = await dir.fetch(`https://directory/uname/${route}`, {
+      method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    return res.json();
+  }
+
+  setUsernameLocal(username, status) {
+    if (username) this.kvSet("username", username); else this.run("DELETE FROM kv WHERE k='username'");
+    this.kvSet("uname_status", status);
+  }
+
+  /* Hello time: report the account's username state, claiming when asked (hello.username) or migrating the legacy
+   * display name once (oldest account wins; losers get needs_new_name). Test accounts never migrate. */
+  async helloUsername(msg, name, isTest) {
+    const have = this.kvGet("username");
+    if (have) return { username: have, status: "ok" };
+    try {
+      if (typeof msg.username === "string" && msg.username) {
+        const r = await this.dirU("claim", { uid: this.profile().uid, name: msg.username, test: isTest, holdMs: this.env.UNAME_HOLD_MS });
+        if (r.ok) { this.setUsernameLocal(r.username, "ok"); return { username: r.username, status: "ok" }; }
+        if (!isTest) this.kvSet("uname_status", "needs_new_name");
+        return { username: null, status: isTest ? "none" : (this.kvGet("uname_status") || "none"), error: reasonToError(r.reason) };
+      }
+      if (isTest) return { username: null, status: "none" };
+      if (!msg.no_auto_username && !this.kvGet("uname_legacy_done")) {
+        const r = await this.dirU("legacy", { uid: this.profile().uid, name, window: this.env.UNAME_LEGACY_WINDOW_MS });
+        this.kvSet("uname_legacy_done", "1");
+        if (r.status === "ok") {
+          this.setUsernameLocal(r.username, "ok");
+          if (r.displaced) { try { await this.call(r.displaced, "uname_revoked", { uid: this.profile().uid }); } catch { /* next hello */ } }
+          return { username: r.username, status: "ok" };
+        }
+        this.kvSet("uname_status", "needs_new_name");
+        return { username: null, status: "needs_new_name" };
+      }
+    } catch { /* registry unreachable: stay as before, retried on the next hello */ }
+    return { username: null, status: this.kvGet("uname_status") || "none" };
+  }
+
+  /* Identity replaced: the retired uid's username follows the person to the new uid (or is held for them). */
+  async transferUsername(old) {
+    try {
+      const p = this.profile();
+      const r = await this.dirU("transfer", { from: old, to: p.uid, holdMs: this.env.UNAME_HOLD_MS });
+      if (r.moved && r.username) {
+        this.setUsernameLocal(r.username, "ok");
+        this.run("UPDATE profile SET name=? WHERE id=1", r.username);
+        this.push({ type: "username", username: r.username, status: "ok" });
+      }
+    } catch { /* registry unreachable: the name stays with the old uid until a retry */ }
+  }
+
+  async setUsername(ws, name) {
+    const p = this.profile();
+    if (!this.hit("uset", 10, 3600 * 1000)) {
+      ws.send(JSON.stringify({ type: "username_result", op: "set", ok: false, reason: "rate-limited" }));
+      return;
+    }
+    const r = await this.dirU("claim", { uid: p.uid, name, test: this.isTestAccount(), holdMs: this.env.UNAME_HOLD_MS });
+    if (!r.ok) {
+      ws.send(JSON.stringify({ type: "username_result", op: "set", ok: false, reason: reasonToError(r.reason), detail: r.reason }));
+      return;
+    }
+    this.setUsernameLocal(r.username, "ok");
+    this.kvSet("uname_legacy_done", "1");
+    this.run("UPDATE profile SET name=? WHERE id=1", r.username);
+    this.push({ type: "username", username: r.username, status: "ok", previous: r.previous || null });
+    ws.send(JSON.stringify({ type: "username_result", op: "set", ok: true, username: r.username }));
+    await this.broadcastPresence(true);
   }
 
   async dispatch(ws, att, msg) {
@@ -848,7 +1057,49 @@ export class UserHub extends DurableObject {
         await this.broadcastPresence(false);
         break;
       }
+      case "username_check": {
+        if (!this.hit("ucheck", 40, 5 * 60 * 1000)) {
+          ws.send(JSON.stringify({ type: "username_result", op: "check", ok: false, name: String(msg.name ?? "").slice(0, 32), reason: "rate-limited" }));
+          break;
+        }
+        const r = await this.dirU("check", { uid: p.uid, name: msg.name, test: this.isTestAccount() });
+        ws.send(JSON.stringify({
+          type: "username_result", op: "check", name: String(msg.name ?? "").slice(0, 32), ok: !!r.ok,
+          ...(r.ok ? { username: r.display, yours: !!r.yours } : { reason: reasonToError(r.reason), detail: r.reason }),
+        }));
+        break;
+      }
+      case "set_username": {
+        if (typeof msg.name !== "string") return this.err(ws, "bad-request", type);
+        await this.setUsername(ws, msg.name);
+        break;
+      }
+      case "release_username": {
+        // Give the name up (held for you 7 days so nobody can snipe it); you keep your display name until you pick a new one.
+        const r = await this.dirU("release", { uid: p.uid, holdMs: this.env.UNAME_HOLD_MS });
+        this.setUsernameLocal(null, "none");
+        this.kvSet("uname_legacy_done", "1");
+        this.push({ type: "username", username: null, status: "none", previous: r.released || null });
+        break;
+      }
+      case "delete_account": {
+        // Account deletion: the username is freed at once, friendships are removed and the uid can never connect again.
+        if (msg.confirm !== true) return this.err(ws, "bad-request", type, "confirm-required");
+        await this.dirU("release", { uid: p.uid, hold: false });
+        for (const f of this.all("SELECT uid FROM friends")) {
+          this.run("DELETE FROM friends WHERE uid=?", f.uid);
+          try { await this.call(f.uid, "friend_removed", { uid: p.uid }); } catch { /* peer unreachable */ }
+        }
+        this.run("DELETE FROM requests");
+        this.setUsernameLocal(null, "none");
+        this.kvSet("retired", p.uid);
+        try { await this.setOnline(false); } catch { /* lease expires */ }
+        this.push({ type: "account_deleted" });
+        for (const s of this.ctx.getWebSockets()) { try { s.close(4005, "deleted"); } catch { /* closed */ } }
+        break;
+      }
       case "rename": {
+        if (this.kvGet("username")) return this.err(ws, "bad-request", type, "use-set-username");
         const name = cleanName(msg.name);
         if (!name) return this.err(ws, "bad-request", type);
         this.run("UPDATE profile SET name=? WHERE id=1", name);
@@ -862,6 +1113,7 @@ export class UserHub extends DurableObject {
         if (!old || old === p.uid || typeof msg.secret !== "string") return this.err(ws, "bad-request", type);
         if (!this.hit("retire", 10, 3600 * 1000)) return this.err(ws, "rate-limited", type);
         if (this.one("SELECT 1 FROM kv WHERE k=?", "retire_done:" + old)) {
+          await this.transferUsername(old);
           await this.postAlias(old, p.uid);   // idempotent retry: an earlier attempt may have failed after the marker
           ws.send(JSON.stringify({ type: "retired", uid: old })); // already completed: never replay (would re-block)
           return;
@@ -926,6 +1178,7 @@ export class UserHub extends DurableObject {
         this.dedupeRows();
         if (failed) return this.err(ws, "bad-request", type, "retire-failed"); // snapshot kept on the old account: retry resumes
         await this.postAlias(old, p.uid);   // alias first, then the marker: a failed POST is retried on the early-return path
+        await this.transferUsername(old);
         this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '1')", "retire_done:" + old);
         try { await this.call(old, "retire_done", { uid: p.uid, secret: msg.secret }); } catch { /* old stays inert; marker prevents replay */ }
         this.push({ type: "retired", uid: old });
@@ -933,15 +1186,26 @@ export class UserHub extends DurableObject {
         break;
       }
       case "add_friend": {
-        if (typeof msg.code !== "string") return this.err(ws, "bad-request", type);
+        // By friend code (`code`) or by username (`username`, or a `code` that is not code-shaped).
+        const raw = typeof msg.code === "string" ? msg.code.trim() : "";
+        const byName = typeof msg.username === "string" ? msg.username
+          : (raw && !CODE_RE.test(raw.toUpperCase()) && lookupKey(raw) ? raw : null);
+        if (byName === null && typeof msg.code !== "string") return this.err(ws, "bad-request", type);
         if (!this.hit("add", 30, 3600 * 1000)) return this.err(ws, "rate-limited", type);
-        const m = CODE_RE.exec(msg.code.trim().toUpperCase());
-        if (!m) return this.err(ws, "unknown-code", type);
-        const prefix = (m[1] + m[2]).toLowerCase();
-        const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
-        const lr = await (await dir.fetch(`https://directory/lookup?prefix=${prefix}`, { headers: { "x-rh-internal": "1" } })).json();
-        if (!lr.uid) return this.err(ws, "unknown-code", type);
-        const target = lr.uid;
+        let target;
+        if (byName !== null) {
+          const ur = await this.dirU("lookup", { name: byName });
+          if (!ur.uid) return this.err(ws, "unknown-code", type, "unknown-username");
+          target = ur.uid;
+        } else {
+          const m = CODE_RE.exec(raw.toUpperCase());
+          if (!m) return this.err(ws, "unknown-code", type);
+          const prefix = (m[1] + m[2]).toLowerCase();
+          const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+          const lr = await (await dir.fetch(`https://directory/lookup?prefix=${prefix}`, { headers: { "x-rh-internal": "1" } })).json();
+          if (!lr.uid) return this.err(ws, "unknown-code", type);
+          target = lr.uid;
+        }
         if (target === p.uid) return this.err(ws, "self", type);
         if (this.isBlocked(target)) return this.err(ws, "blocked", type);
         if (this.isFriend(target)) return this.err(ws, "already-friends", type);
