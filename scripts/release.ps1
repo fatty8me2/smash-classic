@@ -33,7 +33,7 @@ param(
     [switch]$ForceBattleShip,            # passed to package-windows.ps1
     [switch]$SkipPackage                 # reuse assets already in OutDir (e.g. after a failed push); still bumps/commits/pushes
 )
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"   # native tools write progress to stderr; every call checks $LASTEXITCODE explicitly
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 $Root = Split-Path -Parent $PSScriptRoot
