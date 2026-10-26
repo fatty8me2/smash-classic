@@ -21,6 +21,7 @@
 # assets to a scratch directory so the real dist\ folder is left alone.
 [CmdletBinding()]
 param(
+    [switch]$AlsoSmashClassic,       # also publish to fatty8me2/smash-classic (only for Smash Classic releases; RetroHub updates come from retrohub since v1.27.3)
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$Notes = "",                 # release notes: path to a .md file, or literal Markdown. Default: changelog.json entry.
     [switch]$DryRun,
@@ -172,8 +173,8 @@ if ($DeployWorker) {
 # ── 7. GitHub releases (same three assets on both repos) ──
 Step "Creating GitHub releases"
 $title = $Tag
-& gh release create $Tag @assets -R $BsRepo --target main --title $title -F $NotesFile
-if ($LASTEXITCODE -ne 0) { Die "gh release create failed for $BsRepo (retry with: gh release create $Tag <assets> -R $BsRepo)" }
+if ($AlsoSmashClassic) { & gh release create $Tag @assets -R $BsRepo --target main --title $title -F $NotesFile }
+if ($AlsoSmashClassic -and $LASTEXITCODE -ne 0) { Die "gh release create failed for $BsRepo (retry with: gh release create $Tag <assets> -R $BsRepo)" }
 & gh release create $Tag @assets -R $HubRepo --target main --title $title --latest -F $NotesFile
 if ($LASTEXITCODE -ne 0) { Die "gh release create failed for $HubRepo (retry with: gh release create $Tag <assets> -R $HubRepo --latest)" }
 
