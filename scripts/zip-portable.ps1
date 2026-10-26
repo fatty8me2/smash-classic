@@ -6,7 +6,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$Source,
     [Parameter(Mandatory = $true)][string]$Destination,
-    [string]$Prefix = ""    # prepended to every entry name, e.g. "shaders/"
+    [string]$Prefix = "",   # prepended to every entry name, e.g. "shaders/"
+    [ValidateSet("Optimal", "Fastest", "NoCompression")][string]$Level = "Fastest"   # deflate level (Fastest ~ zlib 1)
 )
 Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 
@@ -17,7 +18,7 @@ $archive = New-Object System.IO.Compression.ZipArchive($stream, [System.IO.Compr
 try {
     Get-ChildItem -Path $src -Recurse -File -Force | ForEach-Object {
         $name = $Prefix + $_.FullName.Substring($src.Length + 1).Replace('\', '/')
-        $entry = $archive.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Optimal)
+        $entry = $archive.CreateEntry($name, [System.IO.Compression.CompressionLevel]$Level)
         $entry.LastWriteTime = $_.LastWriteTime
         $out = $entry.Open()
         $in = [System.IO.File]::OpenRead($_.FullName)

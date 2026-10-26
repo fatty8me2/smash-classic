@@ -13,6 +13,9 @@
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
+#ifndef SetupCompression
+  #define SetupCompression lzma2/fast
+#endif
 #ifndef OutputDir
   #define OutputDir "."
 #endif
@@ -39,7 +42,7 @@ UninstallDisplayIcon={app}\RetroHub.exe
 SetupIconFile=retrohub.ico
 OutputDir={#OutputDir}
 OutputBaseFilename=RetroHub-Setup
-Compression=lzma2/normal
+Compression={#SetupCompression}
 SolidCompression=yes
 CloseApplications=yes
 RestartApplications=no

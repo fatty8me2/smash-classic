@@ -700,8 +700,8 @@ set(SSB64_COMPILE_DEFS
     # ImGui
     CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 
-    # Updater
-    BATTLESHIP_CURRENT_VERSION=\"${BATTLESHIP_VERSION}\"
+    # (The release version is NOT a compile definition: that would recompile every TU on each
+    # version bump. It lives in the generated build_version.cpp, see below.)
 
     # Asset-recipe fingerprint (see the computation above SSB64_COMPILE_DEFS)
     SSB64_ASSET_RECIPE_HASH=\"${SSB64_ASSET_RECIPE_HASH}\"
@@ -965,6 +965,19 @@ endif()
 ################################################################################
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE ${SSB64_COMPILE_DEFS})
+
+# Release version string: one tiny generated TU (rewritten only when the text changes, via
+# configure_file COPYONLY) so bumping VERSION recompiles/relinks just this file. It is a fixed-size
+# writable slot behind a marker so scripts/package-windows.ps1 can stamp the release version into a
+# staged copy of the exe (patch-in-place) and skip the BattleShip build when only VERSION changed.
+file(WRITE "${CMAKE_BINARY_DIR}/version_gen/build_version.cpp.tmp"
+    "volatile char kBattleShipVersionSlot[64] = \"@@BSVERSLOT@@|${BATTLESHIP_VERSION}\";
+const char* battleship_version(void) { return (const char*)kBattleShipVersionSlot + 14; }
+")
+configure_file("${CMAKE_BINARY_DIR}/version_gen/build_version.cpp.tmp"
+               "${CMAKE_BINARY_DIR}/version_gen/build_version.cpp" COPYONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/VERSION")
+target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}/version_gen/build_version.cpp")
 
 ################################################################################
 # Include paths (no include/ here — port code uses system headers)

@@ -18,6 +18,7 @@
 #include "enhancements.h"
 
 #include "port_log.h"
+#include "../build_version.h"
 
 #include <libultraship/bridge/consolevariablebridge.h>
 #include <ship/Context.h>
@@ -73,9 +74,6 @@ static std::mutex s_stringMutex;
 
 namespace {
 
-#ifndef BATTLESHIP_CURRENT_VERSION
-#define BATTLESHIP_CURRENT_VERSION "dev"
-#endif
 
 constexpr const char* kRepo = "fatty8me2/smash-classic";
 constexpr const char* kLatestReleaseApi = "https://api.github.com/repos/fatty8me2/smash-classic/releases/latest";

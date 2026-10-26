@@ -35,7 +35,18 @@
 # (LUS Context::GetAppBundlePath, _WIN32 branch) and saves via the same
 # mechanism, so the only paths the binary ever touches are exe-relative.
 
+param(
+    # Scratch output dir (zip, installer, SHA256SUMS, stage tree). Default: <root>\dist. Same as $env:SSB64_DIST_DIR.
+    [string]$OutDir = "",
+    # RetroHub checkout (default: sibling ..\RetroHub). Same as $env:RETROHUB_DIR.
+    [string]$RetroHubDir = "",
+    # Ignore the "BattleShip sources unchanged" cache and rebuild BattleShip/torch/f3d.o2r anyway.
+    [switch]$ForceBattleShip,
+    # Build every RetroHub target (all tests included) like the old behaviour, instead of only the shipped ones.
+    [switch]$BuildAllHub
+)
 $ErrorActionPreference = "Stop"
+$script:PkgClock = [System.Diagnostics.Stopwatch]::StartNew()
 
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 # ROM version: us (default) or jp. The JP build is a SEPARATE
@@ -63,16 +74,118 @@ $BuildDir = if ($env:SSB64_BUILD_DIR) { $env:SSB64_BUILD_DIR } else { Join-Path 
 # SSB64_SKIP_BUILD=1 = reuse existing build outputs (no codegen/cmake/RetroHub rebuild),
 # RETROHUB_DIR = RetroHub checkout (default: sibling ..\RetroHub), RETROHUB_BUILD_DIR = its build dir.
 $SkipBuild = $env:SSB64_SKIP_BUILD -eq "1"
-$DistDir = if ($env:SSB64_DIST_DIR) { $env:SSB64_DIST_DIR } else { Join-Path $Root "dist" }
+$DistDir = if ($OutDir) { $OutDir } elseif ($env:SSB64_DIST_DIR) { $env:SSB64_DIST_DIR } else { Join-Path $Root "dist" }
 New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
 $AppName = if ($Ver -eq "jp") { "BattleShip-JP" } else { "BattleShip" }
 $StageName = $AppName
 $StageDir = Join-Path $DistDir $StageName
 $ZipPath = Join-Path $DistDir "$AppName$ZipSuffix.zip"
+# Zip deflate level (Fastest|Optimal|NoCompression) and Inno Setup compression (lzma2/fast|lzma2/normal|lzma2/max...).
+$ZipLevel = if ($env:PKG_ZIP_LEVEL) { $env:PKG_ZIP_LEVEL } else { "Fastest" }
+$SetupCompression = if ($env:PKG_SETUP_COMPRESSION) { $env:PKG_SETUP_COMPRESSION } else { "lzma2/fast" }
 $Jobs = if ($env:NUMBER_OF_PROCESSORS) { [int]$env:NUMBER_OF_PROCESSORS } else { 4 }
 
-function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
-function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+# Per-step wall-clock timing: every Write-Step closes the previous step and prints its elapsed time;
+# Show-Timings prints the table (also written to <DistDir>\package-timings.txt) at the end or on failure.
+$script:StepLog = New-Object System.Collections.ArrayList
+$script:StepName = $null
+$script:StepStart = 0.0
+function Close-Step {
+    if ($script:StepName) {
+        $e = $script:PkgClock.Elapsed.TotalSeconds - $script:StepStart
+        [void]$script:StepLog.Add([pscustomobject]@{ Step = $script:StepName; Seconds = [math]::Round($e, 1) })
+        Write-Host ("    [{0}] {1:N1}s" -f $script:StepName, $e) -ForegroundColor DarkGray
+        $script:StepName = $null
+    }
+}
+function Write-Step($msg) {
+    Close-Step
+    $script:StepName = $msg
+    $script:StepStart = $script:PkgClock.Elapsed.TotalSeconds
+    Write-Host "`n=== $msg ===" -ForegroundColor Cyan
+}
+function Show-Timings {
+    Close-Step
+    $lines = @("Package timings:") + ($script:StepLog | ForEach-Object { "{0,8:N1}s  {1}" -f $_.Seconds, $_.Step }) +
+             ("{0,8:N1}s  TOTAL" -f $script:PkgClock.Elapsed.TotalSeconds)
+    $lines | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+    try { Set-Content -Path (Join-Path $DistDir "package-timings.txt") -Value $lines -Encoding ascii } catch {}
+}
+function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; Show-Timings; exit 1 }
+
+# ── BattleShip change detection ──
+# Fingerprint of everything that can change the BattleShip build outputs (BattleShip.exe, torch.exe,
+# f3d.o2r): tracked file blob ids (submodules = their pinned commit), uncommitted edits, untracked
+# files, and each submodule's own commit + dirty state. VERSION is deliberately NOT part of it (the
+# release version is stamped into the staged exe, see Set-ExeVersion), neither are docs/server/installer/
+# scripts/CI files, which never reach the game binaries. Stored next to the build dir after each
+# successful build; if it matches and the artifacts exist, configure+build+o2r are skipped entirely.
+function Get-BsInputHash {
+    $ex = @(':(exclude)VERSION', ':(exclude)docs', ':(exclude)server', ':(exclude)installer', ':(exclude)scripts',
+            ':(exclude).github', ':(exclude).claude', ':(exclude)ci', ':(exclude)*.md', ':(exclude)wt', ':(exclude)dist')
+    $parts = New-Object System.Collections.ArrayList
+    [void]$parts.Add("ver=$Ver;scripting=$EnableScripting;salt=1")
+    [void]$parts.Add(((& git -C $Root ls-files -s -- . @ex) -join "`n"))
+    [void]$parts.Add(((& git -C $Root diff HEAD --no-ext-diff -- . @ex) -join "`n"))
+    foreach ($f in (& git -C $Root ls-files -o --exclude-standard -- . @ex)) {
+        $fi = Get-Item -LiteralPath (Join-Path $Root $f) -ErrorAction SilentlyContinue
+        if ($fi) { [void]$parts.Add("untracked:${f}:$($fi.Length):$($fi.LastWriteTimeUtc.Ticks)") }
+    }
+    foreach ($sm in @("libultraship", "torch", "decomp")) {
+        $d = Join-Path $Root $sm
+        if (Test-Path $d) {
+            [void]$parts.Add("$sm=$(& git -C $d rev-parse HEAD)")
+            [void]$parts.Add(((& git -C $d status --porcelain --ignore-submodules=none) -join "`n"))
+        }
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes(($parts -join "`n--`n"))
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLower()
+}
+
+# The version string lives in a 64-byte slot behind a marker (port/build_version.h + generated
+# build_version.cpp: "@@BSVERSLOT@@|<version>"). Overwrite the value in a staged copy of the exe so a
+# VERSION bump needs no BattleShip recompile/relink.
+function Set-ExeVersion($ExePath, $Version) {
+    $marker = [System.Text.Encoding]::ASCII.GetBytes("@@BSVERSLOT@@|")
+    $slotLen = 64
+    $bytes = [System.IO.File]::ReadAllBytes($ExePath)
+    $found = -1
+    $first = $marker[0]
+    $idx = [Array]::IndexOf($bytes, $first, 0)
+    while ($idx -ge 0 -and $idx -le $bytes.Length - $marker.Length) {
+        $ok = $true
+        for ($k = 1; $k -lt $marker.Length; $k++) { if ($bytes[$idx + $k] -ne $marker[$k]) { $ok = $false; break } }
+        if ($ok) { $found = $idx; break }
+        $idx = [Array]::IndexOf($bytes, $first, $idx + 1)
+    }
+    if ($found -lt 0) { Fail "version slot marker not found in $ExePath - rebuild BattleShip (-ForceBattleShip)" }
+    $val = [System.Text.Encoding]::ASCII.GetBytes($Version)
+    $room = $slotLen - $marker.Length - 1
+    if ($val.Length -gt $room) { Fail "version '$Version' too long for the exe slot ($room bytes)" }
+    $off = $found + $marker.Length
+    for ($k = 0; $k -lt $room + 1; $k++) { $bytes[$off + $k] = 0 }
+    [Array]::Copy($val, 0, $bytes, $off, $val.Length)
+    [System.IO.File]::WriteAllBytes($ExePath, $bytes)
+    Write-Host "Stamped $Version into $(Split-Path -Leaf $ExePath)"
+}
+
+$BsStamp = Join-Path $BuildDir "pkg-input.sha256"
+$BsArtifactsOk = ((Test-Path (Join-Path $BuildDir "Release\$AppName.exe")) -or (Test-Path (Join-Path $BuildDir "$AppName.exe"))) -and
+                 (Test-Path (Join-Path $BuildDir "f3d.o2r")) -and
+                 [bool](@("TorchExternal\src\TorchExternal-build\Release\torch.exe", "TorchExternal\src\TorchExternal-build\torch.exe", "torch-install\bin\torch.exe") |
+                        Where-Object { Test-Path (Join-Path $BuildDir $_) })
+$BsHash = $null
+$BsReuse = $false
+if (-not $SkipBuild -and -not $ForceBattleShip) {
+    Write-Step "Checking whether BattleShip changed"
+    $BsHash = Get-BsInputHash
+    $BsOld = if (Test-Path $BsStamp) { (Get-Content $BsStamp -Raw).Trim() } else { "" }
+    $BsReuse = $BsArtifactsOk -and ($BsOld -eq $BsHash)
+    Write-Host ("BattleShip inputs: {0}" -f $(if ($BsReuse) { "UNCHANGED - reusing the previous BattleShip.exe/torch.exe/f3d.o2r (skipping credits, configure, build)" } else { "changed or no previous build - building" }))
+}
+# Everything BattleShip-side (credits, configure, build, o2r) is skipped when reusing.
+$SkipBsBuild = $SkipBuild -or $BsReuse
 
 # ── 0. Run codegen scripts that don't need the ROM ──
 # Encoded credit files are gitignored (input text is in decomp/src/credits/),
@@ -80,7 +193,7 @@ function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 # cmake builds scstaffroll.c. ROM-independent — same step CMake's
 # GenerateCreditsAssets target runs.
 Write-Step "Encoding credits text"
-if (-not $SkipBuild) {
+if (-not $SkipBsBuild) {
 Push-Location (Join-Path $Root "decomp/src/credits")
 foreach ($f in @("staff.credits.us.txt", "titles.credits.us.txt")) {
     & python "$Root/tools/creditsTextConverter.py" $f | Out-Null
@@ -107,28 +220,38 @@ Write-Step "Configuring release build (portable, scripting=$EnableScripting)"
 # Windows Store stub); without a hint, CMake's find_package(Python3) can
 # resolve to a different interpreter than the one pip targeted, and the
 # CSS-arrow asset rules then fail with "Pillow is required" mid-build.
-if (-not $SkipBuild) {
+if (-not $SkipBsBuild) {
 $PythonExe = (Get-Command python).Source
 Write-Host "Using Python: $PythonExe"
-cmake -B $BuildDir $Root `
-    -DCMAKE_BUILD_TYPE=Release `
-    "-DDISABLE_SCRIPTING=$DisableScripting" `
-    "-DSSB64_VERSION=$Ver" `
-    "-DPython3_EXECUTABLE=$PythonExe" `
-    | Out-Null
-if ($LASTEXITCODE -ne 0) { Fail "cmake configure failed" }
+# An existing configured build dir is NOT reconfigured here: `cmake --build` re-runs the configure step
+# by itself when any CMakeLists/cmake file or VERSION changed.
+if (-not (Test-Path (Join-Path $BuildDir "CMakeCache.txt"))) {
+    cmake -B $BuildDir $Root `
+        -DCMAKE_BUILD_TYPE=Release `
+        "-DDISABLE_SCRIPTING=$DisableScripting" `
+        "-DSSB64_VERSION=$Ver" `
+        "-DPython3_EXECUTABLE=$PythonExe" `
+        | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail "cmake configure failed" }
+} else {
+    Write-Host "Build dir already configured - not reconfiguring"
+}
 
 Write-Step "Building BattleShip + torch"
 cmake --build $BuildDir --config Release -j $Jobs
 if ($LASTEXITCODE -ne 0) { Fail "build failed" }
+if (-not $BsHash) { $BsHash = Get-BsInputHash }
+Set-Content -Path $BsStamp -Value $BsHash -Encoding ascii
 }
 
 # ── 2. Build f3d.o2r (zip of LUS shaders, ROM-independent) ──
 Write-Step "Packaging Fast3D shader archive"
 $F3DO2R = Join-Path $BuildDir "f3d.o2r"
-if (-not $SkipBuild -or -not (Test-Path $F3DO2R)) {
-if (Test-Path $F3DO2R) { Remove-Item $F3DO2R -Force }
 $ShaderSrc = Join-Path $Root "libultraship\src\fast\shaders"
+$F3DStale = (-not (Test-Path $F3DO2R)) -or
+    ((Get-ChildItem -Path $ShaderSrc -Recurse -File | Where-Object { $_.LastWriteTimeUtc -gt (Get-Item $F3DO2R).LastWriteTimeUtc } | Select-Object -First 1) -ne $null)
+if (-not $SkipBsBuild -and $F3DStale -or -not (Test-Path $F3DO2R)) {
+if (Test-Path $F3DO2R) { Remove-Item $F3DO2R -Force }
 # Entry names must use forward slashes ("shaders/directx/..."): libultraship
 # looks shaders up by those names. Windows PowerShell 5.1's Compress-Archive
 # writes backslashes (and rejects a .o2r destination), which ships a release
@@ -164,6 +287,7 @@ New-Item -ItemType Directory -Path $StageDir | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $StageDir "yamls\$Ver") | Out-Null
 
 Copy-Item $GameExe        (Join-Path $StageDir "$AppName.exe")
+Set-ExeVersion (Join-Path $StageDir "$AppName.exe") ((Get-Content (Join-Path $Root "VERSION") -Raw).Trim())
 Copy-Item $TorchExe      (Join-Path $StageDir "torch.exe")
 Copy-Item $F3DO2R        (Join-Path $StageDir "f3d.o2r")
 Copy-Item (Join-Path $Root "gamecontrollerdb.txt") $StageDir
@@ -236,17 +360,28 @@ Get-ChildItem -Path $ExeBuildDir -Filter "*.dll" | ForEach-Object {
 # RetroHub (the launcher BattleShip.exe hands off to) + n64run + the
 # mupen64plus emulator files for the non-native games. Built from the sibling
 # ..\RetroHub checkout; skipped with a warning if it isn't there.
-$HubRoot = if ($env:RETROHUB_DIR) { $env:RETROHUB_DIR } else { Join-Path (Split-Path $Root -Parent) "RetroHub" }
+$HubRoot = if ($RetroHubDir) { $RetroHubDir } elseif ($env:RETROHUB_DIR) { $env:RETROHUB_DIR } else { Join-Path (Split-Path $Root -Parent) "RetroHub" }
 if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     Write-Step "Building RetroHub"
     $HubBuild = if ($env:RETROHUB_BUILD_DIR) { $env:RETROHUB_BUILD_DIR } else { Join-Path $HubRoot "build" }
     # RetroHub reports (and its updater compares) the release version, not its own dev number.
     if (-not $SkipBuild) {
     $RelVer = (Get-Content (Join-Path $Root "VERSION") -Raw).Trim()
-    Set-Content -Path (Join-Path $HubRoot "VERSION") -Value $RelVer -NoNewline -Encoding ascii
-    cmake -S $HubRoot -B $HubBuild | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail "RetroHub configure failed" }
-    cmake --build $HubBuild --config Release
+    $HubVerFile = Join-Path $HubRoot "VERSION"
+    # Only write when different (the version files are generated at build time from it; no reconfigure needed).
+    if (-not (Test-Path $HubVerFile) -or ((Get-Content $HubVerFile -Raw).Trim() -ne $RelVer)) {
+        Set-Content -Path $HubVerFile -Value $RelVer -NoNewline -Encoding ascii
+    }
+    if (-not (Test-Path (Join-Path $HubBuild "CMakeCache.txt"))) {
+        cmake -S $HubRoot -B $HubBuild | Out-Null
+        if ($LASTEXITCODE -ne 0) { Fail "RetroHub configure failed" }
+    }
+    # Only what ships (not the ~75 test executables); `cmake --build` reconfigures by itself if a CMakeLists changed.
+    if ($BuildAllHub) {
+        cmake --build $HubBuild --config Release -j $Jobs
+    } else {
+        cmake --build $HubBuild --config Release -j $Jobs --target RetroHub n64run retrorun streamrun mgba_link_libretro sameboy_rb_libretro beetle_psx_libretro
+    }
     if ($LASTEXITCODE -ne 0) { Fail "RetroHub build failed" }
     }
     $HubBin = Join-Path $HubBuild "bin\Release"
@@ -360,7 +495,7 @@ if ($EnableScripting) {
 # ── 5. Zip ──
 Write-Step "Compressing $ZipPath"
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-& (Join-Path $PSScriptRoot "zip-portable.ps1") -Source $StageDir -Destination $ZipPath
+& (Join-Path $PSScriptRoot "zip-portable.ps1") -Source $StageDir -Destination $ZipPath -Level $ZipLevel
 if (-not (Test-Path $ZipPath)) { Fail "zip was not created" }
 
 # ── 6. Setup exe (Inno Setup 6) from the same staged files ──
@@ -383,7 +518,7 @@ if ($Ver -eq "us" -and $env:SKIP_INSTALLER -ne "1") {
 }
 if ($Iscc) {
     $AppVer = (Get-Content (Join-Path $Root "VERSION") -Raw).Trim().TrimStart('v','V')
-    & $Iscc "/Qp" "/DSourceDir=$StageDir" "/DAppVersion=$AppVer" "/DOutputDir=$DistDir" (Join-Path $Root "installer\RetroHub.iss")
+    & $Iscc "/Qp" "/DSourceDir=$StageDir" "/DAppVersion=$AppVer" "/DOutputDir=$DistDir" "/DSetupCompression=$SetupCompression" (Join-Path $Root "installer\RetroHub.iss")
     if ($LASTEXITCODE -ne 0) { Fail "ISCC failed" }
     $SetupPath = Join-Path $DistDir "RetroHub-Setup.exe"
     if (-not (Test-Path $SetupPath)) { Fail "RetroHub-Setup.exe was not created" }
@@ -406,6 +541,7 @@ Write-Host "Checksums ready: $SumsPath" -ForegroundColor Green
 $SumLines | ForEach-Object { Write-Host "   $_" }
 
 $ZipKB = [int]((Get-Item $ZipPath).Length / 1024)
+Show-Timings
 Write-Host "`nRelease zip ready: $ZipPath ($ZipKB KB)" -ForegroundColor Green
 Write-Host "   Portable: extract anywhere; save data lives next to BattleShip.exe."
 if ($EnableScripting) {

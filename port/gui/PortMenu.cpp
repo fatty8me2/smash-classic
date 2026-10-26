@@ -12,6 +12,7 @@
 #include "../enhancements/enhancements.h"
 #include "../interpolation/frame_interpolation.h"
 #include "../net/netlobby.h"
+#include "../build_version.h"
 #ifdef PORT_HIRES_ENABLED
 #include "../hires/HiResPack.h"
 #endif

@@ -31,6 +31,7 @@
 #include "port_ws.h"
 #include "port_log.h"
 #include "netrules.h"
+#include "../build_version.h"
 
 #include <libultraship/bridge/consolevariablebridge.h>
 
@@ -477,11 +478,7 @@ void host_rules(int *autoz, int *comp, int *neutral, int *hazards_off)
     *hazards_off = CVarGetInteger("gEnhancements.StageHazardsDisabled", 0) != 0;
 }
 
-#ifdef BATTLESHIP_CURRENT_VERSION
 const char *const kGameVersion = BATTLESHIP_CURRENT_VERSION;
-#else
-const char *const kGameVersion = "dev";
-#endif
 
 /* Two different builds can simulate the same inputs differently, so an online
  * match only starts when every player runs the same version. Returns true
