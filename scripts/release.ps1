@@ -85,9 +85,9 @@ if (-not $AllowDirty) {
 GitC $Root fetch fatty main | Out-Null
 GitC $Hub fetch origin main | Out-Null
 & git -C $Root merge-base --is-ancestor fatty/main HEAD
-if ($LASTEXITCODE -ne 0) { Die "fatty/main has commits that $BattleShipBranch lacks (merge/rebase first)" }
+if ($LASTEXITCODE -ne 0) { if ($DryRun) { Write-Host "WARNING: fatty/main has commits that $BattleShipBranch lacks (a real run would stop here)" -ForegroundColor Yellow } else { Die "fatty/main has commits that $BattleShipBranch lacks (merge/rebase first)" } }
 & git -C $Hub merge-base --is-ancestor origin/main HEAD
-if ($LASTEXITCODE -ne 0) { Die "origin/main has commits that RetroHub main lacks (pull first)" }
+if ($LASTEXITCODE -ne 0) { if ($DryRun) { Write-Host "WARNING: origin/main has commits that RetroHub $RetroHubBranch lacks (a real run would stop here)" -ForegroundColor Yellow } else { Die "origin/main has commits that RetroHub $RetroHubBranch lacks (pull first)" } }
 foreach ($pair in @(@($BsRepo, "BattleShip"), @($HubRepo, "RetroHub"))) {
     & gh release view $Tag -R $pair[0] *> $null
     if ($LASTEXITCODE -eq 0) { Die "release $Tag already exists on $($pair[0])" }
