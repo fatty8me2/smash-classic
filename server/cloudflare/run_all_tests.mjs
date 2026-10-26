@@ -29,6 +29,7 @@ const SUITE = [
   { file: "test_link_bruteforce.mjs", kind: "http", vars: { LINK_REDEEM_LIMIT: "5", LINK_GLOBAL_LIMIT: "12" } },
   { file: "test_usernames.mjs", kind: "http" },
   { file: "test_presence.mjs", kind: "http" },
+  { file: "test_playtime.mjs", kind: "ws", vars: { TEST_PT_STALE_MS: "0" } },
   { file: "test_relay.mjs", kind: "ws" },
   { file: "test_retire.mjs", kind: "ws", vars: { TEST_RETIRE_FAIL_AFTER: "1", ADMIN_UID: ADMIN } },
   { file: "test_ask.mjs", kind: "self", env: { ASK_TEST_PORT: "10061" } },

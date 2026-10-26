@@ -39,6 +39,10 @@ const INBOX_TTL = 30 * 24 * 3600 * 1000;
 const MAX_HISTORY = 200;
 const INVITE_TTL = 30 * 60 * 1000;
 export const ONLINE_LEASE_MS = PRESENCE_LEASE_MS;   // 10 min (was 3): the refresh alarm fires every lease/3 (see reqbudget_core.js)
+// Friends' play time: per game key, coarse minutes, top PT_MAX_GAMES per user. Friends pull it (cached PT_STALE_MS per friend).
+export const PT_MAX_GAMES = 30;
+export const PT_STALE_MS = 6 * 3600 * 1000;
+const PT_PULLS_PER_GET = 12;
 const RANK = { offline: 0, online: 1, in_lobby: 2, in_game: 3 };
 
 const now = () => Date.now();
@@ -79,6 +83,21 @@ function sanitizeStatus(s) {
   if (n(s.players) !== undefined) out.players = s.players;
   if (n(s.max_players) !== undefined) out.max_players = s.max_players;
   return out;
+}
+
+/* Client playtime payload [{k,t,m}] -> top PT_MAX_GAMES clean rows (key, title, whole minutes, highest first). */
+export function sanitizePlaytime(games) {
+  if (!Array.isArray(games)) return [];
+  const seen = new Map();
+  for (const g of games.slice(0, 200)) {
+    if (!g || typeof g !== "object") continue;
+    const k = clean(g.k, 64);
+    const m = Math.floor(Number(g.m));
+    if (!k || !Number.isFinite(m) || m < 1) continue;
+    const t = clean(g.t, 48) || k;
+    seen.set(k, { k, t, m: Math.min(m, 600000) });
+  }
+  return [...seen.values()].sort((a, b) => b.m - a.m).slice(0, PT_MAX_GAMES);
 }
 
 const offlineStatus = () => ({ state: "offline", updated: now() });
@@ -325,6 +344,8 @@ export class UserHub extends DurableObject {
     q("CREATE INDEX IF NOT EXISTS history_peer ON history (peer, at)");
     q("CREATE TABLE IF NOT EXISTS rl (k TEXT PRIMARY KEY, start INTEGER NOT NULL, n INTEGER NOT NULL)");
     q("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+    q("CREATE TABLE IF NOT EXISTS playtime (gkey TEXT PRIMARY KEY, title TEXT NOT NULL, mins INTEGER NOT NULL)");
+    for (const col of ["pt TEXT", "pt_at INTEGER"]) { try { q("ALTER TABLE friends ADD COLUMN " + col); } catch { /* already there */ } }
   }
 
   // ---- helpers ----------------------------------------------------------
@@ -732,6 +753,11 @@ export class UserHub extends DurableObject {
         this.push({ type: "presence", uid: from, name, status: st });
         return { r: "ok", name: p.name, st: this.effective() };
       }
+      case "pt_pull": {   // a friend asks for our play time: only friends, never blocked users; nothing when sharing is off / test account
+        if (!this.isFriend(from) || this.isBlocked(from)) return { r: "none" };
+        if (this.kvGet("pt_share") === "0" || this.isTestAccount()) return { r: "ok", pt: [] };
+        return { r: "ok", pt: this.all("SELECT gkey AS k, title AS t, mins AS m FROM playtime ORDER BY mins DESC LIMIT ?", PT_MAX_GAMES) };
+      }
       case "request": {
         const name = cleanName(b.name) || "player";
         // Blocked sender: fake "ok" so they cannot tell they are blocked (privacy). Their pending-request entry
@@ -1055,6 +1081,32 @@ export class UserHub extends DurableObject {
         if (!st) return this.err(ws, "bad-request", type);
         ws.serializeAttachment({ ...att, status: st });
         await this.broadcastPresence(false);
+        break;
+      }
+      case "playtime": {   // end of a game session: my per-game totals (or share:false = stop sharing and erase)
+        if (!this.hit("pt:w", 12, 3600 * 1000)) return this.err(ws, "rate-limited", type);
+        const share = msg.share !== false;
+        if (this.isTestAccount()) break;
+        this.kvSet("pt_share", share ? "1" : "0");
+        this.run("DELETE FROM playtime");
+        if (share) for (const g of sanitizePlaytime(msg.games)) this.run("INSERT INTO playtime (gkey, title, mins) VALUES (?, ?, ?)", g.k, g.t, g.m);
+        break;
+      }
+      case "playtime_get": {   // friends' totals from the cache; stale/unknown friends are refreshed (bounded) first
+        if (!this.hit("pt:r", 30, 3600 * 1000)) return this.err(ws, "rate-limited", type);
+        const stale = this.all("SELECT uid FROM friends WHERE pt_at IS NULL OR pt_at < ? ORDER BY pt_at LIMIT ?", now() - (this.env.TEST_PT_STALE_MS !== undefined ? Number(this.env.TEST_PT_STALE_MS) : PT_STALE_MS), PT_PULLS_PER_GET);
+        const got = await Promise.allSettled(stale.map((r) => this.call(r.uid, "pt_pull", { uid: p.uid })));
+        got.forEach((res, i) => {
+          const r = res.status === "fulfilled" ? res.value : null;
+          if (!r) return;   // unreachable: retried on the next request
+          this.run("UPDATE friends SET pt=?, pt_at=? WHERE uid=?", JSON.stringify(r.r === "ok" ? sanitizePlaytime(r.pt) : []), now(), stale[i].uid);
+        });
+        const out = {};
+        for (const r of this.all("SELECT uid, pt FROM friends WHERE pt IS NOT NULL")) {
+          let arr = []; try { arr = JSON.parse(r.pt); } catch { /* ignore */ }
+          if (arr.length) out[r.uid] = arr;
+        }
+        ws.send(JSON.stringify({ type: "playtime", friends: out }));
         break;
       }
       case "username_check": {
