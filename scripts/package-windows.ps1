@@ -58,8 +58,13 @@ if ($EnableScripting -and $Ver -eq "jp") {
 $DisableScripting = if ($EnableScripting) { "OFF" } else { "ON" }
 $PackageFlavor = if ($EnableScripting) { "scripting" } else { "standard" }
 $ZipSuffix = "-windows"
-$BuildDir = Join-Path $Root "build-bundle-win-$Ver-$PackageFlavor"
-$DistDir = Join-Path $Root "dist"
+$BuildDir = if ($env:SSB64_BUILD_DIR) { $env:SSB64_BUILD_DIR } else { Join-Path $Root "build-bundle-win-$Ver-$PackageFlavor" }
+# Dry-run knobs (QA): SSB64_DIST_DIR = scratch output dir instead of <root>\dist,
+# SSB64_SKIP_BUILD=1 = reuse existing build outputs (no codegen/cmake/RetroHub rebuild),
+# RETROHUB_DIR = RetroHub checkout (default: sibling ..\RetroHub), RETROHUB_BUILD_DIR = its build dir.
+$SkipBuild = $env:SSB64_SKIP_BUILD -eq "1"
+$DistDir = if ($env:SSB64_DIST_DIR) { $env:SSB64_DIST_DIR } else { Join-Path $Root "dist" }
+New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
 $AppName = if ($Ver -eq "jp") { "BattleShip-JP" } else { "BattleShip" }
 $StageName = $AppName
 $StageDir = Join-Path $DistDir $StageName
@@ -75,6 +80,7 @@ function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 # cmake builds scstaffroll.c. ROM-independent — same step CMake's
 # GenerateCreditsAssets target runs.
 Write-Step "Encoding credits text"
+if (-not $SkipBuild) {
 Push-Location (Join-Path $Root "decomp/src/credits")
 foreach ($f in @("staff.credits.us.txt", "titles.credits.us.txt")) {
     & python "$Root/tools/creditsTextConverter.py" $f | Out-Null
@@ -85,6 +91,7 @@ foreach ($f in @("info.credits.us.txt", "companies.credits.us.txt")) {
     if ($LASTEXITCODE -ne 0) { Pop-Location; Fail "credits encode failed: $f" }
 }
 Pop-Location
+}
 
 # ── 1. Configure + build (Release, portable) ──
 Write-Step "Configuring release build (portable, scripting=$EnableScripting)"
@@ -100,6 +107,7 @@ Write-Step "Configuring release build (portable, scripting=$EnableScripting)"
 # Windows Store stub); without a hint, CMake's find_package(Python3) can
 # resolve to a different interpreter than the one pip targeted, and the
 # CSS-arrow asset rules then fail with "Pillow is required" mid-build.
+if (-not $SkipBuild) {
 $PythonExe = (Get-Command python).Source
 Write-Host "Using Python: $PythonExe"
 cmake -B $BuildDir $Root `
@@ -113,10 +121,12 @@ if ($LASTEXITCODE -ne 0) { Fail "cmake configure failed" }
 Write-Step "Building BattleShip + torch"
 cmake --build $BuildDir --config Release -j $Jobs
 if ($LASTEXITCODE -ne 0) { Fail "build failed" }
+}
 
 # ── 2. Build f3d.o2r (zip of LUS shaders, ROM-independent) ──
 Write-Step "Packaging Fast3D shader archive"
 $F3DO2R = Join-Path $BuildDir "f3d.o2r"
+if (-not $SkipBuild -or -not (Test-Path $F3DO2R)) {
 if (Test-Path $F3DO2R) { Remove-Item $F3DO2R -Force }
 $ShaderSrc = Join-Path $Root "libultraship\src\fast\shaders"
 # Entry names must use forward slashes ("shaders/directx/..."): libultraship
@@ -124,6 +134,7 @@ $ShaderSrc = Join-Path $Root "libultraship\src\fast\shaders"
 # writes backslashes (and rejects a .o2r destination), which ships a release
 # whose renderer can't find a single shader.
 & (Join-Path $PSScriptRoot "zip-portable.ps1") -Source $ShaderSrc -Destination $F3DO2R -Prefix "shaders/"
+}
 if (-not (Test-Path $F3DO2R)) { Fail "f3d.o2r was not created" }
 
 # ── 3. Locate built artifacts ──
@@ -225,33 +236,42 @@ Get-ChildItem -Path $ExeBuildDir -Filter "*.dll" | ForEach-Object {
 # RetroHub (the launcher BattleShip.exe hands off to) + n64run + the
 # mupen64plus emulator files for the non-native games. Built from the sibling
 # ..\RetroHub checkout; skipped with a warning if it isn't there.
-$HubRoot = Join-Path (Split-Path $Root -Parent) "RetroHub"
+$HubRoot = if ($env:RETROHUB_DIR) { $env:RETROHUB_DIR } else { Join-Path (Split-Path $Root -Parent) "RetroHub" }
 if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     Write-Step "Building RetroHub"
-    $HubBuild = Join-Path $HubRoot "build"
+    $HubBuild = if ($env:RETROHUB_BUILD_DIR) { $env:RETROHUB_BUILD_DIR } else { Join-Path $HubRoot "build" }
     # RetroHub reports (and its updater compares) the release version, not its own dev number.
+    if (-not $SkipBuild) {
     $RelVer = (Get-Content (Join-Path $Root "VERSION") -Raw).Trim()
     Set-Content -Path (Join-Path $HubRoot "VERSION") -Value $RelVer -NoNewline -Encoding ascii
     cmake -S $HubRoot -B $HubBuild | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "RetroHub configure failed" }
     cmake --build $HubBuild --config Release
     if ($LASTEXITCODE -ne 0) { Fail "RetroHub build failed" }
+    }
     $HubBin = Join-Path $HubBuild "bin\Release"
     Copy-Item (Join-Path $HubBin "RetroHub.exe") $StageDir
     Copy-Item (Join-Path $HubBin "n64run.exe") $StageDir
     Copy-Item (Join-Path $HubBin "retrorun.exe") $StageDir
+    # Remote play host/guest. Required: Wii U / stream features break without it.
+    $StreamExe = Join-Path $HubBin "streamrun.exe"
+    if (-not (Test-Path $StreamExe)) { Fail "streamrun.exe not built (expected $StreamExe)" }
+    Copy-Item $StreamExe $StageDir
     # Cheat database + curated featured cheats (read from <exe dir>\data at run time).
     $DataDst = Join-Path $StageDir "data"
     New-Item -ItemType Directory -Path $DataDst -Force | Out-Null
+    # Everything in RetroHub data\ ships (new data files are picked up automatically); these must exist.
     foreach ($d in "cheats_db.bin", "cheats_featured.json", "changelog.json", "gameinfo.tsv") {
-        $src = Join-Path $HubRoot "data\$d"
-        if (-not (Test-Path $src)) { Fail "missing RetroHub data file $src" }
-        Copy-Item $src $DataDst
+        if (-not (Test-Path (Join-Path $HubRoot "data\$d"))) { Fail "missing RetroHub data file $d" }
     }
-    # libretro cores for GBA / GB / GBC / DS (mGBA MPL-2.0, SameBoy MIT, Gambatte GPL-2.0, melonDS DS GPL-3.0+)
+    Copy-Item (Join-Path $HubRoot "data\*") $DataDst -Recurse -Force
+    # libretro cores for GBA / GB / GBC / DS / NES / SNES (Nestopia, Snes9x; mGBA MPL-2.0, SameBoy MIT, Gambatte GPL-2.0, melonDS DS GPL-3.0+)
     $CoreSrc = Join-Path $HubRoot "deps\cores"
-    if (-not (Test-Path (Join-Path $CoreSrc "mgba_libretro.dll")) -or -not (Test-Path (Join-Path $CoreSrc "melondsds_libretro.dll"))) {
+    $NeedCores = "mgba", "melondsds", "nestopia", "snes9x" | Where-Object { -not (Test-Path (Join-Path $CoreSrc "$($_)_libretro.dll")) }
+    if ($NeedCores) {
+        # fetch-cores.ps1 verifies nestopia/snes9x against pinned SHA-256 (warns on drift).
         & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $HubRoot "scripts\fetch-cores.ps1")
+        if ($LASTEXITCODE -ne 0) { Fail "fetch-cores.ps1 failed" }
     }
     $CoreDst = Join-Path $StageDir "cores"
     New-Item -ItemType Directory -Path (Join-Path $CoreDst "info") -Force | Out-Null
@@ -268,6 +288,9 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     # Every other core RetroHub builds from source (e.g. beetle_psx_libretro.dll for PS1, MinGW).
     Get-ChildItem -Path (Join-Path $HubBin "cores") -File -Filter "*_libretro.dll" | ForEach-Object { Copy-Item $_.FullName $CoreDst -Force }
     if (-not (Test-Path (Join-Path $CoreDst "beetle_psx_libretro.dll"))) { Fail "beetle_psx_libretro.dll not built (PS1); build RetroHub with MinGW gcc" }
+    foreach ($c in "nestopia_libretro.dll", "snes9x_libretro.dll") {
+        if (-not (Test-Path (Join-Path $CoreDst $c))) { Fail "$c missing from cores (NES/SNES)" }
+    }
     Get-ChildItem -Path (Join-Path $CoreSrc "info") -File -Filter "*.info" -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName (Join-Path $CoreDst "info") }
     Copy-Item (Join-Path $HubBin "SDL2.dll") $StageDir -Force
 
@@ -311,6 +334,8 @@ The full license text is in mupen64plus-LICENSES.txt.
 cores\ contains unmodified libretro cores loaded by retrorun.exe:
 
   - mGBA (MPL-2.0), SameBoy (MIT), Gambatte (GPL-2.0)
+  - Nestopia UE (GPL-2.0) NES  source: https://github.com/libretro/nestopia
+  - Snes9x (non-commercial license) SNES  source: https://github.com/libretro/snes9x
   - mgba_link_libretro (mGBA 0.10.5 built from source, MPL-2.0)  source: https://github.com/mgba-emu/mgba
   - sameboy_rb_libretro (SameBoy MIT, libretro fork with a rollback determinism patch)  source: https://github.com/libretro/SameBoy
   - melonDS DS (GPL-3.0-or-later)  source: https://github.com/JesseTG/melonds-ds
