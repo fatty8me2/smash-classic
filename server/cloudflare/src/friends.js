@@ -14,6 +14,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { meter, gate, PRESENCE_LEASE_MS, presenceAlarmMs } from "./reqbudget.js";
 import { normalizeUsername, lookupKey, reasonToError, HOLD_MS, LEGACY_WINDOW_MS } from "./usernames.js";
+import { initGlib, isLibraryFrame, MAX_LIB_JSON, glibInfo, ownLibVer, setFriendLib, friendLibVer, dropFriendLib, clearAllLib, handleLibrary, handleFriendLibrary, internalLibGet } from "./gamelib.js";
 import { FixedWindow, onlineTargets, FRIENDS_MSGS_PER_MIN } from "./limits.js";
 
 const UID_RE = /^[a-z2-7]{26}$/;
@@ -325,6 +326,7 @@ export class UserHub extends DurableObject {
     q("CREATE INDEX IF NOT EXISTS history_peer ON history (peer, at)");
     q("CREATE TABLE IF NOT EXISTS rl (k TEXT PRIMARY KEY, start INTEGER NOT NULL, n INTEGER NOT NULL)");
     q("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+    initGlib(this.sql);
   }
 
   // ---- helpers ----------------------------------------------------------
@@ -428,18 +430,19 @@ export class UserHub extends DurableObject {
   }
 
   friendObj(r) {
-    return { uid: r.uid, code: r.code, name: r.name, status: JSON.parse(r.status), since: r.since };
+    return { uid: r.uid, code: r.code, name: r.name, status: JSON.parse(r.status), since: r.since, lib: friendLibVer(this, r.uid) };
   }
 
   async broadcastPresence(force, except) {
     const p = this.profile();
     if (!p) return;
     const eff = this.effective(except);
-    const key = JSON.stringify({ ...eff, updated: 0 }) + "|" + p.name;
+    const lib = ownLibVer(this);
+    const key = JSON.stringify({ ...eff, updated: 0 }) + "|" + p.name + "|" + lib;
     const prev = this.one("SELECT v FROM kv WHERE k='pres'");
     if (!force && prev && prev.v === key) return;
     this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('pres', ?)", key);
-    const payload = { uid: p.uid, name: p.name, status: eff };
+    const payload = { uid: p.uid, name: p.name, status: eff, lib };
     const isAdmin = !!this.env.ADMIN_UID && p.uid === this.env.ADMIN_UID;
     const rows = isAdmin
       ? this.all("SELECT uid FROM friends ORDER BY since ASC LIMIT ?", ADMIN_FANOUT)
@@ -461,6 +464,7 @@ export class UserHub extends DurableObject {
       const r = res.status === "fulfilled" ? res.value : null;
       const st = r && sanitizeStatus(r.st);
       if (st) this.run("UPDATE friends SET name=?, status=? WHERE uid=?", cleanName(r.name) || "player", JSON.stringify(st), targets[i]);
+      if (r && Number.isInteger(r.lib)) setFriendLib(this, targets[i], r.lib);
     });
   }
 
@@ -729,8 +733,9 @@ export class UserHub extends DurableObject {
         const st = sanitizeStatus(b.status) || offlineStatus();
         const name = cleanName(b.name) || "player";
         this.run("UPDATE friends SET name=?, status=? WHERE uid=?", name, JSON.stringify(st), from);
-        this.push({ type: "presence", uid: from, name, status: st });
-        return { r: "ok", name: p.name, st: this.effective() };
+        if (Number.isInteger(b.lib)) setFriendLib(this, from, b.lib);
+        this.push({ type: "presence", uid: from, name, status: st, lib: friendLibVer(this, from) });
+        return { r: "ok", name: p.name, st: this.effective(), lib: ownLibVer(this) };
       }
       case "request": {
         const name = cleanName(b.name) || "player";
@@ -824,9 +829,11 @@ export class UserHub extends DurableObject {
         if (!this.isFriend(from)) return { r: "none" };
         this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '1')", "norelink:" + from);
         this.run("DELETE FROM friends WHERE uid=?", from);
+        dropFriendLib(this, from);
         this.push({ type: "friend_removed", uid: from });
         return { r: "ok" };
       }
+      case "lib_get": return internalLibGet(this, from, b);
       case "msg": {
         const m = b.msg;
         if (!m || m.from !== from || m.to !== p.uid) return { r: "none" };
@@ -853,7 +860,7 @@ export class UserHub extends DurableObject {
     if (typeof message !== "string") return;
     const att = ws.deserializeAttachment();
     if (!att) return;
-    if (message.length > MAX_JSON) {
+    if (message.length > (isLibraryFrame(message) ? MAX_LIB_JSON : MAX_JSON)) {
       this.err(ws, "bad-request", undefined, "too-large");
       return;
     }
@@ -961,6 +968,7 @@ export class UserHub extends DurableObject {
         outgoing: reqs.filter((r) => r.dir === "out").map(strip),
       },
       blocked: this.all("SELECT uid FROM blocked").map((r) => r.uid),
+      lib: glibInfo(this),
       inbox: this.all("SELECT json FROM inbox ORDER BY at").map((r) => JSON.parse(r.json)),
     }));
     await this.broadcastPresence(renamed);
@@ -1091,6 +1099,7 @@ export class UserHub extends DurableObject {
           try { await this.call(f.uid, "friend_removed", { uid: p.uid }); } catch { /* peer unreachable */ }
         }
         this.run("DELETE FROM requests");
+        clearAllLib(this);
         this.setUsernameLocal(null, "none");
         this.kvSet("retired", p.uid);
         try { await this.setOnline(false); } catch { /* lease expires */ }
@@ -1264,6 +1273,7 @@ export class UserHub extends DurableObject {
         if (!this.isFriend(uid)) return this.err(ws, "not-friends", type, undefined);
         this.run("INSERT OR REPLACE INTO kv (k, v) VALUES (?, '1')", "norelink:" + uid);   // never auto re-add someone we removed
         this.run("DELETE FROM friends WHERE uid=?", uid);
+        dropFriendLib(this, uid);
         this.push({ type: "friend_removed", uid });
         try { await this.call(uid, "friend_removed", { uid: p.uid }); } catch { /* peer unreachable */ }
         break;
@@ -1280,6 +1290,7 @@ export class UserHub extends DurableObject {
         const hadIn = !!this.one("SELECT 1 FROM requests WHERE uid=? AND dir='in'", uid);
         const hadOut = !!this.one("SELECT 1 FROM requests WHERE uid=? AND dir='out'", uid);
         this.run("DELETE FROM friends WHERE uid=?", uid);
+        dropFriendLib(this, uid);
         this.run("DELETE FROM requests WHERE uid=?", uid);
         this.run("DELETE FROM inbox WHERE json LIKE ?", `%"from":"${uid}"%`);
         this.push({ type: "block_update", uid, blocked: true });
@@ -1360,6 +1371,7 @@ export class UserHub extends DurableObject {
         }
         const m = { id: crypto.randomUUID(), from: p.uid, from_name: p.name, to, kind: "ask",
                     ask: { game_id: clean(msg.game_id, 64), game_title: clean(msg.game_title, 64), system: clean(msg.system, 32) }, at: now() };
+        if (msg.host === true) m.ask.host = true;
         let ok = false, reason = "undeliverable";
         try {
           const r = await this.call(to, "msg", { uid: p.uid, msg: m });
@@ -1367,6 +1379,14 @@ export class UserHub extends DurableObject {
           if (r && r.r === "notfriend") reason = "not-friends";
         } catch { /* unreachable */ }
         try { ws.send(JSON.stringify(ok ? { type: "ask_result", to, ok: true } : { type: "ask_result", to, ok: false, reason })); } catch { /* closing */ }
+        break;
+      }
+      case "library": {
+        if (handleLibrary(this, ws, msg)) await this.broadcastPresence(true);
+        break;
+      }
+      case "friend_library": {
+        await handleFriendLibrary(this, ws, msg, uidArg, p);
         break;
       }
       case "prefs": {
