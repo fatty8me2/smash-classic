@@ -35,6 +35,7 @@ const SUITE = [
   { file: "test_ask.mjs", kind: "self", env: { ASK_TEST_PORT: "10061" } },
   { file: "test_room4.mjs", kind: "ws" },
   { file: "test_roster_sync.mjs", kind: "ws" },
+  { file: "test_gamelib.mjs", kind: "ws" },
 ];
 
 const filter = process.argv[2] || "";
