@@ -49,7 +49,7 @@ function Die($m) { Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
 function Run([string]$what, [scriptblock]$b) {
     if ($DryRun) { Write-Host "[dry-run] would: $what" -ForegroundColor Yellow } else { Write-Host "> $what"; & $b; if ($LASTEXITCODE -ne 0) { Die "$what failed (exit $LASTEXITCODE)" } }
 }
-function GitC($repo) { $a = @($args); $o = & git -C $repo @a 2>&1; if ($LASTEXITCODE -ne 0) { Die "git -C $repo $($a -join ' ') failed: $o" }; return ($o | Out-String).Trim() }
+function GitC($repo) { $a = @($args); $ErrorActionPreference = "Continue"; $o = & git -C $repo @a 2>&1; if ($LASTEXITCODE -ne 0) { Die "git -C $repo $($a -join ' ') failed: $o" }; return ($o | Out-String).Trim() }
 
 if ($Bare -notmatch '^\d+\.\d+\.\d+$') { Die "-Version must look like 1.27.3 (got '$Version')" }
 if (-not (Test-Path (Join-Path $Hub "CMakeLists.txt"))) { Die "RetroHub checkout not found at $Hub" }
