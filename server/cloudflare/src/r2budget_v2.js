@@ -37,6 +37,9 @@ class Rollback extends Error { constructor(why, extra = {}) { super(why); this.w
 export function initV2(d) {
   const s = d.sql;
   s.exec(`CREATE TABLE IF NOT EXISTS devices (uid TEXT NOT NULL, dev TEXT NOT NULL, name TEXT NOT NULL, first INTEGER NOT NULL, last_seen INTEGER NOT NULL, PRIMARY KEY(uid,dev))`);
+  // devices a PC owner signed out from another PC (Settings > Account > Linked PCs). The account secret is shared by all its PCs,
+  // so a revoked device id is refused (401 device-revoked) until that PC makes itself a new device id ("Sign in again").
+  s.exec(`CREATE TABLE IF NOT EXISTS revoked (uid TEXT NOT NULL, dev TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(uid,dev))`);
   s.exec(`CREATE TABLE IF NOT EXISTS games (uid TEXT NOT NULL, gkey TEXT NOT NULL, played_at INTEGER NOT NULL DEFAULT 0, device TEXT NOT NULL DEFAULT '',
     pin INTEGER NOT NULL DEFAULT 0, lease_dev TEXT, lease_since INTEGER NOT NULL DEFAULT 0, lease_until INTEGER NOT NULL DEFAULT 0, rev INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(uid,gkey))`);
   s.exec(`CREATE TABLE IF NOT EXISTS vers (uid TEXT NOT NULL, gkey TEXT NOT NULL, path TEXT NOT NULL, ver INTEGER NOT NULL, sha TEXT NOT NULL, size INTEGER NOT NULL,
@@ -127,6 +130,7 @@ function enter(d, q, now, o = {}) {
   if (!o.status && d.over()) return { res: E(429, "cloud-saves-busy-today", { retryAfter: 3600 }) };
   if (o.write && d.locked(now)) return { res: E(409, "busy", { retryAfter: 5 }) };
   const uid = q.uid;
+  if (q.dev && d.q(`SELECT 1 x FROM revoked WHERE uid=? AND dev=?`, uid, q.dev)[0]) return { res: E(401, "device-revoked") };
   let a = getAcct(d, uid);
   if (!a.v2) a = migrate(d, a, now);
   return { uid, a, c: cfg(d), nowS: sec(now) };
@@ -265,6 +269,35 @@ function opDevice(d, q, now) {
   }
   const devices = d.q(`SELECT dev,name,first,last_seen FROM devices WHERE uid=? ORDER BY first`, uid).map((r) => ({ dev: r.dev, name: r.name, first: r.first, lastSeen: r.last_seen }));
   return J({ r: "ok", devices });
+}
+
+const MAX_REVOKED = 64;   // remembered revoked device ids per account (oldest forgotten first)
+const devList = (d, uid, cur) => d.q(`SELECT dev,name,first,last_seen FROM devices WHERE uid=? ORDER BY first, rowid`, uid)
+  .map((r) => ({ dev: r.dev, name: r.name, first: r.first, lastSeen: r.last_seen, current: r.dev === cur }));
+
+// GET /saves/v2/devices: the PCs on this account (name, last seen). One cheap read; the hub asks once when Settings > Account opens.
+function opDevices(d, q, now) {
+  const e = enter(d, q, now, { status: true, cost: 2 }); if (e.res) return e.res;
+  seen(d, e.uid, q.dev, e.nowS);
+  return J({ r: "ok", devices: devList(d, e.uid, q.dev), max: 8 });
+}
+
+// POST /saves/v2/device/revoke {dev}: sign another PC out. The calling PC (X-RH-Device) can never revoke itself.
+function opDeviceRevoke(d, q, now) {
+  const e = enter(d, q, now, { write: false, cost: 2 }); if (e.res) return e.res;
+  const { uid, nowS } = e;
+  const b = q.body || {};
+  if (!q.dev || !DEV_RE.test(q.dev)) return E(400, "bad-device");
+  if (typeof b.dev !== "string" || !DEV_RE.test(b.dev)) return E(400, "bad-body");
+  if (b.dev === q.dev) return E(400, "cannot-revoke-self");
+  if (!d.q(`SELECT 1 x FROM devices WHERE uid=? AND dev=?`, uid, b.dev)[0]) return E(404, "not-found");
+  d.ctx.storage.transactionSync(() => {
+    d.q(`DELETE FROM devices WHERE uid=? AND dev=?`, uid, b.dev);
+    d.q(`UPDATE games SET lease_dev=NULL, lease_until=0 WHERE uid=? AND lease_dev=?`, uid, b.dev);
+    d.q(`INSERT OR REPLACE INTO revoked(uid,dev,at) VALUES(?,?,?)`, uid, b.dev, nowS);
+    d.q(`DELETE FROM revoked WHERE uid=? AND dev NOT IN (SELECT dev FROM revoked WHERE uid=? ORDER BY at DESC, dev LIMIT ?)`, uid, uid, MAX_REVOKED);
+  });
+  return J({ r: "ok", devices: devList(d, uid, q.dev) });
 }
 
 // ---- plan ----
@@ -568,7 +601,7 @@ export function idleSweep(d, c, nowS, dels, force = false) {
 }
 function removeAll(d, uid, nowS, dels) {
   for (const v of d.q(`SELECT DISTINCT rkey FROM vers WHERE uid=? AND rkey IS NOT NULL`, uid)) markDead(d, v.rkey, nowS, dels);
-  d.q(`DELETE FROM vers WHERE uid=?`, uid); d.q(`DELETE FROM games WHERE uid=?`, uid); d.q(`DELETE FROM devices WHERE uid=?`, uid);
+  d.q(`DELETE FROM vers WHERE uid=?`, uid); d.q(`DELETE FROM games WHERE uid=?`, uid); d.q(`DELETE FROM devices WHERE uid=?`, uid); d.q(`DELETE FROM revoked WHERE uid=?`, uid);
   d.q(`DELETE FROM tickets WHERE uid=?`, uid);
   d.q(`UPDATE accts SET vused=0, vprot=0, rev=rev+1 WHERE uid=?`, uid);
 }
@@ -730,6 +763,8 @@ function v2Switch(d, q, now) {
     case "v2_status": return opStatus(d, q, now);
     case "v2_manifest": return opManifest(d, q, now);
     case "v2_device": return opDevice(d, q, now);
+    case "v2_devices": return opDevices(d, q, now);
+    case "v2_device_revoke": return opDeviceRevoke(d, q, now);
     case "v2_plan": return opPlan(d, q, now);
     case "v2_blob_begin": return opBlobBegin(d, q, now);
     case "v2_commit": return opCommit(d, q, now);

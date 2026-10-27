@@ -76,6 +76,45 @@ phases.push(["A", async () => withServer(BASE_PORT, { SAVES_RATE_PC: "1000", SAV
   const over = await api.device(C, devId(), "ninth");
   check(over.status === 403 && over.data.error === "device-limit", "ninth active device -> 403 device-limit");
 
+  // ---- linked PCs: list + revoke (Settings > Account) ----
+  {
+    const reg = (a, d, n) => api.call(a, "POST", "/saves/v2/device", { json: { dev: d, name: n }, dev: d });
+    const L = await account(BASE);
+    const e1 = devId(), e2 = devId(), e3 = devId();
+    await reg(L, e1, "PC-ONE"); await reg(L, e2, "PC-TWO"); await reg(L, e3, "PC-THREE");
+    const ls = await api.call(L, "GET", "/saves/v2/devices", { dev: e1 });
+    check(ls.status === 200 && ls.data.devices.length === 3 && ls.data.devices.map((x) => x.name).join() === "PC-ONE,PC-TWO,PC-THREE", "devices: lists name per PC");
+    check(ls.data.devices.filter((x) => x.current).length === 1 && ls.data.devices.find((x) => x.current).dev === e1 && ls.data.devices.every((x) => x.lastSeen > 0), "devices: marks the calling PC, has last seen");
+    check((await api.call(null, "GET", "/saves/v2/devices")).status === 401, "devices: needs auth");
+    check((await api.call(B, "GET", "/saves/v2/devices", { dev: e1 })).data.devices.length === 0, "devices: another account sees none of these PCs");
+    const self = await api.call(L, "POST", "/saves/v2/device/revoke", { json: { dev: e1 }, dev: e1 });
+    check(self.status === 400 && self.data.error === "cannot-revoke-self", "revoke: a PC cannot revoke itself");
+    const nohdr = await api.call(L, "POST", "/saves/v2/device/revoke", { json: { dev: e2 } });
+    check(nohdr.status === 400 && nohdr.data.error === "bad-device", "revoke: needs the caller's device header");
+    check((await api.call(B, "POST", "/saves/v2/device/revoke", { json: { dev: e2 }, dev: devId() })).status === 404, "revoke: another account cannot touch these PCs");
+    check((await api.call(L, "POST", "/saves/v2/device/revoke", { json: { dev: devId() }, dev: e1 })).status === 404, "revoke: unknown PC -> 404");
+    check((await api.call(L, "POST", "/saves/v2/device/revoke", { json: { dev: "BAD ID" }, dev: e1 })).status === 400, "revoke: bad id -> 400");
+    check((await api.status(L, e2)).status === 200, "revoked-to-be PC still works before the revoke");
+    const rv = await api.call(L, "POST", "/saves/v2/device/revoke", { json: { dev: e2 }, dev: e1 });
+    check(rv.status === 200 && rv.data.devices.length === 2 && !rv.data.devices.some((x) => x.dev === e2), "revoke: PC removed from the list");
+    const after = await api.status(L, e2);
+    check(after.status === 401 && after.data.error === "device-revoked", "revoked PC: next call -> 401 device-revoked");
+    check((await api.manifest(L, "", e2)).status === 401, "revoked PC: manifest refused too");
+    const re = await reg(L, e2, "PC-TWO");
+    check(re.status === 401 && re.data.error === "device-revoked", "revoked PC cannot register again under the same id");
+    check((await api.status(L, e1)).status === 200 && (await api.status(L, e3)).status === 200, "other PCs keep working");
+    const e4 = devId();
+    check((await reg(L, e4, "PC-TWO")).status === 200, "the same PC signs in again with a NEW device id");
+    check((await api.call(L, "GET", "/saves/v2/devices", { dev: e4 })).data.devices.length === 3, "list: new id counted, revoked one gone");
+    // a full account (8 PCs): revoking one frees the slot for a ninth
+    const F = await account(BASE);
+    const f = Array.from({ length: 8 }, () => devId());
+    for (const [i, d] of f.entries()) await reg(F, d, "pc" + i);
+    check((await reg(F, devId(), "ninth")).status === 403, "8 active PCs: ninth refused");
+    await api.call(F, "POST", "/saves/v2/device/revoke", { json: { dev: f[7] }, dev: f[0] });
+    check((await reg(F, devId(), "ninth")).status === 200, "after a revoke the ninth PC fits");
+  }
+
   // ---- first push: classes, dedup, compression ----
   const ssb = rnd(2000), meta = Buffer.from('{"k":1}'), state = rnd(100000), shot = rnd(3000);
   let r = await api.push(A, G, [{ path: "battery/ssb64.sra", data: ssb, mtime: 100 }, { path: "meta.json", data: meta, mtime: 101 },
