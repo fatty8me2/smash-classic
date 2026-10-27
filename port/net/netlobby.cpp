@@ -1472,6 +1472,36 @@ extern "C" void port_netlobby_set_match_note(const char *note)
     sLobby.match_note = note ? note : "";
 }
 
+/* RetroHub rivalries: when SSB64_RESULT_FILE is set, write the finished online match as small JSON for the hub to read.
+ * Player i of the battle is match member i; "slot" is the lobby slot (the hub maps it to an account). Written before
+ * on_match_end clears the match. place: 0 = winner, higher = knocked out earlier. */
+extern "C" void port_netlobby_report_result(int count, const unsigned char *fkind, const unsigned char *place,
+                                            const signed char *stocks, const int *kos, const int *falls)
+{
+    const char *path = env("SSB64_RESULT_FILE");
+    if (path == nullptr || sLobby.state != PORT_NETLOBBY_IN_MATCH || sLobby.match.size() < 2) {
+        return;
+    }
+    std::string j = "{\"v\":1,\"game\":\"smash64\",\"id\":\"" + sLobby.code + "-" + std::to_string(sLobby.seed) +
+                    "\",\"code\":\"" + sLobby.code + "\",\"players\":[";
+    bool first = true;
+    for (int i = 0; i < count && i < static_cast<int>(sLobby.match.size()); ++i) {
+        if (!first) {
+            j += ",";
+        }
+        first = false;
+        j += "{\"slot\":" + std::to_string(sLobby.match[i].slot) + ",\"char\":" + std::to_string(fkind[i]) +
+             ",\"place\":" + std::to_string(place[i]) + ",\"stocks\":" + std::to_string(stocks[i]) +
+             ",\"kos\":" + std::to_string(kos[i]) + ",\"falls\":" + std::to_string(falls[i]) + "}";
+    }
+    j += "]}
+";
+    if (FILE *f = std::fopen(path, "wb")) {
+        std::fwrite(j.data(), 1, j.size(), f);
+        std::fclose(f);
+    }
+}
+
 extern "C" void port_netlobby_on_match_end(void)
 {
     port_netrules_clear();
