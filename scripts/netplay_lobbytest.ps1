@@ -114,7 +114,7 @@ function Start-Peer([int]$index) {
         SSB64_NETPLAY_TEST_MINUTES = $(if ($MatchMinutes) { "$MatchMinutes" } else { "" })
         SSB64_NETPLAY_SIM_LATENCY_MS = "$LatencyMs"; SSB64_NETPLAY_SIM_JITTER_MS = "$JitterMs"
         SSB64_NETPLAY_SIM_LOSS_PCT = "$LossPct"; SSB64_NETPLAY_SIM_SEED = "$(111 * ($index + 1))"
-        SSB64_NETPLAY_CONFIRMED_TRACE = "$out\$role.trace"; SSB64_LOG_PATH = "$out\$role.log"
+        SSB64_NETPLAY_CONFIRMED_TRACE = "$out\$role.trace"; SSB64_LOG_PATH = "$out\$role.log"; SSB64_RESULT_FILE = "$out\$role.result.json"
         SSB64_LOBBY_FORCE_RELAY = $(if ($ForceRelay) { "1" } else { "" })
         SSB64_LOBBY_RELAY_PEER = $(if ($RelayPeer -ge 0 -and $index -ne $RelayPeer) { "$RelayPeer" } else { "" })
     }
