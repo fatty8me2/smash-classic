@@ -14,6 +14,26 @@ u8 port_diag_get_scene_curr(void)
 	return gSCManagerSceneData.scene_curr;
 }
 
+/* 1 on the title screen and the plain menu scenes, where a prompt cannot cover gameplay. Everything else (matches, 1P stages,
+ * character/stage select feeding a match, results, demos, cutscenes) is 0. Used by UpdatePrompt so it never pops up mid-game. */
+int port_diag_scene_is_menu(void)
+{
+	switch (gSCManagerSceneData.scene_curr) {
+	case nSCKindTitle:
+	case nSCKindModeSelect:
+	case nSCKind1PMode:
+	case nSCKindVSMode:
+	case nSCKindVSOptions:
+	case nSCKindVSItemSwitch:
+	case nSCKindOption:
+	case nSCKindData:
+	case nSCKindSoundTest:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 u8 port_diag_get_scene_prev(void)
 {
 	return gSCManagerSceneData.scene_prev;

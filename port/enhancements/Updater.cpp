@@ -170,10 +170,8 @@ try {
     Start-Process -FilePath $GamePath -WorkingDirectory $InstallDir
 } catch {
     $message = "Could not install Smash Classic " + $Version + ": " + $_.Exception.Message + "`nThe previous version will be opened."
-    try {
-        Add-Type -AssemblyName System.Windows.Forms
-        [System.Windows.Forms.MessageBox]::Show($message, "Smash Classic Update", "OK", "Error") | Out-Null
-    } catch { }
+    # No MessageBox: it could land on top of a game. The error goes to a log next to the game instead.
+    try { Add-Content -LiteralPath (Join-Path $InstallDir "update-error.log") -Value ((Get-Date -Format s) + " " + $message) } catch { }
     Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath ($ZipPath + ".started") -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue

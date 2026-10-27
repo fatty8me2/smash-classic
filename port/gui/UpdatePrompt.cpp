@@ -1,6 +1,9 @@
 #include "UpdatePrompt.h"
 
 #include "../enhancements/enhancements.h"
+#include "../net/netlobby.h"
+
+extern "C" int port_diag_scene_is_menu(void);
 
 #include <imgui.h>
 
@@ -55,8 +58,19 @@ void UpdatePromptWindow::InitElement() {
 void UpdatePromptWindow::UpdateElement() {
 }
 
+/* The prompt may only be open on the title / menu screens and with no online room or match: never over gameplay. */
+static bool PromptSafeNow() {
+    return port_diag_scene_is_menu() != 0 &&
+           (port_netlobby_state() == PORT_NETLOBBY_IDLE || port_netlobby_state() == PORT_NETLOBBY_FAILED);
+}
+
 void UpdatePromptWindow::Draw() {
-    if (!mPrompted && enhancements::IsUpdateAvailable() && !enhancements::IsLatestVersionSkipped()) {
+    const bool safe = PromptSafeNow();
+    if (!safe && IsVisible() && !enhancements::IsDownloading() && !enhancements::IsDownloadComplete()) {
+        Hide();            // a match or online session began: close it, and offer it again at the next menu
+        mPrompted = false;
+    }
+    if (safe && !mPrompted && enhancements::IsUpdateAvailable() && !enhancements::IsLatestVersionSkipped()) {
         mPrompted = true;
         Show();
     }
