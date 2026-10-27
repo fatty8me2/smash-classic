@@ -1494,8 +1494,7 @@ extern "C" void port_netlobby_report_result(int count, const unsigned char *fkin
              ",\"place\":" + std::to_string(place[i]) + ",\"stocks\":" + std::to_string(stocks[i]) +
              ",\"kos\":" + std::to_string(kos[i]) + ",\"falls\":" + std::to_string(falls[i]) + "}";
     }
-    j += "]}
-";
+    j += "]}\n";
     if (FILE *f = std::fopen(path, "wb")) {
         std::fwrite(j.data(), 1, j.size(), f);
         std::fclose(f);
