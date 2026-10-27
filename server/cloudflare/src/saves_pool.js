@@ -28,6 +28,7 @@ export function classifyPath(rel, size = 0) {
   const seg0 = parts[0].toLowerCase();
   const name = parts[parts.length - 1].toLowerCase();
   if (seg0 === "_account" || name === "meta.json") return "settings";
+  if (parts.length === 1 && name === "cover.png") return "settings";   // the user's custom cover at the game root
   if (seg0 === "states") return SHOT_EXT.has(extOf(name)) ? "shot" : "state";
   if (CARD_EXT.has(extOf(name))) return "card";
   if (seg0 === "battery") return "battery";
