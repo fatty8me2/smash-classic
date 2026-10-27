@@ -653,6 +653,15 @@ phases.push(["E", async () => withServer(BASE_PORT + 10, { ACCOUNT_CAP: "100000"
   await totalMatchesIndex(api, "oversized conversion");
 }, {})]);
 
+// G: GET /saves/v2/devices obeys the saves share of the daily request budget (it is not a free "status" probe)
+phases.push(["G", async () => withServer(BASE_PORT + 11, { DAILY_REQ_CAP: "10", SAVES_RATE_META: "1000" }, async (srv, api) => {
+  console.log("--- phase G: devices obeys the daily guard ---");
+  const A = await account(srv.BASE), d = devId();
+  let last = 0;
+  for (let i = 0; i < 4; i++) last = (await api.call(A, "GET", "/saves/v2/devices", { dev: d })).status;
+  check(last === 429, "devices: over the saves cap of the daily budget -> 429 (not exempt like status)");
+})]);
+
 for (const [name, fn] of phases) if (!want.length || want.includes(name)) await fn();
 console.log(st.fails ? `${st.fails} FAILED` : "ALL PASSED");
 process.exit(st.fails ? 1 : 0);

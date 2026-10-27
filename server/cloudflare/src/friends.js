@@ -1136,9 +1136,17 @@ export class UserHub extends DurableObject {
         break;
       }
       case "watch_online": {   // the friends I want a "came online" ping for (replaces the list; friends only, at most MAX_WATCH)
-        if (!this.hit("watch", 20, 60 * 1000)) return this.err(ws, "rate-limited", type);
+        // In-memory limiter (the SQL `hit` would itself write rows): about 4 changes per 10 minutes per socket.
+        this.watchRl = this.watchRl || new FixedWindow(4, 10 * 60 * 1000);
+        this.watchIds = this.watchIds || new WeakMap();
+        if (!this.watchIds.has(ws)) this.watchIds.set(ws, (this.watchSeq = (this.watchSeq || 0) + 1));
+        if (!this.watchRl.hit(this.watchIds.get(ws))) return this.err(ws, "rate-limited", type);
+        if (!gate(this.env).relayFrames) return this.err(ws, "rate-limited", type, "busy");   // >= 90% of the daily budget: no writes
         const list = cleanWatch(msg.uids, (u) => this.isFriend(u));
-        if (list.length) this.kvSet("watch", JSON.stringify(list)); else this.run("DELETE FROM kv WHERE k='watch'");
+        const text = list.length ? JSON.stringify(list) : null;
+        if (text !== this.kvGet("watch")) {   // unchanged list: no row written
+          if (text) this.kvSet("watch", text); else this.run("DELETE FROM kv WHERE k='watch'");
+        }
         ws.send(JSON.stringify({ type: "watch_online", uids: list }));
         break;
       }

@@ -277,7 +277,7 @@ const devList = (d, uid, cur) => d.q(`SELECT dev,name,first,last_seen FROM devic
 
 // GET /saves/v2/devices: the PCs on this account (name, last seen). One cheap read; the hub asks once when Settings > Account opens.
 function opDevices(d, q, now) {
-  const e = enter(d, q, now, { status: true, cost: 2 }); if (e.res) return e.res;
+  const e = enter(d, q, now, { cost: 2 }); if (e.res) return e.res;
   seen(d, e.uid, q.dev, e.nowS);
   return J({ r: "ok", devices: devList(d, e.uid, q.dev), max: 8 });
 }
