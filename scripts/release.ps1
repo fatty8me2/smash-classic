@@ -170,7 +170,7 @@ if ($DeployWorker) {
     try { & npx wrangler deploy; if ($LASTEXITCODE -ne 0) { Die "wrangler deploy failed (commits are already pushed; assets are in $Dist)" } } finally { Pop-Location }
 }
 
-# ── 7. GitHub releases (same three assets on both repos) ──
+# ── 7. GitHub releases (retrohub; smash-classic too with -AlsoSmashClassic) ──
 Step "Creating GitHub releases"
 $title = $Tag
 if ($AlsoSmashClassic) { & gh release create $Tag @assets -R $BsRepo --target main --title $title -F $NotesFile }
@@ -178,6 +178,6 @@ if ($AlsoSmashClassic -and $LASTEXITCODE -ne 0) { Die "gh release create failed 
 & gh release create $Tag @assets -R $HubRepo --target main --title $title --latest -F $NotesFile
 if ($LASTEXITCODE -ne 0) { Die "gh release create failed for $HubRepo (retry with: gh release create $Tag <assets> -R $HubRepo --latest)" }
 
-Write-Host ("`nReleased $Tag on both repos in {0:N0}s" -f $sw.Elapsed.TotalSeconds) -ForegroundColor Green
-Write-Host "   https://github.com/$BsRepo/releases/tag/$Tag"
+Write-Host ("`nReleased $Tag on {0} in {1:N0}s" -f $(if ($AlsoSmashClassic) { "both repos" } else { $HubRepo }), $sw.Elapsed.TotalSeconds) -ForegroundColor Green
+if ($AlsoSmashClassic) { Write-Host "   https://github.com/$BsRepo/releases/tag/$Tag" }
 Write-Host "   https://github.com/$HubRepo/releases/tag/$Tag"
