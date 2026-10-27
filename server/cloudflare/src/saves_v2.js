@@ -15,6 +15,8 @@ const ROUTES = {
   "GET /saves/v2/status": { cls: "meta", op: "v2_status", status: true },
   "GET /saves/v2/manifest": { cls: "meta", op: "v2_manifest" },
   "POST /saves/v2/device": { cls: "meta", op: "v2_device", body: 8192 },
+  "GET /saves/v2/devices": { cls: "meta", op: "v2_devices" },
+  "POST /saves/v2/device/revoke": { cls: "meta", op: "v2_device_revoke", body: 8192 },
   "POST /saves/v2/plan": { cls: "pc", op: "v2_plan", body: 65536 },
   "POST /saves/v2/commit": { cls: "pc", op: "v2_commit", body: 8192 },
   "GET /saves/v2/blob": { cls: "get", op: "v2_blob_get", blob: true },

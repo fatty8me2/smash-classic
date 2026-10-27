@@ -45,6 +45,27 @@ export const PT_MAX_GAMES = 30;
 export const PT_STALE_MS = 6 * 3600 * 1000;
 const PT_PULLS_PER_GET = 12;
 const RANK = { offline: 0, online: 1, in_lobby: 2, in_game: 3 };
+// "Notify me when they come online": each account lists the friends it watches (opt-in, off by default). The check runs in the
+// WATCHER's own UserHub when the friend's presence arrives (no extra fan-out, no extra subrequests); at most MAX_WATCH friends.
+export const MAX_WATCH = 50;
+export const WATCH_COOLDOWN_MS = 10 * 60 * 1000;   // the same friend flapping offline/online pings once per 10 min
+
+/* Pure rule: should a presence change from `prev` to `next` ping a watcher? Offline (or unknown) -> not offline only. */
+export function cameOnline(prev, next) {
+  const was = !prev || !prev.state || prev.state === "offline";
+  return was && !!next && next.state !== "offline";
+}
+/* Pure: the stored watch list, cleaned (strings that look like uids, unique, friends only, at most MAX_WATCH). */
+export function cleanWatch(list, isFriend) {
+  const out = [];
+  if (!Array.isArray(list)) return out;
+  for (const u of list) {
+    if (typeof u !== "string" || !UID_RE.test(u) || out.includes(u) || !isFriend(u)) continue;
+    out.push(u);
+    if (out.length >= MAX_WATCH) break;
+  }
+  return out;
+}
 
 const now = () => Date.now();
 const codeOf = (uid) => {
@@ -388,6 +409,26 @@ export class UserHub extends DurableObject {
     for (const ws of this.authedSockets(except)) {
       try { ws.send(text); } catch { /* closing */ }
     }
+  }
+
+  /* Opt-in "came online" ping: only when the friend went offline -> online, only if we watch them, at most once per
+   * WATCH_COOLDOWN_MS per friend, and never at >= 90% of the daily request budget (same switch as the presence alarms).
+   * It is a push on sockets we already hold, so it costs no subrequest and no billed request. */
+  maybeNotifyOnline(uid, name, prev, next) {
+    if (!cameOnline(prev, next)) return;
+    const raw = this.kvGet("watch");
+    if (!raw || !raw.includes(uid)) return;
+    let list = [];
+    try { list = JSON.parse(raw); } catch { return; }
+    if (!Array.isArray(list) || !list.includes(uid)) return;
+    if (!gate(this.env).relayFrames) return;
+    const nowMs = now();
+    this.onlineNoted = this.onlineNoted || new Map();
+    const last = this.onlineNoted.get(uid) || 0;
+    if (nowMs - last < WATCH_COOLDOWN_MS) return;
+    this.onlineNoted.set(uid, nowMs);
+    if (this.onlineNoted.size > 100) this.onlineNoted.delete(this.onlineNoted.keys().next().value);
+    this.push({ type: "friend_online", uid, name, at: nowMs });
   }
 
   err(ws, reason, ref, detail) {
@@ -753,9 +794,12 @@ export class UserHub extends DurableObject {
         if (!this.isFriend(from)) return { r: "none" };
         const st = sanitizeStatus(b.status) || offlineStatus();
         const name = cleanName(b.name) || "player";
+        let prevSt = null;
+        try { const pr = this.one("SELECT status FROM friends WHERE uid=?", from); prevSt = pr ? JSON.parse(pr.status) : null; } catch { /* unreadable: treat as unknown */ }
         this.run("UPDATE friends SET name=?, status=? WHERE uid=?", name, JSON.stringify(st), from);
         if (Number.isInteger(b.lib)) setFriendLib(this, from, b.lib);
         this.push({ type: "presence", uid: from, name, status: st, lib: friendLibVer(this, from) });
+        this.maybeNotifyOnline(from, name, prevSt, st);
         return { r: "ok", name: p.name, st: this.effective(), lib: ownLibVer(this) };
       }
       case "pt_pull": {   // a friend asks for our play time: only friends, never blocked users; nothing when sharing is off / test account
@@ -1089,6 +1133,13 @@ export class UserHub extends DurableObject {
         if (!st) return this.err(ws, "bad-request", type);
         ws.serializeAttachment({ ...att, status: st });
         await this.broadcastPresence(false);
+        break;
+      }
+      case "watch_online": {   // the friends I want a "came online" ping for (replaces the list; friends only, at most MAX_WATCH)
+        if (!this.hit("watch", 20, 60 * 1000)) return this.err(ws, "rate-limited", type);
+        const list = cleanWatch(msg.uids, (u) => this.isFriend(u));
+        if (list.length) this.kvSet("watch", JSON.stringify(list)); else this.run("DELETE FROM kv WHERE k='watch'");
+        ws.send(JSON.stringify({ type: "watch_online", uids: list }));
         break;
       }
       case "playtime": {   // end of a game session: my per-game totals (or share:false = stop sharing and erase)
