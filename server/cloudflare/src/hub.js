@@ -24,6 +24,18 @@
 //   bad-slot         join asked for slot 0 or a slot that is already taken (legacy: room-full)
 //   host-reconnecting game room (-N) with guests but no host right now (legacy: no-such-room); clients retry
 //   host-left-game   sent as error{reason} just before the 4001 close when the host of a game room leaves: game over
+// Spectators (&role=watch, additive; old clients never send it; any `slot` param is ignored):
+//   Accept rules: host present (else same refusal as join), at most 2 spectator seats ("spectators-full"), daily budget
+//   below 50% (gate().spectate, else "spectate-busy"), game rooms also need a free slot 1..3 ("room-full").
+//   Attachment/member field `spec:true`. welcome{room,slot,spec:true}.
+//   LOBBY room: slot 4 or 5 (lowest free), NOT a member: excluded from members/peers/pairAll/migration/binary relay (both ways),
+//     receives every msg broadcast. The host's latest msg with body.kind==="launch" is stored (one storage write, key "launch")
+//     and replayed to a new watcher as msg{from:0,body:{...body,watch:true}} when younger than 6 h. Host leaving closes
+//     spectators with 4001 (no migration, never "keep" candidates). Spectator leave does not call syncSmash.
+//   GAME room: takes a real slot 1..3, listed in members as {slot,name,spec:true} (only spec members carry the field)
+//     and in peers once it sent an endpoint. Binary: a spectator may only send to dest slot 0; dest 0xFF is never delivered to
+//     spectator seats; a frame addressed to a spectator slot is delivered only when it comes from slot 0. Spectators'
+//     msg/ident are ignored. Host leaving closes them like other members (4001, host-left-game for reasons clients).
 
 import { DurableObject } from "cloudflare:workers";
 import { meter, gate } from "./reqbudget.js";
@@ -32,6 +44,8 @@ const ROOM_RE = /^[A-HJ-NP-Z2-9]{6}(-[0-9]{1,6})?$/;
 const ENDPOINT_RE = /^(-|[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5})$/;
 const UID_RE = /^[a-z2-7]{26}$/;
 const MAX_MEMBERS = 4;
+const MAX_SPECTATORS = 2;
+const LOBBY_SPEC_SLOTS = [4, 5];
 const MAX_NAME = 24;
 const MAX_TEXT_BYTES = 4096;
 const MAX_BINARY_BYTES = 1200;
@@ -51,11 +65,11 @@ export function hubFetch(request, env) {
   }
   const room = (url.searchParams.get("room") || "").toUpperCase();
   const role = url.searchParams.get("role");
-  if (!ROOM_RE.test(room) || (role !== "host" && role !== "join")) {
+  if (!ROOM_RE.test(room) || (role !== "host" && role !== "join" && role !== "watch")) {
     return new Response("bad room or role", { status: 400 });
   }
   const slotParam = url.searchParams.get("slot");
-  if (slotParam !== null && !/^[0-3]$/.test(slotParam)) {
+  if (role !== "watch" && slotParam !== null && !/^[0-3]$/.test(slotParam)) {
     return new Response("bad slot", { status: 400 });
   }
   const stub = env.HUB_ROOMS.get(env.HUB_ROOMS.idFromName(room));
@@ -76,7 +90,7 @@ export class HubRoom extends DurableObject {
       if (ws === except) continue;
       const a = ws.deserializeAttachment();
       if (!a || typeof a.slot !== "number" || a.slot < 0) continue;
-      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs, uid: a.uid || null });
+      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs, uid: a.uid || null, spec: !!a.spec });
     }
     return out;
   }
@@ -89,29 +103,34 @@ export class HubRoom extends DurableObject {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  broadcast(obj, except) {
+  // Seats that count as room members: everyone except lobby-room spectators.
+  players(except) { return this.members(except).filter((m) => !(m.spec && !m.game)); }
+
+  broadcast(obj, except, list) {
     const text = JSON.stringify(obj);
-    for (const m of this.members(except)) {
+    for (const m of list || this.members(except)) {
       try { m.ws.send(text); } catch { /* closing */ }
     }
   }
 
   sendMembers(except) {
-    const list = this.members(except).map((m) => ({ slot: m.slot, name: m.name }));
+    const ps = this.players(except);
+    const list = ps.map((m) => (m.spec ? { slot: m.slot, name: m.name, spec: true } : { slot: m.slot, name: m.name }));
     list.sort((a, b) => a.slot - b.slot);
-    this.broadcast({ type: "members", members: list }, except);
+    this.broadcast({ type: "members", members: list }, except, ps);
   }
 
   attach(ws, m) {
-    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs, uid: m.uid || null });
+    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs, uid: m.uid || null, spec: !!m.spec });
   }
 
   sendPeers() {
-    const peers = this.members()
+    const ps = this.players();
+    const peers = ps
       .filter((m) => m.endpoint)
       .map((m) => ({ slot: m.slot, public: m.endpoint.public, local: m.endpoint.local }));
     peers.sort((a, b) => a.slot - b.slot);
-    this.broadcast({ type: "peers", peers });
+    this.broadcast({ type: "peers", peers }, undefined, ps);
   }
 
   /* Auto-friending. launch=false: `fresh` just identified; pair it with the host (host fresh: with every guest).
@@ -123,7 +142,7 @@ export class HubRoom extends DurableObject {
       if (this.lastLaunchPair && t - this.lastLaunchPair < 10000) return;
       this.lastLaunchPair = t;
     }
-    const ids = this.members().filter((m) => m.uid);
+    const ids = this.players().filter((m) => m.uid && !m.spec);
     const pairs = [];
     for (let i = 0; i < ids.length; i++) {
       for (let j = i + 1; j < ids.length; j++) {
@@ -178,7 +197,7 @@ export class HubRoom extends DurableObject {
     const room = (url.searchParams.get("room") || "").toUpperCase();
     const role = url.searchParams.get("role");
     const name = cleanName(url.searchParams.get("name"));
-    const slotParam = url.searchParams.get("slot");
+    const slotParam = role === "watch" ? null : url.searchParams.get("slot");
     const caps = (url.searchParams.get("caps") || "").split(",");
     const mig = caps.includes("hostmig");
     const rs = caps.includes("reasons");
@@ -186,7 +205,15 @@ export class HubRoom extends DurableObject {
     const members = this.members();
     const taken = new Set(members.map((m) => m.slot));
     let slot;
-    if (role === "host") {
+    const spec = role === "watch";
+    if (spec) {
+      if (!taken.has(0)) return this.reject(rs && isGameRoom(room) && members.length > 0 ? "host-reconnecting" : "no-such-room");
+      if (members.filter((m) => m.spec).length >= MAX_SPECTATORS) return this.reject("spectators-full");
+      if (!gate(this.env, (p) => this.ctx.waitUntil(p)).spectate) return this.reject("spectate-busy");
+      const pool = isGameRoom(room) ? [1, 2, 3] : LOBBY_SPEC_SLOTS;
+      slot = pool.find((s) => !taken.has(s));
+      if (slot === undefined) return this.reject("room-full");
+    } else if (role === "host") {
       if (taken.has(0)) return this.reject("room-in-use");
       slot = 0;
     } else {
@@ -204,8 +231,14 @@ export class HubRoom extends DurableObject {
 
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
-    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs });
-    pair[1].send(JSON.stringify({ type: "welcome", room, slot }));
+    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs, spec });
+    pair[1].send(JSON.stringify(spec ? { type: "welcome", room, slot, spec: true } : { type: "welcome", room, slot }));
+    if (spec && !isGameRoom(room)) {
+      const l = await this.ctx.storage.get("launch");
+      if (l && l.body && Date.now() - l.at < SMASH_LINK_TTL_MS) {
+        try { pair[1].send(JSON.stringify({ type: "msg", from: 0, body: { ...l.body, watch: true } })); } catch { /* closing */ }
+      }
+    }
     this.sendMembers();
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
@@ -219,13 +252,18 @@ export class HubRoom extends DurableObject {
       // Relayed game packet: byte0 = destination slot.
       if (message.byteLength < 1 || message.byteLength > MAX_BINARY_BYTES) return;
       if (!gate(this.env).relayFrames) return;   // cost guard: >=90% of the daily budget, stop relaying game packets
+      if (me.spec && !me.game) return;   // lobby spectators never send binary
       const src = new Uint8Array(message);
       const dest = src[0];
       const out = new Uint8Array(src.length);
       out.set(src);
       out[0] = me.slot;
+      if (me.spec && dest !== 0) return;   // a game-room spectator may only talk to the host
       for (const m of this.members()) {
         if (m.ws === ws) continue;
+        if (m.spec) {   // spectators never get broadcasts; lobby ones no binary at all; game ones only host-addressed frames
+          if (!m.game || dest === 0xff || me.slot !== 0) continue;
+        }
         if (dest === 0xff || dest === m.slot) {
           try { m.ws.send(out); } catch { /* closing */ }
         }
@@ -241,10 +279,12 @@ export class HubRoom extends DurableObject {
       return;
     }
     if (!msg || typeof msg !== "object") return;
+    if (me.spec && (msg.type !== "endpoint" || !me.game)) return;   // spectators never send msg/ident
     switch (msg.type) {
       case "msg": {
         if (msg.body === null || typeof msg.body !== "object") return;
         this.broadcast({ type: "msg", from: me.slot, body: msg.body }, ws);
+        if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.ctx.storage.put("launch", { body: msg.body, at: Date.now() });
         // The host starting a game: everyone present who proved their account becomes friends with each other.
         if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.pairAll(true);
         break;
@@ -280,6 +320,7 @@ export class HubRoom extends DurableObject {
           game: !!me.game,
           rs: !!me.rs,
           uid: me.uid || null,
+          spec: !!me.spec,
         });
         this.sendPeers();
         break;
@@ -302,11 +343,11 @@ export class HubRoom extends DurableObject {
     try { ws.serializeAttachment({ slot: -1 }); } catch { /* closed */ }
     if (me.slot !== 0) {
       this.sendMembers(ws);
-      if (!me.game) await this.syncSmash([me.slot], null);
+      if (!me.game && !me.spec) await this.syncSmash([me.slot], null);
       return;
     }
     const rest = this.members(ws);
-    const keep = me.game ? [] : rest.filter((m) => m.mig);
+    const keep = me.game ? [] : rest.filter((m) => m.mig && !m.spec);
     for (const m of rest) {
       if (keep.includes(m)) continue;
       if (me.game && m.rs) { try { m.ws.send(JSON.stringify({ type: "error", reason: "host-left-game" })); } catch { /* closed */ } }

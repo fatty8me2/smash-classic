@@ -10,6 +10,7 @@ v = verdict(70_000); ok(!v.roomNew && v.relayFrames, "70% stops new rooms");
 v = verdict(90_000); ok(!v.relayFrames, "90% drops relay frames");
 v = verdict(10, 20); ok(!v.relayNew && v.cap === 20, "custom cap honored");
 ok(verdict(1, NaN).cap === DEFAULT_DAILY_CAP && verdict(1, -5).cap === DEFAULT_DAILY_CAP, "bad cap falls back to default");
+ok(verdict(49_999).spectate && !verdict(50_000).spectate && verdict(0).spectate, "spectate boundary: exactly 50% refused, just under allowed");
 ok(unitsOf(10, 400) === 30, "400 frames = 20 units");
 let t = Date.parse("2026-01-01T23:59:59Z");
 const l = new DayLedger(() => t);
