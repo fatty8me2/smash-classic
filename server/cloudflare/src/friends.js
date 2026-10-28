@@ -87,6 +87,24 @@ function cleanText(raw) {
   return String(raw ?? "").replace(/[^\S\n]+/g, " ").replace(/[\p{C}\p{Zl}\p{Zp}]/gu, (c) => (c === "\n" ? c : "")).trim();
 }
 
+/* Tiny public profile riding on the presence status (no extra storage or messages):
+ * {a: avatar id "c:<console>" | "g:<game key>", g: favourite game key, s: short status line}. */
+const AVATAR_RE = /^[cg]:[A-Za-z0-9_.:-]{1,36}$/;
+export const PROF_STATUS_MAX = 32;
+export function sanitizeProfile(p) {
+  if (!p || typeof p !== "object") return null;
+  const out = {};
+  if (typeof p.a === "string" && AVATAR_RE.test(p.a)) out.a = p.a;
+  const g = clean(typeof p.g === "string" ? p.g : "", 64);
+  if (g) out.g = g;
+  const st = clean(typeof p.s === "string" ? p.s : "", PROF_STATUS_MAX);
+  if (st) out.s = st;
+  return Object.keys(out).length ? out : null;
+}
+
+/* Reactions: a fixed code list, so a reaction is a few bytes and nothing free-form travels. */
+export const REACTIONS = ["heart", "up", "lol", "fire", "gg", "sad"];
+
 function sanitizeStatus(s) {
   if (!s || typeof s !== "object") return null;
   const state = s.state;
@@ -96,6 +114,8 @@ function sanitizeStatus(s) {
   if (s.game_id != null) out.game_id = clean(s.game_id, 64);
   if (s.game_title != null) out.game_title = clean(s.game_title, 64);
   if (s.system != null) out.system = clean(s.system, 32);
+  const prof = sanitizeProfile(s.prof);
+  if (prof) out.prof = prof;
   if (state === "in_lobby" || state === "in_game") {
     const lc = String(s.lobby_code || "").toUpperCase();
     if (LOBBY_RE.test(lc)) out.lobby_code = lc;
@@ -1439,6 +1459,17 @@ export class UserHub extends DurableObject {
         if (r.r === "notfriend") return this.err(ws, "not-friends", type, to);
         if (r.r !== "ok") return this.err(ws, "bad-request", type, "undeliverable");
         this.saveHistory(to, m);
+        break;
+      }
+      case "react": {   // emoji reaction on a DM line: a tiny non-stored message to a friend
+        const to = uidArg(msg.to);
+        const target = typeof msg.target === "string" && msg.target.length > 0 && msg.target.length <= 64 ? msg.target : "";
+        if (!to || !target || !REACTIONS.includes(msg.emoji)) return this.err(ws, "bad-request", type, "react");
+        if (!this.isFriend(to)) return this.err(ws, "not-friends", type, to);
+        if (!this.hit("react", 60, 60 * 1000)) return this.err(ws, "rate-limited", type, to);
+        const m = { id: crypto.randomUUID(), from: p.uid, from_name: p.name, to, kind: "react", target, emoji: msg.emoji, on: msg.on !== false, at: now() };
+        const r = await this.call(to, "msg", { uid: p.uid, msg: m });
+        if (r.r === "notfriend") return this.err(ws, "not-friends", type, to);
         break;
       }
       case "invite": {
