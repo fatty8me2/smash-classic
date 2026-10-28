@@ -2,6 +2,7 @@
 
 export const DEFAULT_DAILY_CAP = 100_000;
 export const RELAY_NEW_FRAC = 0.5;
+export const SPECTATE_FRAC = 0.5;
 export const ROOM_NEW_FRAC = 0.7;
 export const RELAY_STOP_FRAC = 0.9;
 export const FRAMES_PER_UNIT = 20;
@@ -16,6 +17,7 @@ export function verdict(total, cap = DEFAULT_DAILY_CAP) {
   return {
     total, cap: c,
     relayNew: total < c * RELAY_NEW_FRAC,
+    spectate: total < c * SPECTATE_FRAC,
     roomNew: total < c * ROOM_NEW_FRAC,
     relayFrames: total < c * RELAY_STOP_FRAC,
   };
