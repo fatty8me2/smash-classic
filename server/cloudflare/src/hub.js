@@ -23,7 +23,19 @@
 // Distinct failure reasons (&caps=reasons; older clients keep the legacy reasons so their retry logic is unchanged):
 //   bad-slot         join asked for slot 0 or a slot that is already taken (legacy: room-full)
 //   host-reconnecting game room (-N) with guests but no host right now (legacy: no-such-room); clients retry
+//   no-such-game     drop-in watch on a lobby with no stored host launch (or older than 6 h)
+//   host-too-old     drop-in watch but the stored launch has no integer body.dropin (host RetroHub cannot serve drop-in)
+//   no-free-port     drop-in watch but the host's launch announced body.dropin <= 0 (no spare port in its own plan)
 //   host-left-game   sent as error{reason} just before the 4001 close when the host of a game room leaves: game over
+// Drop-in (additive; a friend takes an empty controller port of a running rollback game):
+//   LOBBY `&role=watch&dropin=1`: a normal lobby spectator seat (same rules/budget/limits, spec:true, not a member) plus checks
+//     against the stored launch {body,at}: none/stale -> "no-such-game"; body.dropin not an integer -> "host-too-old";
+//     body.dropin <= 0 -> "no-free-port" (static: the launch plan had no spare port). The server does NOT count live ports: the host RUNNER is
+//     the only authority (it admits, or refuses a knock with an explicit no-free-port / busy / old-peer packet). Drop-in seats use their
+//     own lobby slots 6/7 and cap of 2 and never take a spectator seat. welcome{room,slot,spec:true,dropin:true}; the
+//     launch is replayed as msg{from:0,body:{...body,watch:true,dropin_join:true}}. dropin=1 with role=host/join on a lobby: ignored.
+//   GAME room `&role=join&dropin=1&slot=K`: a normal member join (real slot, not spec) but refused "spectate-busy" when
+//     gate().spectate is false. All other join rules unchanged.
 // Spectators (&role=watch, additive; old clients never send it; any `slot` param is ignored):
 //   Accept rules: host present (else same refusal as join), at most 2 spectator seats ("spectators-full"), daily budget
 //   below 50% (gate().spectate, else "spectate-busy"), game rooms also need a free slot 1..3 ("room-full").
@@ -46,6 +58,7 @@ const UID_RE = /^[a-z2-7]{26}$/;
 const MAX_MEMBERS = 4;
 const MAX_SPECTATORS = 2;
 const LOBBY_SPEC_SLOTS = [4, 5];
+const LOBBY_DROPIN_SLOTS = [6, 7];   // drop-in seats: their own pool and cap, they never use a spectator seat
 const MAX_NAME = 24;
 const MAX_TEXT_BYTES = 4096;
 const MAX_BINARY_BYTES = 1200;
@@ -90,7 +103,7 @@ export class HubRoom extends DurableObject {
       if (ws === except) continue;
       const a = ws.deserializeAttachment();
       if (!a || typeof a.slot !== "number" || a.slot < 0) continue;
-      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs, uid: a.uid || null, spec: !!a.spec });
+      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs, uid: a.uid || null, spec: !!a.spec, dr: !!a.dr });
     }
     return out;
   }
@@ -121,7 +134,7 @@ export class HubRoom extends DurableObject {
   }
 
   attach(ws, m) {
-    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs, uid: m.uid || null, spec: !!m.spec });
+    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs, uid: m.uid || null, spec: !!m.spec, dr: !!m.dr });
   }
 
   sendPeers() {
@@ -206,18 +219,28 @@ export class HubRoom extends DurableObject {
     const taken = new Set(members.map((m) => m.slot));
     let slot;
     const spec = role === "watch";
+    const dropin = url.searchParams.get("dropin") === "1";
+    let dropRec = null;
     if (spec) {
       if (!taken.has(0)) return this.reject(rs && isGameRoom(room) && members.length > 0 ? "host-reconnecting" : "no-such-room");
-      if (members.filter((m) => m.spec).length >= MAX_SPECTATORS) return this.reject("spectators-full");
+      if (members.filter((m) => m.spec && (dropin ? m.dr : !m.dr)).length >= MAX_SPECTATORS) return this.reject("spectators-full");
       if (!gate(this.env, (p) => this.ctx.waitUntil(p)).spectate) return this.reject("spectate-busy");
-      const pool = isGameRoom(room) ? [1, 2, 3] : LOBBY_SPEC_SLOTS;
+      const pool = isGameRoom(room) ? [1, 2, 3] : dropin ? LOBBY_DROPIN_SLOTS : LOBBY_SPEC_SLOTS;
       slot = pool.find((s) => !taken.has(s));
       if (slot === undefined) return this.reject("room-full");
+      if (dropin && !isGameRoom(room)) {
+        const l = await this.ctx.storage.get("launch");
+        if (!l || !l.body || !(Date.now() - l.at < SMASH_LINK_TTL_MS)) return this.reject("no-such-game");
+        if (!Number.isInteger(l.body.dropin)) return this.reject("host-too-old");
+        if (l.body.dropin <= 0) return this.reject("no-free-port");   // the host's own launch plan has no spare port (static; the host runner is the only authority on live ports and refuses a knock itself)
+        dropRec = l;
+      }
     } else if (role === "host") {
       if (taken.has(0)) return this.reject("room-in-use");
       slot = 0;
     } else {
       if (!taken.has(0)) return this.reject(rs && isGameRoom(room) && members.length > 0 ? "host-reconnecting" : "no-such-room");
+      if (dropin && role === "join" && isGameRoom(room) && !gate(this.env, (p) => this.ctx.waitUntil(p)).spectate) return this.reject("spectate-busy");
       if (slotParam !== null) {
         slot = Number(slotParam);
         if (slot === 0 || taken.has(slot)) return this.reject(rs ? "bad-slot" : "room-full");
@@ -231,12 +254,12 @@ export class HubRoom extends DurableObject {
 
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
-    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs, spec });
-    pair[1].send(JSON.stringify(spec ? { type: "welcome", room, slot, spec: true } : { type: "welcome", room, slot }));
+    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs, spec, dr: !!dropRec });
+    pair[1].send(JSON.stringify(spec ? (dropRec ? { type: "welcome", room, slot, spec: true, dropin: true } : { type: "welcome", room, slot, spec: true }) : { type: "welcome", room, slot }));
     if (spec && !isGameRoom(room)) {
-      const l = await this.ctx.storage.get("launch");
+      const l = dropRec || await this.ctx.storage.get("launch");
       if (l && l.body && Date.now() - l.at < SMASH_LINK_TTL_MS) {
-        try { pair[1].send(JSON.stringify({ type: "msg", from: 0, body: { ...l.body, watch: true } })); } catch { /* closing */ }
+        try { pair[1].send(JSON.stringify({ type: "msg", from: 0, body: dropRec ? { ...l.body, watch: true, dropin_join: true } : { ...l.body, watch: true } })); } catch { /* closing */ }
       }
     }
     this.sendMembers();

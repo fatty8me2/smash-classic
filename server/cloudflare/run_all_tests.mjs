@@ -38,6 +38,8 @@ const SUITE = [
   { file: "test_gamelib.mjs", kind: "ws" },
   { file: "test_spectate.mjs", kind: "ws" },
   { file: "test_spectate_budget.mjs", kind: "ws", vars: { DAILY_REQ_CAP: "60" } },
+  { file: "test_dropin.mjs", kind: "ws" },
+  { file: "test_dropin_budget.mjs", kind: "ws", vars: { DAILY_REQ_CAP: "60" } },
 ];
 
 const filter = process.argv[2] || "";

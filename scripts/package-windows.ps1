@@ -386,6 +386,8 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     }
     $HubBin = Join-Path $HubBuild "bin\Release"
     Copy-Item (Join-Path $HubBin "RetroHub.exe") $StageDir
+    $hubPdb = Join-Path $HubBin "RetroHub.pdb"
+    if (Test-Path $hubPdb) { Copy-Item $hubPdb $StageDir }
     Copy-Item (Join-Path $HubBin "n64run.exe") $StageDir
     Copy-Item (Join-Path $HubBin "retrorun.exe") $StageDir
     # Remote play host/guest. Required: Wii U / stream features break without it.
