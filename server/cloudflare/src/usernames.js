@@ -1,24 +1,45 @@
 // RetroHub usernames: pure validation / normalization (no Worker imports, unit-testable in plain node).
 // The registry itself lives in the Directory Durable Object (friends.js); see RetroHub/docs/ACCOUNTS.md.
 //
-//   display  = NFKC form of what the player typed (case kept), 3-16 chars of [A-Za-z0-9_.-]
-//   key      = the uniqueness key: lowercase, separators (_ . -) removed, digit look-alikes folded (0->o, 1->l, 5->s).
-//              i and l are NOT folded ("Kai" and "Kal" are different names). Non-ASCII look-alikes (Cyrillic/Greek) can
-//              never be claimed at all: only [A-Za-z0-9_.-] is accepted after NFKC.
+//   display  = NFKC form of what the player typed (case kept), leading/trailing space trimmed, runs of spaces collapsed to one.
+//              3-20 characters from: printable ASCII (letters, digits, space, symbols) except  " \ < > ` /  plus the
+//              Latin-1 letters U+00C0-U+00FF except x (U+00D7) and / (U+00F7). Nothing else: no emoji, no other scripts
+//              (the hub's font only has Basic Latin + Latin-1), no control / zero-width / bidi characters.
+//              Excluded ASCII: " and \ break JSON / command lines, < > ` break markup, / breaks paths.
+//   key      = the uniqueness key: lowercase, Latin-1 accents stripped to the base letter (e->e, n->n, ss, ae, o, th, d),
+//              EVERY character that is not [a-z0-9] removed, then digit look-alikes folded (0->o, 1->l, 5->s).
+//              For any name valid under the old rules ([A-Za-z0-9_.-], only _ . - were removed) this is byte-identical to
+//              the old key, so existing registrations never change. i and l are NOT folded. Needs >= 3 key characters.
+//              Non-Latin look-alikes (Cyrillic/Greek) can never be claimed: they are not in the allowed set.
 
 export const NAME_MIN = 3;
-export const NAME_MAX = 16;
+export const NAME_MAX = 20;
 export const HOLD_MS = 7 * 24 * 60 * 60 * 1000;      // a renamed-away name is held for its old owner this long
 export const LEGACY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;   // an auto-claimed (migrated) name can be displaced by an older account this long
 
-const ALLOWED = /^[A-Za-z0-9_.-]+$/;
-const CODE_LIKE = /^rh-?[a-z2-7]{4}-?[a-z2-7]{4}$/i;      // would be mistaken for a friend code
+// space..~ except " / < > \ `   +   U+00C0-U+00FF except U+00D7, U+00F7
+const ALLOWED = /^[ !#-.0-;=?-\[\]-_a-~À-ÖØ-öø-ÿ]+$/;
+const CODE_LIKE = /^rh[- ]?[a-z2-7]{4}[- ]?[a-z2-7]{4}$/i;      // would be mistaken for a friend code
 
-/** Look-alike folding applied to the lowercase, separator-free form. */
+const ACCENT = {
+  "à": "a", "á": "a", "â": "a", "ã": "a", "ä": "a", "å": "a", "æ": "ae",
+  "ç": "c", "è": "e", "é": "e", "ê": "e", "ë": "e",
+  "ì": "i", "í": "i", "î": "i", "ï": "i", "ð": "d", "ñ": "n",
+  "ò": "o", "ó": "o", "ô": "o", "õ": "o", "ö": "o", "ø": "o",
+  "ù": "u", "ú": "u", "û": "u", "ü": "u", "ý": "y", "þ": "th", "ÿ": "y", "ß": "ss",
+};
+
+/** Trim, collapse space runs, NFKC (shared by validation and lookup). */
+function shape(raw) {
+  return raw.normalize("NFKC").trim().replace(/ {2,}/g, " ");
+}
+
+/** Uniqueness key of an already-shaped name: lowercase, de-accent, keep only [a-z0-9], then look-alike folding. */
 export function foldKey(s) {
   return s
     .toLowerCase()
-    .replace(/[_.-]/g, "")
+    .replace(/[ß-ÿ]/g, (c) => ACCENT[c] ?? "")
+    .replace(/[^a-z0-9]/g, "")
     .replace(/0/g, "o")
     .replace(/1/g, "l")
     .replace(/5/g, "s");
@@ -47,14 +68,11 @@ const BAD = BAD_WORDS.map(strong);
  */
 export function normalizeUsername(raw, opts = {}) {
   if (typeof raw !== "string") return { ok: false, reason: "invalid-chars" };
-  const display = raw.normalize("NFKC").trim();
+  const display = shape(raw);
   if (!ALLOWED.test(display)) return { ok: false, reason: display.length ? "invalid-chars" : "too-short" };
   if (display.length < NAME_MIN) return { ok: false, reason: "too-short" };
   if (display.length > NAME_MAX) return { ok: false, reason: "too-long" };
-  if (!/^[A-Za-z0-9]/.test(display) || !/[A-Za-z0-9]$/.test(display) || /[_.-]{2}/.test(display)) {
-    return { ok: false, reason: "bad-shape" };
-  }
-  const isQa = /^qa[-_.]/i.test(display);
+  const isQa = /^qa[-_. ]/i.test(display);
   if (opts.test) {
     if (!isQa) return { ok: false, reason: "test-only-qa" };
   } else if (isQa) {
@@ -62,7 +80,7 @@ export function normalizeUsername(raw, opts = {}) {
   }
   if (CODE_LIKE.test(display)) return { ok: false, reason: "looks-like-code" };
   const key = foldKey(display);
-  if (key.length < NAME_MIN) return { ok: false, reason: "too-short" };
+  if (key.length < NAME_MIN) return { ok: false, reason: "bad-shape" };   // needs 3+ letters/digits
   if (!opts.test) {
     const sk = strong(display);
     if (RESERVED.has(sk)) return { ok: false, reason: "reserved" };
@@ -84,7 +102,7 @@ export function reasonToError(reason) {
 /** Key for looking a name up (add-friend by username). No policy checks, just shape + folding. */
 export function lookupKey(raw) {
   if (typeof raw !== "string") return null;
-  const d = raw.normalize("NFKC").trim();
+  const d = shape(raw);
   if (!ALLOWED.test(d) || d.length < NAME_MIN || d.length > NAME_MAX) return null;
   const k = foldKey(d);
   return k.length >= NAME_MIN ? k : null;
