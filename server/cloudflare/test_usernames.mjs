@@ -1,7 +1,8 @@
 // Username registry tests. Pure normalization runs anywhere; the live part needs a LOCAL worker:
 //   npx wrangler dev --ip 127.0.0.1 --port 10200 --persist-to C:\rhq\10200   (tracked .dev.vars: UNAME_HOLD_MS=4000, link TTL 3 s)
 //   node test_usernames.mjs [http://127.0.0.1:10200]
-import { normalizeUsername, lookupKey } from "./src/usernames.js";
+import { readFileSync } from "node:fs";
+import { normalizeUsername, lookupKey, foldKey } from "./src/usernames.js";
 
 const BASE = process.argv[2] || "http://127.0.0.1:10200";
 if (!/^https?:\/\/(127\.0\.0\.1|localhost)/.test(BASE)) { console.error("local worker only"); process.exit(2); }
@@ -13,7 +14,7 @@ let failures = 0;
 const check = (name, cond, extra = "") => { console.log(`${cond ? "PASS" : "FAIL"} ${name}${extra ? " " + extra : ""}`); if (!cond) failures++; };
 // unique per run so a re-run against persisted state does not collide
 const RUN = rnd(4, "abcdefghjkmnpqrtuvwxy");
-const nm = (base) => `${base}${RUN}`.slice(0, 16);
+const nm = (base) => `${base}${RUN}`.slice(0, 20);
 
 // ---------------- pure ----------------
 const key = (s, o) => normalizeUsername(s, o).key;
@@ -23,14 +24,48 @@ check("digit look-alikes folded: 1->l, 5->s", key("B1ll") === key("Blll") && key
 check("i and l are NOT folded", key("Kai99") !== key("Kal99") && key("BIll") !== key("Bll1"));
 check("O/0 folded", key("R0bot9") === key("Robot9"));
 check("rn/m and vv/w are NOT folded", key("corner") !== key("comer") && key("vvolf") !== key("wolf"));
-check("NFKC fullwidth folds to ascii", normalizeUsername("ｋａｉｘ９").display === "kaix9");
+check("no Unicode normalization: fullwidth is rejected (client parity)", normalizeUsername("ｋａｉｘ９").reason === "invalid-chars");
+// Parity corpus: the SAME file drives RetroHub's test_username.cpp (generated include), so client and server must agree on every verdict and key.
+{
+  const corpus = JSON.parse(readFileSync(new URL("./username_parity_corpus.json", import.meta.url), "utf8"));
+  const klass = (r) => (r.ok ? "ok" : ["reserved", "profanity", "looks-like-code", "qa-only"].includes(r.reason) ? "blocked" : r.reason);
+  const lookupOk = (s, v, k) => (v === "ok" ? lookupKey(s) === k : v === "blocked" ? true : lookupKey(s) === null);   // lookup has no policy checks, only shape
+  const bad = corpus.filter(([s, v, k]) => { const r = normalizeUsername(s); return klass(r) !== v || (v === "ok" && r.key !== k) || !lookupOk(s, v, k); });
+  check("parity corpus verdicts and keys", bad.length === 0, bad.length ? JSON.stringify(bad.slice(0, 5)) : `${corpus.length} cases`);
+}
 check("non-ascii homoglyph rejected", normalizeUsername("Kаi99").reason === "invalid-chars");   // Cyrillic a
-check("length 3..16", normalizeUsername("ab").reason === "too-short" && normalizeUsername("a".repeat(17)).reason === "too-long" && normalizeUsername("abc").ok && normalizeUsername("a".repeat(16)).ok);
-check("shape: no leading/trailing/double separators", ["_abc", "abc_", "a__b", "a..b"].every((n) => normalizeUsername(n).reason === "bad-shape"));
+check("length 3..20", normalizeUsername("ab").reason === "too-short" && normalizeUsername("a".repeat(21)).reason === "too-long" && normalizeUsername("abc").ok && normalizeUsername("a".repeat(20)).ok);
+check("shape: needs 3+ letters/digits in the key", ["a!!!!", "__a__", "a b !", "!!!!!!"].every((n) => normalizeUsername(n).reason === "bad-shape") && normalizeUsername("a_bc").ok && normalizeUsername("_abc").ok);
+check("spaces trimmed and collapsed", normalizeUsername("  Kai   Smith  ").display === "Kai Smith" && key("Kai Smith") === key("kai.smith"));
+check("other whitespace rejected", ["a\tbc", "ab\ncd", "ab​cd", "ab‮cd"].every((n) => normalizeUsername(n).reason === "invalid-chars"));
+check("symbols allowed", ["Cool! Guy", "Mr. T (2)", "R&B+Soul", "a@b#c$d%e", "{xy}[z]~^*=,:;|?!'_-"].every((n) => normalizeUsername(n).ok), JSON.stringify(normalizeUsername("{xy}[z]~^*=,:;|?!'_-")));
+check("excluded: quote backslash < > backtick slash", ['ab"c', "ab\\c", "ab<c", "ab>c", "ab`c", "ab/c"].every((n) => normalizeUsername(n).reason === "invalid-chars"));
+check("Latin-1 letters allowed, multiply/divide not", normalizeUsername("Zoë Ñandú").ok && normalizeUsername("Ærø Þór ßeta").ok && normalizeUsername("ab×c").reason === "invalid-chars" && normalizeUsername("ab÷c").reason === "invalid-chars");
+check("no emoji / CJK / Greek / Latin Extended-A", ["ab\u{1F600}c", "ab中c", "abαc", "abŁc", "ab©c", "abµc"].every((n) => normalizeUsername(n).reason === "invalid-chars"));
+check("accent folding", key("Zoë") === key("Zoe") && key("Ñandú") === key("Nandu") && key("Straße") === key("Strasse") && key("Æon") === key("aeon") && key("Øla") === key("Ola") && key("Þor") === key("thor") && key("Ðan") === key("dan") && key("ÀÉÎ") === key("aei"));
+check("symbols/spaces do not make names distinct", key("K.a-i_9 9") === key("Kai99") && key("Kai99!!") === key("kai99"));
+check("accent+leet reserved", normalizeUsername("Ädmin").reason === "reserved" && normalizeUsername("ad min").reason === "reserved" && normalizeUsername("Adm1n!").reason === "reserved");
+check("profanity across spaces", normalizeUsername("xx fu ck xx").reason === "profanity");
+check("friend-code lookalike with space/dash", ["RH-7KQ2-M4XD", "RH 7KQ2 M4XD", "rh7kq2m4xd"].every((n) => normalizeUsername(n).reason === "looks-like-code"));
+check("qa prefix with - _ . space", ["qa-bob", "qa_bob", "qa.bob", "QA bob"].every((n) => normalizeUsername(n).reason === "qa-only" && normalizeUsername(n, { test: true }).ok) && normalizeUsername("qatar").ok);
+check("lookupKey shape", lookupKey("Kai Smith") === key("kai.smith") && lookupKey("a".repeat(21)) === null && lookupKey("a/bc") === null && lookupKey("!!!!") === null && lookupKey("  Zoë  ") === key("zoe"));
+// Key stability: for every name valid under the OLD rules the new key must equal the old key (existing registrations must not move).
+const oldFold = (s) => s.toLowerCase().replace(/[_.-]/g, "").replace(/0/g, "o").replace(/1/g, "l").replace(/5/g, "s");
+{
+  const OA = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-";
+  let bad = 0, n = 0;
+  for (let t = 0; t < 200000; t++) {
+    const len = 3 + Math.floor(Math.random() * 14);
+    const s2 = Array.from({ length: len }, () => OA[Math.floor(Math.random() * OA.length)]).join("");
+    if (!/^[A-Za-z0-9]/.test(s2) || !/[A-Za-z0-9]$/.test(s2) || /[_.-]{2}/.test(s2)) continue;
+    n++;
+    if (foldKey(s2) !== oldFold(s2)) bad++;
+  }
+  for (const c of OA) if (foldKey(c) !== oldFold(c)) bad++;   // per-character proof: the fold is a per-char map, so it holds for every concatenation
+  check("old-valid names keep their old key", bad === 0 && n > 1000, `${n} samples`);
+}
 check("reserved words (incl. look-alikes)", ["admin", "Adm1n", "RetroHub", "m0derator", "SYSTEM", "r_e_t_r_o_h_u_b"].every((n) => normalizeUsername(n).reason === "reserved"));
 check("profanity", normalizeUsername("xx_fuck_xx").reason === "profanity" && normalizeUsername("Sh1tlord").reason === "profanity");
-check("friend-code lookalike", normalizeUsername("RH-7KQ2-M4XD").reason === "looks-like-code");
-check("qa- reserved for test accounts", normalizeUsername("qa-bob").reason === "qa-only" && normalizeUsername("qa-bob", { test: true }).ok && normalizeUsername("bobby", { test: true }).reason === "test-only-qa");
 check("lookupKey matches claim key", lookupKey("KAI99") === key("Kai99") && lookupKey("x") === null);
 
 // ---------------- live helpers ----------------
@@ -102,7 +137,7 @@ const keep = (c) => { all.push(c); return c; };
   check("check: fresh name available", free.ok === true && free.username === nm("FreeName"));
   const bad = await a.ask({ type: "username_check", name: "admin" });
   check("check: reserved", !bad.ok && bad.reason === "username-reserved");
-  const inv = await a.ask({ type: "username_check", name: "no spaces!" });
+  const inv = await a.ask({ type: "username_check", name: "no/slash!" });
   check("check: invalid chars", !inv.ok && inv.reason === "username-invalid");
   let limited = false;
   for (let i = 0; i < 45 && !limited; i++) { const r = await a.ask({ type: "username_check", name: nm("Probe") + i }); limited = !!r && r.reason === "rate-limited"; }
@@ -185,6 +220,21 @@ const keep = (c) => { all.push(c); return c; };
   const D = keep(await mk("CodeUser"));
   D.send({ type: "add_friend", code: A.welcome.code });
   check("friend code add still works", !!(await A.wait((m) => m.type === "request" && m.req.uid === D.acct.uid)));
+}
+
+// ---------------- 5b. creative names: spaces / accents / symbols, claimed and found by an equivalent spelling ----------------
+{
+  const A = keep(await mk("SpaceOwner")), B = keep(await mk("SpaceAdder"));
+  const shown = `Zoë Smith ${RUN}!`;
+  const r = await A.ask({ type: "set_username", name: `  Zoë   Smith ${RUN}!  ` });
+  check("creative name claimed (trimmed, collapsed)", r && r.ok && r.username === shown, JSON.stringify(r));
+  const dup = await B.ask({ type: "set_username", name: `zoe.smith-${RUN}` });
+  check("same fold key is taken", dup && !dup.ok && dup.reason === "username-taken", JSON.stringify(dup));
+  B.send({ type: "add_friend", username: `ZOE smith ${RUN}` });
+  const req = await A.wait((m) => m.type === "request" && m.dir === "in");
+  check("add by an equivalent spelling finds the owner", !!req && req.req.uid === B.acct.uid);
+  const bad = await B.ask({ type: "username_check", name: "no\u{1F600}emoji" });
+  check("emoji rejected by the server", bad && !bad.ok && bad.reason === "username-invalid");
 }
 
 // ---------------- 6. link-code flow, two devices ----------------
