@@ -1,7 +1,7 @@
 // RetroHub usernames: pure validation / normalization (no Worker imports, unit-testable in plain node).
 // The registry itself lives in the Directory Durable Object (friends.js); see RetroHub/docs/ACCOUNTS.md.
 //
-//   display  = NFKC form of what the player typed (case kept), leading/trailing space trimmed, runs of spaces collapsed to one.
+//   display  = what the player typed (case kept, no Unicode normalization), leading/trailing space trimmed, runs of spaces collapsed to one.
 //              3-20 characters from: printable ASCII (letters, digits, space, symbols) except  " \ < > ` /  plus the
 //              Latin-1 letters U+00C0-U+00FF except x (U+00D7) and / (U+00F7). Nothing else: no emoji, no other scripts
 //              (the hub's font only has Basic Latin + Latin-1), no control / zero-width / bidi characters.
@@ -29,9 +29,11 @@ const ACCENT = {
   "ù": "u", "ú": "u", "û": "u", "ü": "u", "ý": "y", "þ": "th", "ÿ": "y", "ß": "ss",
 };
 
-/** Trim, collapse space runs, NFKC (shared by validation and lookup). */
+/** Trim spaces/tabs at the ends and collapse space runs (shared by validation and lookup). Deliberately NO Unicode
+ *  normalization: the client validates the raw text, so both sides must judge exactly the same characters (fullwidth,
+ *  ligatures, NBSP, decomposed accents are rejected rather than silently converted). Old names were pure ASCII, so keys are unaffected. */
 function shape(raw) {
-  return raw.normalize("NFKC").trim().replace(/ {2,}/g, " ");
+  return raw.replace(/^[ \t]+|[ \t]+$/g, "").replace(/ {2,}/g, " ");
 }
 
 /** Uniqueness key of an already-shaped name: lowercase, de-accent, keep only [a-z0-9], then look-alike folding. */

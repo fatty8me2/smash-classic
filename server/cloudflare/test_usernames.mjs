@@ -1,6 +1,7 @@
 // Username registry tests. Pure normalization runs anywhere; the live part needs a LOCAL worker:
 //   npx wrangler dev --ip 127.0.0.1 --port 10200 --persist-to C:\rhq\10200   (tracked .dev.vars: UNAME_HOLD_MS=4000, link TTL 3 s)
 //   node test_usernames.mjs [http://127.0.0.1:10200]
+import { readFileSync } from "node:fs";
 import { normalizeUsername, lookupKey, foldKey } from "./src/usernames.js";
 
 const BASE = process.argv[2] || "http://127.0.0.1:10200";
@@ -23,7 +24,15 @@ check("digit look-alikes folded: 1->l, 5->s", key("B1ll") === key("Blll") && key
 check("i and l are NOT folded", key("Kai99") !== key("Kal99") && key("BIll") !== key("Bll1"));
 check("O/0 folded", key("R0bot9") === key("Robot9"));
 check("rn/m and vv/w are NOT folded", key("corner") !== key("comer") && key("vvolf") !== key("wolf"));
-check("NFKC fullwidth folds to ascii", normalizeUsername("ｋａｉｘ９").display === "kaix9");
+check("no Unicode normalization: fullwidth is rejected (client parity)", normalizeUsername("ｋａｉｘ９").reason === "invalid-chars");
+// Parity corpus: the SAME file drives RetroHub's test_username.cpp (generated include), so client and server must agree on every verdict and key.
+{
+  const corpus = JSON.parse(readFileSync(new URL("./username_parity_corpus.json", import.meta.url), "utf8"));
+  const klass = (r) => (r.ok ? "ok" : ["reserved", "profanity", "looks-like-code", "qa-only"].includes(r.reason) ? "blocked" : r.reason);
+  const lookupOk = (s, v, k) => (v === "ok" ? lookupKey(s) === k : v === "blocked" ? true : lookupKey(s) === null);   // lookup has no policy checks, only shape
+  const bad = corpus.filter(([s, v, k]) => { const r = normalizeUsername(s); return klass(r) !== v || (v === "ok" && r.key !== k) || !lookupOk(s, v, k); });
+  check("parity corpus verdicts and keys", bad.length === 0, bad.length ? JSON.stringify(bad.slice(0, 5)) : `${corpus.length} cases`);
+}
 check("non-ascii homoglyph rejected", normalizeUsername("Kаi99").reason === "invalid-chars");   // Cyrillic a
 check("length 3..20", normalizeUsername("ab").reason === "too-short" && normalizeUsername("a".repeat(21)).reason === "too-long" && normalizeUsername("abc").ok && normalizeUsername("a".repeat(20)).ok);
 check("shape: needs 3+ letters/digits in the key", ["a!!!!", "__a__", "a b !", "!!!!!!"].every((n) => normalizeUsername(n).reason === "bad-shape") && normalizeUsername("a_bc").ok && normalizeUsername("_abc").ok);
