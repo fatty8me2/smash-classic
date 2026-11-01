@@ -101,6 +101,12 @@ export function hubFetch(request, env) {
   return stub.fetch(request);
 }
 
+// Host grace: an ABNORMAL drop (1006/1011: Wi-Fi blip, Worker restart) of slot 0 with members present does not migrate / close the room
+// for HOST_GRACE_MS (env var of the same name overrides, 0 = off). The same host (same name) reconnecting with role=host inside the
+// window reclaims slot 0; the others never saw it go (members keeps a placeholder, no 4001). After it: the normal teardown.
+const HOST_GRACE_MS = 10000;
+export const graceMs = (env) => { const v = Number(env && env.HOST_GRACE_MS); return Number.isFinite(v) && v >= 0 && env.HOST_GRACE_MS !== undefined && env.HOST_GRACE_MS !== "" ? v : HOST_GRACE_MS; };
+
 export class HubRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -205,6 +211,7 @@ export class HubRoom extends DurableObject {
   sendMembers(except) {
     const ps = this.players(except);
     const list = ps.map((m) => (m.spec ? { slot: m.slot, name: m.name, spec: true } : { slot: m.slot, name: m.name }));
+    if (this.grace && !ps.some((m) => m.slot === 0)) list.push({ slot: 0, name: this.grace.name });   // host held during its grace
     list.sort((a, b) => a.slot - b.slot);
     this.broadcast({ type: "members", members: list }, except, ps);
   }
@@ -294,12 +301,13 @@ export class HubRoom extends DurableObject {
 
     const members = this.members();
     const taken = new Set(members.map((m) => m.slot));
+    const grace = !taken.has(0) && members.length > 0 ? await this.getGrace() : null;
     let slot;
     const spec = role === "watch";
     const dropin = url.searchParams.get("dropin") === "1";
     let dropRec = null;
     if (spec) {
-      if (!taken.has(0)) return this.reject(rs && isGameRoom(room) && members.length > 0 ? "host-reconnecting" : "no-such-room");
+      if (!taken.has(0)) return this.reject(rs && (isGameRoom(room) || grace) && members.length > 0 ? "host-reconnecting" : "no-such-room");
       if (members.filter((m) => m.spec && (dropin ? m.dr : !m.dr)).length >= MAX_SPECTATORS) return this.reject("spectators-full");
       if (!gate(this.env, (p) => this.ctx.waitUntil(p)).spectate) return this.reject("spectate-busy");
       const pool = isGameRoom(room) ? [1, 2, 3] : dropin ? LOBBY_DROPIN_SLOTS : LOBBY_SPEC_SLOTS;
@@ -314,9 +322,13 @@ export class HubRoom extends DurableObject {
       }
     } else if (role === "host") {
       if (taken.has(0)) return this.reject("room-in-use");
+      if (grace) {
+        if (grace.name !== name) return this.reject("room-in-use");   // somebody else asking for the held seat
+        await this.clearGrace();   // the same host is back: it reclaims slot 0
+      }
       slot = 0;
     } else {
-      if (!taken.has(0)) return this.reject(rs && isGameRoom(room) && members.length > 0 ? "host-reconnecting" : "no-such-room");
+      if (!taken.has(0)) return this.reject(rs && (isGameRoom(room) || grace) && members.length > 0 ? "host-reconnecting" : "no-such-room");
       if (dropin && role === "join" && isGameRoom(room) && !gate(this.env, (p) => this.ctx.waitUntil(p)).spectate) return this.reject("spectate-busy");
       if (slotParam !== null) {
         slot = Number(slotParam);
@@ -455,14 +467,24 @@ export class HubRoom extends DurableObject {
       // already closed
     }
     if (!me || typeof me.slot !== "number" || me.slot < 0) return;
+    const abnormal = code === 1006 || code === 1011;
     // Mark as departed so a second close/error event for this socket (or the
     // late close of a socket we closed ourselves) is a no-op.
     try { ws.serializeAttachment({ slot: -1 }); } catch { /* closed */ }
+    if (me.slot === 0 && abnormal && graceMs(this.env) > 0 && !(await this.getGrace()) && this.members(ws).some((m) => !(m.spec && !m.game))) {
+      await this.setGrace({ name: me.name, game: !!me.game, mig: !!me.mig, rs: !!me.rs });
+      return;   // hold slot 0: guests keep their view of the room
+    }
     if (me.slot !== 0) {
+      if (this.members(ws).every((m) => m.slot !== 0)) await this.getGrace();   // loads the placeholder for sendMembers
       this.sendMembers(ws);
       if (!me.game && !me.spec) await this.syncSmash([me.slot], null);
       return;
     }
+    await this.hostGone(me, ws);
+  }
+
+  async hostGone(me, ws) {
     const rest = this.members(ws);
     const keep = me.game ? [] : rest.filter((m) => m.mig && !m.spec);
     for (const m of rest) {
@@ -483,6 +505,42 @@ export class HubRoom extends DurableObject {
     this.sendMembers();
     this.sendPeers();
     if (!me.game) await this.syncSmash([0], { from, to: 0 });
+  }
+
+  // ---- host grace (see HOST_GRACE_MS) ----
+  async getGrace() {
+    if (this.graceLoaded) return this.grace || null;
+    this.grace = (await this.ctx.storage.get("hostgrace")) || null;
+    this.graceLoaded = true;
+    if (this.grace && Date.now() > this.grace.until + 2000) { await this.alarm(); return null; }
+    return this.grace;
+  }
+
+  async setGrace(g) {
+    this.grace = { ...g, until: Date.now() + graceMs(this.env) };
+    this.graceLoaded = true;
+    await this.ctx.storage.put("hostgrace", this.grace);
+    await this.ctx.storage.setAlarm(this.grace.until);
+    noteRows(2);
+    this.sendMembers();   // placeholder keeps the host listed
+  }
+
+  async clearGrace() {
+    this.grace = null;
+    this.graceLoaded = true;
+    await this.ctx.storage.delete("hostgrace");
+    try { await this.ctx.storage.deleteAlarm(); } catch { /* none */ }
+  }
+
+  // Grace over and the host never came back: the teardown webSocketClose would have done at once.
+  async alarm() {
+    const g = this.grace && this.graceLoaded ? this.grace : await this.ctx.storage.get("hostgrace");
+    this.grace = null;
+    this.graceLoaded = true;
+    if (!g) return;
+    await this.ctx.storage.delete("hostgrace");
+    if (this.members().some((m) => m.slot === 0)) return;   // reclaimed in the meantime
+    await this.hostGone({ slot: 0, name: g.name, game: g.game, mig: g.mig, rs: g.rs }, undefined);
   }
 
   async webSocketError(ws) {
