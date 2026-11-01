@@ -40,6 +40,12 @@ const SUITE = [
   { file: "test_spectate_budget.mjs", kind: "ws", vars: { DAILY_REQ_CAP: "60" } },
   { file: "test_dropin.mjs", kind: "ws" },
   { file: "test_dropin_budget.mjs", kind: "ws", vars: { DAILY_REQ_CAP: "60" } },
+  // Plan 4 lane L10: free-tier caps (presence fan-out, rows-written axis, registration limits, pre-auth, /hub relay caps)
+  { file: "test_presence_cap.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, PRESENCE_FANOUT_CAP: "3" } },
+  { file: "test_register_rl.mjs", kind: "ws", vars: { REG_PER_IP: "2", REG_GLOBAL: "7", REG_TEST_PER_IP: "3", REG_TEST_GLOBAL: "4", TEST_BUDGET: "1" } },
+  { file: "test_friends_preauth.mjs", kind: "ws", vars: { HELLO_DEADLINE_MS: "2000" } },
+  { file: "test_rows_gate.mjs", kind: "ws", vars: { DAILY_ROWS_CAP: "80" } },
+  { file: "test_hub_relay_caps.mjs", kind: "self", env: { RELAY_CAPS_PORT: "10077", RELAY_CAPS_PORT2: "10078" } },
 ];
 
 const filter = process.argv[2] || "";

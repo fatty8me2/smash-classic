@@ -9,6 +9,13 @@
 // C->S JSON: msg{body}, endpoint{public,local}, keepalive (auto-answered)
 // Binary: byte0 = destination slot (0xFF = all others), rewritten to the
 //         sender's slot on delivery. Max 1200 bytes.
+// Relay budget (additive; older clients ignore the message): a frame that is NOT relayed is answered with
+//         relay_denied{reason,detail} to its sender (at most once per RELAY_NOTICE_MS per socket), reason "server-busy" (daily
+//         budget: >= 50% for a room's first relayed frame = a new relay session, >= 90% for any) or "rate-limited" (the room
+//         exceeded RELAY_ROOM_MSGS_PER_SEC frames/s or the socket RELAY_BYTES_PER_SEC bytes/s). A socket over its byte budget
+//         for RELAY_ABUSE_MS without pause is closed with 1008 "relay-over-budget". Direct UDP is unaffected.
+// Every socket: text frames are limited to TEXT_MSGS_PER_SEC/s (burst TEXT_BURST); a socket over budget for TEXT_ABUSE_MS is
+//         closed with 1008 "rate-limited". ident: at most IDENT_TRIES_PER_SOCKET tries per seat, and only registered accounts.
 // Host migration (lobby rooms only, i.e. no "-N" game-room suffix):
 //   A client opts in with &caps=hostmig. When the host (slot 0) leaves, the
 //   lowest remaining slot among opted-in members is renumbered to slot 0 (the
@@ -41,7 +48,8 @@
 //   below 50% (gate().spectate, else "spectate-busy"), game rooms also need a free slot 1..3 ("room-full").
 //   Attachment/member field `spec:true`. welcome{room,slot,spec:true}.
 //   LOBBY room: slot 4 or 5 (lowest free), NOT a member: excluded from members/peers/pairAll/migration/binary relay (both ways),
-//     receives every msg broadcast. The host's latest msg with body.kind==="launch" is stored (one storage write, key "launch")
+//     receives every msg broadcast. The host's latest msg with body.kind==="launch" is kept in memory and stored (key "launch";
+//     written only when the body changed, at most LAUNCH_WRITES_PER_HOUR times an hour, never at >= 90% of the daily budget)
 //     and replayed to a new watcher as msg{from:0,body:{...body,watch:true}} when younger than 6 h. Host leaving closes
 //     spectators with 4001 (no migration, never "keep" candidates). Spectator leave does not call syncSmash.
 //   GAME room: takes a real slot 1..3, listed in members as {slot,name,spec:true} (only spec members carry the field)
@@ -50,7 +58,11 @@
 //     msg/ident are ignored. Host leaving closes them like other members (4001, host-left-game for reasons clients).
 
 import { DurableObject } from "cloudflare:workers";
-import { meter, gate } from "./reqbudget.js";
+import { meter, gate, noteRows, RELAY_ROOM_MSGS_PER_SEC } from "./reqbudget.js";
+import {
+  FixedWindow, ByteBucket, SocketLimiter, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, RELAY_ABUSE_MS, RELAY_NOTICE_MS,
+  TEXT_MSGS_PER_SEC, TEXT_BURST, TEXT_ABUSE_MS, IDENT_TRIES_PER_SOCKET, IDENT_PER_ROOM_PER_HOUR, LAUNCH_WRITES_PER_HOUR,
+} from "./limits.js";
 
 const ROOM_RE = /^[A-HJ-NP-Z2-9]{6}(-[0-9]{1,6})?$/;
 const ENDPOINT_RE = /^(-|[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5})$/;
@@ -94,6 +106,70 @@ export class HubRoom extends DurableObject {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair('{"type":"keepalive"}', '{"type":"keepalive_ack"}'));
+    // In-memory guards (a room that hibernates is idle, so losing them only resets counters).
+    this.texts = new SocketLimiter(TEXT_MSGS_PER_SEC, TEXT_BURST, TEXT_ABUSE_MS);   // text frames per socket
+    this.relayBytes = new SocketLimiter(RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, RELAY_ABUSE_MS);   // relayed bytes per socket
+    this.roomRate = new ByteBucket(RELAY_ROOM_MSGS_PER_SEC, RELAY_ROOM_MSGS_PER_SEC * 2);   // relayed frames per room
+    this.relaying = false;                 // this room has relayed a frame: its relay session already exists
+    this.noticed = new WeakMap();          // socket -> when it was last told "relay_denied"
+    this.identTries = new WeakMap();       // socket -> ident attempts
+    this.identWin = new FixedWindow(IDENT_PER_ROOM_PER_HOUR, 3600 * 1000);
+    this.launchWin = new FixedWindow(LAUNCH_WRITES_PER_HOUR, 3600 * 1000);
+    this.launchMem = undefined;            // the host's latest launch {body, at} (undefined = not loaded from storage yet)
+    this.launchSig = "";                   // JSON of the launch body last written to storage
+  }
+
+  /* The host's stored launch replay for late spectators / drop-ins: memory first (the write is rate limited), then storage. */
+  async getLaunch() {
+    if (this.launchMem === undefined) this.launchMem = (await this.ctx.storage.get("launch")) || null;
+    return this.launchMem;
+  }
+
+  /* Remember the host's launch. Memory always; storage only when the body changed, at most LAUNCH_WRITES_PER_HOUR times an
+   * hour, and not at all once the daily budget is nearly gone: a host that sends launch messages in a loop used to cost one
+   * storage row each, from one anonymous socket. */
+  async storeLaunch(body) {
+    const rec = { body, at: Date.now() };
+    this.launchMem = rec;
+    const sig = JSON.stringify(body);
+    if (sig === this.launchSig) return;
+    if (!gate(this.env, (p) => this.ctx.waitUntil(p)).relayFrames) return;
+    if (!this.launchWin.hit("w")) return;
+    this.launchSig = sig;
+    try {
+      await this.ctx.storage.put("launch", rec);
+      noteRows(1);
+    } catch { /* rows exhausted: the replay stays in memory, the launch itself was already broadcast */ }
+  }
+
+  /* Tell a socket its relayed frames are not being forwarded (at most every RELAY_NOTICE_MS), then report "dropped". */
+  denyRelay(ws, reason, detail) {
+    const t = Date.now();
+    if (t - (this.noticed.get(ws) || 0) >= RELAY_NOTICE_MS) {
+      this.noticed.set(ws, t);
+      try { ws.send(JSON.stringify({ type: "relay_denied", reason, detail })); } catch { /* closing */ }
+    }
+    return false;
+  }
+
+  /* May this relayed frame go out? Order: daily budget (>= 90%: nothing; >= 50%: not for a room that has not relayed yet),
+   * then the room's frame rate, then the sender's byte rate (sustained abuse closes the socket). */
+  relayAllowed(ws, bytes) {
+    const g = gate(this.env, (p) => this.ctx.waitUntil(p));
+    const busy = "Server busy, relay unavailable. Try a direct connection.";
+    if (!g.relayFrames) return this.denyRelay(ws, "server-busy", busy);
+    if (!this.relaying) {
+      if (!g.relayNew) return this.denyRelay(ws, "server-busy", busy);
+      this.relaying = true;
+    }
+    if (!this.roomRate.take(1)) return this.denyRelay(ws, "rate-limited", "This room is sending too much through the relay.");
+    const v = this.relayBytes.check(ws, bytes);
+    if (v === 2) {
+      console.log("[hub] relay sustained abuse, closing a socket");
+      try { ws.close(1008, "relay-over-budget"); } catch { /* already closed */ }
+    }
+    if (v) return this.denyRelay(ws, "rate-limited", "You are sending too much through the relay.");
+    return true;
   }
 
   // Live members, optionally excluding one socket (the one that is closing).
@@ -186,6 +262,7 @@ export class HubRoom extends DurableObject {
     const body = await request.json().catch(() => ({}));
     if (typeof body.room === "string" && ROOM_RE.test(body.room)) {
       await this.ctx.storage.put("smash", { room: body.room, at: Date.now() });
+      noteRows(1);
     }
     return Response.json({ ok: true });
   }
@@ -229,7 +306,7 @@ export class HubRoom extends DurableObject {
       slot = pool.find((s) => !taken.has(s));
       if (slot === undefined) return this.reject("room-full");
       if (dropin && !isGameRoom(room)) {
-        const l = await this.ctx.storage.get("launch");
+        const l = await this.getLaunch();
         if (!l || !l.body || !(Date.now() - l.at < SMASH_LINK_TTL_MS)) return this.reject("no-such-game");
         if (!Number.isInteger(l.body.dropin)) return this.reject("host-too-old");
         if (l.body.dropin <= 0) return this.reject("no-free-port");   // the host's own launch plan has no spare port (static; the host runner is the only authority on live ports and refuses a knock itself)
@@ -257,7 +334,7 @@ export class HubRoom extends DurableObject {
     pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs, spec, dr: !!dropRec });
     pair[1].send(JSON.stringify(spec ? (dropRec ? { type: "welcome", room, slot, spec: true, dropin: true } : { type: "welcome", room, slot, spec: true }) : { type: "welcome", room, slot }));
     if (spec && !isGameRoom(room)) {
-      const l = dropRec || await this.ctx.storage.get("launch");
+      const l = dropRec || await this.getLaunch();
       if (l && l.body && Date.now() - l.at < SMASH_LINK_TTL_MS) {
         try { pair[1].send(JSON.stringify({ type: "msg", from: 0, body: dropRec ? { ...l.body, watch: true, dropin_join: true } : { ...l.body, watch: true } })); } catch { /* closing */ }
       }
@@ -274,8 +351,9 @@ export class HubRoom extends DurableObject {
     if (typeof message !== "string") {
       // Relayed game packet: byte0 = destination slot.
       if (message.byteLength < 1 || message.byteLength > MAX_BINARY_BYTES) return;
-      if (!gate(this.env).relayFrames) return;   // cost guard: >=90% of the daily budget, stop relaying game packets
       if (me.spec && !me.game) return;   // lobby spectators never send binary
+      // Cost guard and caps (daily budget, room frame rate, socket byte rate); a refused frame is answered with relay_denied.
+      if (!this.relayAllowed(ws, message.byteLength)) return;
       const src = new Uint8Array(message);
       const dest = src[0];
       const out = new Uint8Array(src.length);
@@ -293,6 +371,12 @@ export class HubRoom extends DurableObject {
       }
       return;
     }
+    // Text frames: a per-socket budget before any parsing (a flood is dropped, and the socket closed once it stays over).
+    const tv = this.texts.check(ws);
+    if (tv) {
+      if (tv === 2) { try { ws.close(1008, "rate-limited"); } catch { /* already closed */ } }
+      return;
+    }
     if (message.length > MAX_TEXT_BYTES) return;
 
     let msg;
@@ -307,7 +391,8 @@ export class HubRoom extends DurableObject {
       case "msg": {
         if (msg.body === null || typeof msg.body !== "object") return;
         this.broadcast({ type: "msg", from: me.slot, body: msg.body }, ws);
-        if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.ctx.storage.put("launch", { body: msg.body, at: Date.now() });
+        // The host's launch is kept for late spectators / drop-ins: storage is written once per changed launch (storeLaunch).
+        if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.storeLaunch(msg.body);
         // The host starting a game: everyone present who proved their account becomes friends with each other.
         if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.pairAll(true);
         break;
@@ -317,14 +402,23 @@ export class HubRoom extends DurableObject {
         // Only used for automatic friending; never forwarded to other members. One DO call per seat.
         if (me.uid || typeof msg.uid !== "string" || !UID_RE.test(msg.uid) || typeof msg.secret !== "string") return;
         if (me.game) return;
+        // A seat sends one ident per welcome. Retries are capped per seat and per room, and only REGISTERED accounts are woken:
+        // an ident with a made-up uid used to make the Worker create (and write the schema of) a brand-new account hub, each time.
+        const tries = (this.identTries.get(ws) || 0) + 1;
+        this.identTries.set(ws, tries);
+        if (tries > IDENT_TRIES_PER_SOCKET || !this.identWin.hit("r")) return;
         let ok = false;
         try {
-          const stub = this.env.USER_HUBS.get(this.env.USER_HUBS.idFromName(msg.uid));
-          const res = await stub.fetch("https://userhub/i/link_auth", {
-            method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
-            body: JSON.stringify({ uid: msg.uid, secret: msg.secret }),
-          });
-          ok = (await res.json()).r === "ok";
+          const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+          const known = await (await dir.fetch("https://directory/lookup?prefix=" + msg.uid.slice(0, 8), { headers: { "x-rh-internal": "1" } })).json();
+          if (known.uid === msg.uid) {
+            const stub = this.env.USER_HUBS.get(this.env.USER_HUBS.idFromName(msg.uid));
+            const res = await stub.fetch("https://userhub/i/link_auth", {
+              method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+              body: JSON.stringify({ uid: msg.uid, secret: msg.secret }),
+            });
+            ok = (await res.json()).r === "ok";
+          }
         } catch { /* unreachable: no auto friending */ }
         const now = ws.deserializeAttachment();
         if (!ok || !now || typeof now.slot !== "number" || now.slot < 0 || now.uid) return;

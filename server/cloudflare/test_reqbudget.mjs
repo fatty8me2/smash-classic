@@ -42,4 +42,30 @@ ok(presenceAlarmMs() === Math.round(PRESENCE_LEASE_MS / 3) && presenceAlarmMs() 
   ok(model(presenceAlarmMs()) < 50_000, `200 accounts x 3h = ${Math.round(model(presenceAlarmMs()))} units/day < 50% cap`);
   ok(model(60_000) > 2.5 * model(presenceAlarmMs()), "old 60 s alarm cost >2.5x more");
 }
+// ---- rows-written axis (Durable Object storage rows; the free plan allows 100,000 a day, the cap is 60%) ----
+import { DEFAULT_DAILY_ROWS_CAP, EMPTY_COUNTS } from "./src/reqbudget_core.js";
+{
+  const CAP = DEFAULT_DAILY_CAP, DUR = DEFAULT_DAILY_DUR_CAP, ROWS = DEFAULT_DAILY_ROWS_CAP;
+  ok(DEFAULT_DAILY_ROWS_CAP >= 50_000 && DEFAULT_DAILY_ROWS_CAP <= 70_000, `rows cap ${ROWS} is 50-70% of the free plan's 100,000 rows written a day`);
+  ok(EMPTY_COUNTS.rows === 0 && "rows" in EMPTY_COUNTS, "counts carry a rows axis");
+  ok(effectiveTotal(10, 0, CAP, DUR, 0) === 10 && effectiveTotal(10, 0, CAP, DUR) === 10, "no rows written: the total is unchanged (old callers keep working)");
+  ok(effectiveTotal(10, 0, CAP, DUR, ROWS * 0.5, ROWS) === 50_000, "half of the rows cap counts as half of the request cap");
+  ok(effectiveTotal(60_000, DUR * 0.7, CAP, DUR, ROWS * 0.65) === 70_000, "the highest of units, duration and rows decides");
+  ok(effectiveTotal(10, 0, CAP, DUR, -500, ROWS) === 10, "negative rows are ignored");
+  ok(effectiveTotal(10, 0, CAP, DUR, ROWS * 10, 0) === 10, "a rows cap of 0 turns the axis off");
+  ok(effectiveTotal(10, 0, 1000, DUR, 30, 60) === 500, "caps scale together (custom cap 1000, rows cap 60: 30 rows = 500 units)");
+  // The same 50/70/90% gates trip on rows alone.
+  const gateAt = (frac) => verdict(effectiveTotal(0, 0, CAP, DUR, ROWS * frac, ROWS));
+  let v2 = gateAt(0.49); ok(v2.relayNew && v2.spectate && v2.roomNew && v2.relayFrames, "49% of the rows cap: everything allowed");
+  v2 = gateAt(0.5); ok(!v2.relayNew && !v2.spectate && v2.roomNew && v2.relayFrames, "50% of the rows cap: no new relay sessions, no spectating");
+  v2 = gateAt(0.7); ok(!v2.roomNew && v2.relayFrames, "70% of the rows cap: no new rooms");
+  v2 = gateAt(0.9); ok(!v2.relayFrames, "90% of the rows cap: relayed frames dropped, new /friends sockets refused");
+  ok(unitsOfAll({ rows: 99_999 }) === 0 && durationGbs({ rows: 99_999 }) === 0, "rows never count as request units or duration");
+  const s2 = sumCounts({ rows: 5, reqs: 1 }, { rows: 7 });
+  ok(s2.rows === 12 && s2.reqs === 1, "sumCounts merges rows");
+  // Daily-load model: a presence alarm writes ~4.5 rows (setAlarm, the directory lease and its index entry, the budget flush).
+  const model = (accounts, hours) => accounts * (hours * 3_600_000 / presenceAlarmMs()) * 4.5;
+  ok(model(100, 3) < ROWS * 0.5, `100 accounts online 3 h a day = ~${Math.round(model(100, 3))} rows, under the 50% gate of ${ROWS * 0.5}`);
+  ok(model(30, 24) > ROWS * 0.5 && model(30, 24) < ROWS, "30 accounts left open all day pass the 50% gate (the heartbeat is the biggest writer) but stay under the cap");
+}
 console.log(bad ? `${bad} FAILED` : "all passed"); process.exit(bad ? 1 : 0);

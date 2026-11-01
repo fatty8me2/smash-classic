@@ -5,7 +5,8 @@
 export const MB = 1024 * 1024;
 export const ACCOUNT_CAP = 50 * MB;      // per account, all retained versions
 export const PROT_CAP = 20 * MB;         // protected class ceiling (settings + battery + small cards, history included)
-export const SMALL_CARD = 512 * 1024;    // memory cards up to this size are protected
+export const SMALL_CARD = 512 * 1024;    // classify(): the size split between a small "battery" card and a large "card"
+export const PROTECTED_CARD_MAX = 16 * MB; // memory cards up to this size are protected (PS2 8 MB card, GameCube 16 MB card; PROT_CAP still bounds the pool)
 export const POOL_TIGHT = 0.7;
 export const POOL_FULL = 0.9;
 export const KEEP_PROTECTED = 3;         // retained versions per path
@@ -35,7 +36,7 @@ export function classifyPath(rel, size = 0) {
   return size > SMALL_CARD ? "card" : "battery";   // unknown layout: small stays protected, big is treated as a large card
 }
 
-export const isProtectedClass = (cls, size = 0) => cls === "settings" || cls === "battery" || (cls === "card" && size <= SMALL_CARD);
+export const isProtectedClass = (cls, size = 0) => cls === "settings" || cls === "battery" || (cls === "card" && size <= PROTECTED_CARD_MAX);
 export const keepVersions = (prot) => (prot ? KEEP_PROTECTED : KEEP_LARGE);
 
 // v1 object key ("system/game/rest" | "_account/rest" | anything else) -> game + path inside the game.

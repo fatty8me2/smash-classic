@@ -23,7 +23,10 @@
 //          whenever someone joins, leaves or reports an endpoint. public and
 //          local are "-" until that member has reported its endpoint.
 //   C->S {type:"relay"}          direct UDP failed for some pair; allow relaying
-//   S->C {type:"relaying"}       to everyone; binary frames are now forwarded
+//   S->C {type:"relaying"}       to everyone; binary frames are now forwarded. (The room's relay flag is stored once, when it turns
+//          on; a repeated request only repeats this message. Text frames are limited to TEXT_MSGS_PER_SEC per socket, a socket
+//          that stays over budget for TEXT_ABUSE_MS is closed with 1008.)
+//   S->C {type:"relay_denied", reason:"server-busy", detail}   the daily budget is at 50% or more: no new relay session
 //   C->S {type:"keepalive"}  ->  S->C {type:"keepalive_ack"}
 //   S->C {type:"peer_left", slot}
 //   S->C {type:"host", slot, prev}
@@ -56,10 +59,13 @@ import { hubFetch, HubRoom } from "./hub.js";
 import { friendsFetch, UserHub, Directory } from "./friends.js";
 import { inviteFetch } from "./invite.js";
 import { linkFetch, LinkBox } from "./link.js";
-import { FixedWindow, ByteBucket, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN, RELAY_ABUSE_MS } from "./limits.js";
+import {
+  FixedWindow, ByteBucket, SocketLimiter, VersionKeys, ipKey, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN, RELAY_ABUSE_MS,
+  HUB_ROOMS_PER_IP_PER_MIN, HUB_SOCKETS_PER_IP_PER_MIN, TEXT_MSGS_PER_SEC, TEXT_BURST, TEXT_ABUSE_MS,
+} from "./limits.js";
 import { savesFetch } from "./saves.js";
 import { R2Budget } from "./r2budget.js";
-import { ReqBudget, gate, meter, noteRequest, noteRelayFrame, RELAY_ROOM_MSGS_PER_SEC } from "./reqbudget.js";
+import { ReqBudget, gate, meter, noteRequest, noteRelayFrame, noteRows, flushForTests, RELAY_ROOM_MSGS_PER_SEC } from "./reqbudget.js";
 import { OpsStats, adminStatsFetch, count, countVersion, flushDue } from "./stats.js";
 
 export { HubRoom, UserHub, Directory, LinkBox, R2Budget, OpsStats, ReqBudget };
@@ -69,9 +75,14 @@ const MAX_TEXT_BYTES = 2048;
 const MAX_BINARY_BYTES = 1024;
 const MAX_PLAYERS = 4;
 
-// In-memory per-isolate limiter for room creation. Only applies when Cloudflare
-// supplies the client IP (not under wrangler dev), so local tests are unaffected.
+// In-memory per-isolate limiter for room creation on /ws. Local `wrangler dev` reports 127.0.0.1 as the client address, so it
+// applies there too (the /hub limiters below skip loopback instead).
 const roomCreates = new FixedWindow(ROOMS_PER_IP_PER_MIN, 60 * 1000);
+// /hub (RetroHub rooms), per client address key (see ipKey: IPv6 by /64, loopback never limited): new rooms and new sockets a minute.
+const hubRooms = new FixedWindow(HUB_ROOMS_PER_IP_PER_MIN, 60 * 1000);
+const hubSockets = new FixedWindow(HUB_SOCKETS_PER_IP_PER_MIN, 60 * 1000);
+// Game versions are client-supplied text: only plain x.y.z, and a bounded number of distinct ones a day, become stats counters.
+const versionKeys = new VersionKeys();
 
 function send(ws, data) {
   try {
@@ -81,13 +92,13 @@ function send(ws, data) {
   }
 }
 
-// "server-busy" answer for a refused WebSocket (readable by the client); plain 503 when it is not an upgrade.
-function busySocket(request) {
-  if (request.headers.get("Upgrade") !== "websocket") return new Response("server busy", { status: 503 });
+// Refused WebSocket with a readable reason (default "server-busy"); plain 503 when it is not an upgrade.
+function busySocket(request, reason = "server-busy") {
+  if (request.headers.get("Upgrade") !== "websocket") return new Response(reason === "server-busy" ? "server busy" : reason, { status: reason === "server-busy" ? 503 : 429 });
   const pair = new WebSocketPair();
   pair[1].accept();
-  pair[1].send(JSON.stringify({ type: "error", reason: "server-busy" }));
-  pair[1].close(4000, "server-busy");
+  pair[1].send(JSON.stringify({ type: "error", reason }));
+  pair[1].close(4000, reason);
   return new Response(null, { status: 101, webSocket: pair[0] });
 }
 
@@ -103,8 +114,16 @@ export default {
       return Response.json({ ok: true, service: "smash-netplay", netplay: 2, maxPlayers: MAX_PLAYERS, hostMigration: 1 });
     }
     if (url.pathname === "/hub") {
+      const role = url.searchParams.get("role");
+      // Per-address limits (one address cannot open sockets or rooms in a loop; the daily budget then never sees it).
+      // ipKey is "" for loopback, so a local wrangler (every test) is never limited.
+      const ipk = request.headers.get("Upgrade") === "websocket" ? ipKey(request.headers.get("CF-Connecting-IP")) : "";
+      if (ipk && (!hubSockets.hit(ipk) || (role === "host" && !hubRooms.hit(ipk)))) {
+        console.log(`[hub] rate-limited ip=${ipk.slice(0, 45)} role=${role}`);
+        return busySocket(request, "rate-limited");
+      }
       // Cost guard: no NEW hub rooms once 70% of the daily budget is used (joins into existing rooms still work).
-      if (url.searchParams.get("role") === "host" && !gate(env, (p) => ctx.waitUntil(p)).roomNew) return busySocket(request);
+      if (role === "host" && !gate(env, (p) => ctx.waitUntil(p)).roomNew) return busySocket(request);
       return hubFetch(request, env);
     }
     if (url.pathname.startsWith("/j/")) {
@@ -113,6 +132,9 @@ export default {
     if (url.pathname === "/__test/alias" && env.TEST_ALIAS === "1" && request.method === "POST") {   // local tests only (never set in production)
       const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
       return dir.fetch("https://directory/alias", { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: await request.text() });
+    }
+    if (url.pathname === "/__test/budget" && env.TEST_BUDGET === "1") {   // local tests only (never set in production): the day's REQ_BUDGET totals
+      return Response.json(await flushForTests(env));
     }
     if (url.pathname === "/__test/aliases" && env.TEST_ALIAS === "1" && request.method === "POST") {   // local tests only
       const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
@@ -159,7 +181,8 @@ export default {
     const hm = url.searchParams.get("hm") || "0";
     const ver = (url.searchParams.get("ver") || "-").slice(0, 16);
     console.log(`[smash] ${role} room=${room} v=${v} hm=${hm} ver=${ver}`);
-    countVersion(ver);
+    const verKey = versionKeys.key(ver);   // anonymous callers cannot mint a stats counter (= a stored row) per request
+    if (verKey) countVersion(verKey);
     flushDue(env, (p) => ctx.waitUntil(p));
     const stub = env.ROOMS.get(env.ROOMS.idFromName(room));
     return stub.fetch(request);
@@ -175,6 +198,7 @@ export class NetplayRoom extends DurableObject {
     this.relay = null;
     this.legacy = null;
     this.hostSlot = null;   // slot that leads the room (v2); null = no room
+    this.texts = new SocketLimiter(TEXT_MSGS_PER_SEC, TEXT_BURST, TEXT_ABUSE_MS);   // text frames per socket (in memory)
     this.ctx.blockConcurrencyWhile(async () => {
       this.relay = (await this.ctx.storage.get("relay")) === true;
       this.legacy = (await this.ctx.storage.get("legacy")) === true;
@@ -280,6 +304,7 @@ export class NetplayRoom extends DurableObject {
       await this.ctx.storage.deleteAll();
       await this.ctx.storage.put("legacy", legacy);
       if (!legacy) await this.ctx.storage.put("host", 0);
+      noteRows(5);   // deleteAll of the old flags (up to 3 keys) + the two puts
     } else {
       if (this.legacy !== legacy) {
         return this.reject(legacy
@@ -419,6 +444,14 @@ export class NetplayRoom extends DurableObject {
       }
       return;
     }
+    // Text frames bill like every incoming Durable Object message (relayed binary frames are counted above), and a socket gets a
+    // generous per-second budget: the room's control traffic is a few frames a minute, a flood is dropped and then disconnected.
+    meter(this.env, this.ctx, "ws");
+    const tv = this.texts.check(ws);
+    if (tv) {
+      if (tv === 2) { try { ws.close(1008, "rate-limited"); } catch { /* already closed */ } }
+      return;
+    }
     if (message.length > MAX_TEXT_BYTES) return;
 
     let msg;
@@ -451,8 +484,14 @@ export class NetplayRoom extends DurableObject {
           send(ws, JSON.stringify({ type: "relay_denied", reason: "server-busy", detail: "Server busy, relay unavailable. Try a direct connection." }));
           break;
         }
-        await this.ctx.storage.put("relay", true);
         if (!this.relay) {
+          // The flag is written once, when relaying turns on. (It was written on EVERY relay frame, even with relaying already on:
+          // one anonymous socket looping `{"type":"relay"}` burned a storage row per frame, the whole day's budget in minutes.)
+          // It is not written at all once the budget is nearly gone (frames are dropped then), and a failed write must not stop
+          // the relay: the flag only matters after a hibernation, and the next relay request sets it again.
+          if (gate(this.env, (p) => this.ctx.waitUntil(p)).relayFrames) {
+            try { await this.ctx.storage.put("relay", true); noteRows(1); } catch { /* rows exhausted: relay anyway */ }
+          }
           this.relayStart = Date.now();
           console.log(`[smash] relay on room=${this.roomCode || "?"}`);
         }
@@ -503,6 +542,7 @@ export class NetplayRoom extends DurableObject {
       if (!this.legacy) {
         this.hostSlot = null;
         await this.ctx.storage.delete("host");
+        noteRows(1);
       }
       return;
     }
@@ -521,6 +561,7 @@ export class NetplayRoom extends DurableObject {
       if (!this.legacy) {
         this.hostSlot = null;
         await this.ctx.storage.delete("host");
+        noteRows(1);
       }
       return;
     }
@@ -538,6 +579,7 @@ export class NetplayRoom extends DurableObject {
     }
     this.announce();
     await this.ctx.storage.put("host", next);
+    noteRows(1);
   }
 
   // RetroHub's room changed (HubRoom -> here): {gone:[hub slots that left], remap:{from,to}|null (a new RetroHub host is

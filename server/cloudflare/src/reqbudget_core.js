@@ -39,11 +39,15 @@ export class DayLedger {
 export const unitsOf = (requests, frames) => Math.max(0, requests) + Math.max(0, frames) / FRAMES_PER_UNIT;
 
 // ---- Full billable-unit model (Workers + Durable Objects) ----
-// Cloudflare free-tier limits (https://developers.cloudflare.com/durable-objects/platform/pricing/ and
-// https://developers.cloudflare.com/workers/platform/limits/, checked 2026-10-24; reset 00:00 UTC):
-//   Workers:         100,000 requests/day
+// Cloudflare free-tier limits, re-read 2026-11-01 (reset 00:00 UTC):
+//   https://developers.cloudflare.com/durable-objects/platform/pricing/ (page "Last updated Oct 18, 2026"),
+//   https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/, https://developers.cloudflare.com/workers/platform/limits/
+//   Workers:         100,000 requests/day; 50 subrequests per invocation (Free)
 //   Durable Objects: 100,000 requests/day (alarm invocations count), 13,000 GB-s duration/day,
-//                    5M rows read/day, 100,000 rows written/day (each setAlarm() = 1 row written), 5 GB stored.
+//                    5M rows read/day, 100,000 rows written/day, 5 GB SQL storage.
+//                    Rows written: every setAlarm() = 1, deletes count, KV put/delete on a SQLite-backed object are billed as
+//                    rows, and "every row update of an index counts as an additional row" (SqlStorageCursor.rowsWritten is the
+//                    figure used for billing).
 //   DO WebSocket:    incoming messages billed 20:1 as requests (100 msgs = 5 requests); outgoing messages and
 //                    protocol pings are free; hibernated objects accrue no duration.
 // Exceeding a limit makes that operation fail (no overage charge on the free plan), but we still degrade early.
@@ -54,7 +58,14 @@ export const DEFAULT_DAILY_DUR_CAP = 13_000;    // GB-s per day (DO free tier)
 export const DO_MEMORY_GB = 0.128;              // DO billed at 128 MB
 export const DUR_SECS_PER_DO_REQ = 0.05;        // estimated wall time an awake DO spends per request/alarm
 export const DUR_SECS_PER_WS_MSG = 0.005;       // ... per incoming WS message (hibernation API wakes briefly)
-export const EMPTY_COUNTS = Object.freeze({ reqs: 0, frames: 0, doReqs: 0, wsMsgs: 0, alarms: 0, gbs: 0 });
+// Rows-written axis. The free plan allows 100,000 rows written per day for the WHOLE account and a failed write is an outage
+// (hello, presence, hosting, relay start all write), so this axis is folded into the same 50/70/90% gates as the request
+// units. The cap is 60% of the free limit: some writers are not metered here (R2Budget keeps its own 70k guard; LinkBox and
+// OpsStats are not wired in), and the 90% gate must trip with margin left. Override with the DAILY_ROWS_CAP var.
+// What is counted: the real cursor.rowsWritten of every UserHub / Directory SQL statement, 1 row per KV put/delete and per
+// setAlarm in HubRoom / NetplayRoom / UserHub, and the ReqBudget flush itself.
+export const DEFAULT_DAILY_ROWS_CAP = 60_000;
+export const EMPTY_COUNTS = Object.freeze({ reqs: 0, frames: 0, doReqs: 0, wsMsgs: 0, alarms: 0, gbs: 0, rows: 0 });
 
 // Pure: estimated DO duration in GB-s for the counted DO events (plus any explicit awake seconds).
 export const durationGbs = (c, extraSecs = 0) =>
@@ -66,10 +77,11 @@ export const unitsOfAll = (c) =>
   Math.max(0, c.reqs || 0) + Math.max(0, c.doReqs || 0) + Math.max(0, c.alarms || 0)
   + (Math.max(0, c.frames || 0) + Math.max(0, c.wsMsgs || 0)) / FRAMES_PER_UNIT;
 
-// Pure: fold duration pressure into the request-unit axis so one verdict() covers both limits:
-// durGbs/durCap of the day gone counts like the same fraction of the request cap.
-export const effectiveTotal = (units, gbs, cap = DEFAULT_DAILY_CAP, durCap = DEFAULT_DAILY_DUR_CAP) =>
-  Math.max(units, durCap > 0 ? (gbs / durCap) * cap : 0);
+// Pure: fold duration and rows-written pressure into the request-unit axis so one verdict() covers all three limits:
+// durGbs/durCap (and rows/rowsCap) of the day gone counts like the same fraction of the request cap. The last two
+// parameters are optional, so callers that only know requests and duration keep working.
+export const effectiveTotal = (units, gbs, cap = DEFAULT_DAILY_CAP, durCap = DEFAULT_DAILY_DUR_CAP, rows = 0, rowsCap = DEFAULT_DAILY_ROWS_CAP) =>
+  Math.max(units, durCap > 0 ? (gbs / durCap) * cap : 0, rowsCap > 0 ? (Math.max(0, rows) / rowsCap) * cap : 0);
 
 export const sumCounts = (a, b) => {
   const o = { ...EMPTY_COUNTS };

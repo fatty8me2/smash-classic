@@ -35,7 +35,8 @@ for (const p of [goldenPath, goldenAlt]) {
   }
 }
 for (const [rel, size, cls] of cases) check(classifyPath(rel, Number(size)) === cls, `classify ${rel} (${size}) -> ${cls}`);
-check(isProtectedClass("card", 512 * 1024) && !isProtectedClass("card", 512 * 1024 + 1), "cards <= 512 KB protected, bigger are large");
+check(isProtectedClass("card", 512 * 1024) && isProtectedClass("card", 8 * MB) && isProtectedClass("card", 16 * MB) && !isProtectedClass("card", 16 * MB + 1), "memory cards up to 16 MB (PS2 8 MB, GameCube) are protected, bigger are large");
+check(classifyPath("battery/ps2card.ps2", 8 * MB) === "card" && isProtectedClass(classifyPath("battery/ps2card.ps2", 8 * MB), 8 * MB), "the PS2 8 MB card is a protected card class");
 check(isProtectedClass("battery", 5 * MB) && isProtectedClass("settings", 1), "battery and settings always protected");
 check(!isProtectedClass("state", 1) && !isProtectedClass("shot", 1), "states and shots are large");
 check(keepVersions(true) === 3 && keepVersions(false) === 1, "retention 3 protected / 1 large");
@@ -64,7 +65,7 @@ check(PROT_CAP === 20 * MB && ACCOUNT_CAP === 50 * MB, "default caps 20 MB prote
 const it = (game, path, cls, mtime, stored, playedAt, pin = false) => ({ game, path, cls, mtime, stored, playedAt, pin });
 const items = [
   it("n64/a", "states/1.state", "state", 50, 100, 10), it("n64/a", "states/0.state", "state", 40, 100, 10), it("n64/a", "states/0.png", "shot", 40, 5, 10),
-  it("ps2/b", "battery/card.ps2", "card", 10, 600000, 5), it("ps2/b", "states/s.state", "state", 20, 300, 5),
+  it("ps2/b", "battery/card.ps2", "card", 10, 20 * MB, 5), it("ps2/b", "states/s.state", "state", 20, 300, 5),
   it("gc/c", "states/x.state", "state", 5, 400, 99, true), it("n64/d", "states/y.state", "state", 70, 200, 50),
   it("n64/a", "battery/s.sra", "battery", 1, 32, 10),
 ];

@@ -12,10 +12,13 @@
 // requires the x-rh-internal header on them.
 
 import { DurableObject } from "cloudflare:workers";
-import { meter, gate, PRESENCE_LEASE_MS, presenceAlarmMs } from "./reqbudget.js";
+import { meter, gate, meteredSql, noteRows, utcDay, PRESENCE_LEASE_MS, presenceAlarmMs } from "./reqbudget.js";
 import { normalizeUsername, lookupKey, reasonToError, HOLD_MS, LEGACY_WINDOW_MS } from "./usernames.js";
 import { initGlib, isLibraryFrame, MAX_LIB_JSON, glibInfo, ownLibVer, setFriendLib, friendLibVer, dropFriendLib, clearAllLib, handleLibrary, handleFriendLibrary, internalLibGet } from "./gamelib.js";
-import { FixedWindow, onlineTargets, FRIENDS_MSGS_PER_MIN } from "./limits.js";
+import {
+  FixedWindow, FanoutRotation, FRIENDS_MSGS_PER_MIN, PRESENCE_FANOUT_CAP, HELLO_DEADLINE_MS, PREAUTH_MAX_FRAMES,
+  MAX_UNAUTHED_SOCKETS, ipKey, regLimits, regDecision, secondsToUtcMidnight,
+} from "./limits.js";
 
 const UID_RE = /^[a-z2-7]{26}$/;
 const LOBBY_RE = /^[A-HJ-NP-Z2-9]{6}(-[0-9]{1,6})?$/;
@@ -38,6 +41,9 @@ const MAX_TEXT = 500;
 const MAX_INBOX = 200;
 const INBOX_TTL = 30 * 24 * 3600 * 1000;
 const MAX_HISTORY = 200;
+// Rows-written estimate for the schema of a new account's hub (about 16 CREATE TABLE / INDEX statements): the SQL API reports 0
+// for them, the bill may not. Added once per registration to the REQ_BUDGET rows axis.
+const NEW_ACCOUNT_SCHEMA_ROWS = 20;
 const INVITE_TTL = 30 * 60 * 1000;
 export const ONLINE_LEASE_MS = PRESENCE_LEASE_MS;   // 10 min (was 3): the refresh alarm fires every lease/3 (see reqbudget_core.js)
 // Friends' play time: per game key, coarse minutes, top PT_MAX_GAMES per user. Friends pull it (cached PT_STALE_MS per friend).
@@ -162,6 +168,10 @@ export function friendsFetch(request, env) {
     const v = request.headers.get(h);
     if (v) headers.set(h, v);
   }
+  // The client address, as Cloudflare saw it (the caller cannot set this header: only the list above is copied). The hub keeps
+  // it with the socket so a brand-new account can be counted against its address (registration limits, see Directory).
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (ip) headers.set("x-rh-ip", ip.slice(0, 45));
   return stub.fetch(new Request(`https://userhub/ws?uid=${uid}`, { method: "GET", headers }));
 }
 
@@ -174,8 +184,13 @@ export function isTestName(n) { return typeof n === "string" && TEST_NAME_RE.tes
 export class Directory extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-    this.sql = ctx.storage.sql;
+    this.sql = meteredSql(ctx.storage.sql);   // every statement is charged to the REQ_BUDGET rows-written axis
     this.sql.exec("CREATE TABLE IF NOT EXISTS dir (prefix TEXT PRIMARY KEY, uid TEXT NOT NULL)");
+    // New-account counters per UTC day (registration limits, see "/register"): accepted accounts per address key and per
+    // kind ('real' | 'test'). Only accepted registrations write; a refusal is read-only.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS reg_ip (k TEXT PRIMARY KEY, day TEXT NOT NULL, n INTEGER NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS reg_day (day TEXT NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (day, kind))");
+    this.regPruned = "";
     // Accounts with at least one authed socket. Lets a sender fan presence out to
     // online friends only, with one call here instead of one per friend.
     this.sql.exec("CREATE TABLE IF NOT EXISTS online (uid TEXT PRIMARY KEY)");
@@ -307,13 +322,37 @@ export class Directory extends DurableObject {
       return json({ uid: row ? row.uid : null });
     }
     if (url.pathname === "/register" && request.method === "POST") {
-      const { prefix, uid } = await request.json();
+      // {prefix, uid, ipk?, test?}: ipk = hashed client address key from the account's hub (absent for loopback, i.e. a local
+      // wrangler: not limited), test = the hello came from a test client (own counters).
+      const { prefix, uid, ipk, test } = await request.json();
       if (!/^[a-z2-7]{8}$/.test(prefix) || !UID_RE.test(uid) || !uid.startsWith(prefix)) {
         return json({ ok: false, reason: "bad-request" }, 400);
       }
       const row = this.sql.exec("SELECT uid FROM dir WHERE prefix=?", prefix).toArray()[0];
-      if (row) return json({ ok: row.uid === uid });
+      if (row) return json({ ok: row.uid === uid });   // already registered: never limited
+      // A brand-new account: per-address and service-wide daily limits. A refusal only reads (no row is written).
+      const key = typeof ipk === "string" && /^[0-9a-f]{8,64}$/.test(ipk) ? ipk : "";
+      const kind = test === true ? "test" : "real";
+      const day = utcDay();
+      let ipUsed = 0, globalUsed = 0;
+      if (key) {
+        const g = this.sql.exec("SELECT n FROM reg_day WHERE day=? AND kind=?", day, kind).toArray()[0];
+        const i = this.sql.exec("SELECT n FROM reg_ip WHERE k=? AND day=?", key + ":" + kind, day).toArray()[0];
+        globalUsed = g ? g.n : 0;
+        ipUsed = i ? i.n : 0;
+        const why = regDecision({ ip: ipUsed, global: globalUsed }, regLimits(this.env), kind === "test");
+        if (why) return json({ ok: false, reason: "reg-limit", scope: why, retry_after: secondsToUtcMidnight() });
+      }
       this.sql.exec("INSERT INTO dir (prefix, uid) VALUES (?, ?)", prefix, uid);
+      if (key) {
+        if (this.regPruned !== day) {   // yesterday's counters are dead weight: one cleanup per day per instance
+          this.regPruned = day;
+          this.sql.exec("DELETE FROM reg_ip WHERE day < ?", day);
+          this.sql.exec("DELETE FROM reg_day WHERE day < ?", day);
+        }
+        this.sql.exec("INSERT OR REPLACE INTO reg_ip (k, day, n) VALUES (?, ?, ?)", key + ":" + kind, day, ipUsed + 1);
+        this.sql.exec("INSERT OR REPLACE INTO reg_day (day, kind, n) VALUES (?, ?, ?)", day, kind, globalUsed + 1);
+      }
       return json({ ok: true });
     }
     if (url.pathname === "/online" && request.method === "POST") {
@@ -371,7 +410,7 @@ export class UserHub extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.env = env;
-    this.sql = ctx.storage.sql;
+    this.sql = meteredSql(ctx.storage.sql);   // every statement is charged to the REQ_BUDGET rows-written axis
     this.helloChain = Promise.resolve();
     this.msgLimit = new FixedWindow(FRIENDS_MSGS_PER_MIN, 60 * 1000);
     ctx.setWebSocketAutoResponse(
@@ -531,15 +570,19 @@ export class UserHub extends DurableObject {
       : this.all("SELECT uid FROM friends");
     const uids = rows.map((f) => f.uid);
     if (uids.length === 0) return;
-    // Only online friends are contacted: one directory call, then one call per online friend.
-    // Offline friends pick up our status when they connect (their hello pulls it below).
-    const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
-    const on = await (await dir.fetch("https://directory/online-of", {
-      method: "POST",
-      headers: { "x-rh-internal": "1", "content-type": "application/json" },
-      body: JSON.stringify({ uids }),
-    })).json();
-    const targets = onlineTargets(uids, new Set(on.uids || []));
+    // Only online friends are contacted: one directory call, then one call per online friend, at most presenceCap() of them
+    // (the Workers Free plan allows 50 subrequests per invocation). Offline friends, and online ones past the cap, pick up our
+    // status when they connect: their hello fans out to us and our reply carries the current status, before their welcome.
+    let on;
+    try {
+      const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+      on = await (await dir.fetch("https://directory/online-of", {
+        method: "POST",
+        headers: { "x-rh-internal": "1", "content-type": "application/json" },
+        body: JSON.stringify({ uids }),
+      })).json();
+    } catch { return; }   // directory unreachable: never fail the caller (a hello must still get its welcome); the next change repairs it
+    const targets = this.fanout().pick(uids, new Set(on.uids || []), this.presenceCap());
     const results = await Promise.allSettled(targets.map((uid) => this.call(uid, "presence", payload)));
     // Each reply carries the friend's own status, so our copy of it stays current too.
     results.forEach((res, i) => {
@@ -548,6 +591,18 @@ export class UserHub extends DurableObject {
       if (st) this.run("UPDATE friends SET name=?, status=? WHERE uid=?", cleanName(r.name) || "player", JSON.stringify(st), targets[i]);
       if (r && Number.isInteger(r.lib)) setFriendLib(this, targets[i], r.lib);
     });
+  }
+
+  /* Targets per presence event. PRESENCE_FANOUT_CAP in production; the var is for local tests only. */
+  presenceCap() {
+    const t = Number(this.env.PRESENCE_FANOUT_CAP);
+    return t >= 1 ? Math.floor(t) : PRESENCE_FANOUT_CAP;
+  }
+  /* Who was reached by the last capped presence events (in memory): the next event starts with the friends it skipped. A woken
+   * hub starts from a time-derived offset, so it is not always the same friends that come first. */
+  fanout() {
+    if (!this.rotation) this.rotation = new FanoutRotation(Math.floor(Date.now() / 1000) % 1009);
+    return this.rotation;
   }
 
   // Record this account in the directory's online set (called on the first socket up / last socket down).
@@ -573,15 +628,26 @@ export class UserHub extends DurableObject {
   // without waking this object, so a timer does the refresh).
   async scheduleLease() {
     try {
-      if (!(await this.ctx.storage.getAlarm())) await this.ctx.storage.setAlarm(Date.now() + presenceAlarmMs(ONLINE_LEASE_MS));
+      if (!(await this.ctx.storage.getAlarm())) {
+        await this.ctx.storage.setAlarm(Date.now() + presenceAlarmMs(ONLINE_LEASE_MS));
+        noteRows(1);   // each setAlarm() is one row written
+      }
     } catch { /* storage alarm unavailable */ }
   }
 
   async alarm() {
     meter(this.env, this.ctx, "alarm");
     if (this.authedSockets().length === 0) return;
-    // Cost guard: at >=90% of the daily budget stop refreshing presence (no reschedule; leases lapse harmlessly).
-    if (!gate(this.env).relayFrames) return;
+    // Cost guard: at >=90% of the daily budget stop refreshing presence (leases lapse harmlessly). The alarm is moved to just
+    // after the next 00:00 UTC (one row, once) rather than dropped: a dropped alarm left every connected account looking
+    // offline for the rest of its session, even after the budget had reset.
+    if (!gate(this.env).relayFrames) {
+      try {
+        await this.ctx.storage.setAlarm(Date.now() + secondsToUtcMidnight() * 1000 + 60 * 1000);
+        noteRows(1);
+      } catch { /* storage alarm unavailable */ }
+      return;
+    }
     await this.setOnline(true);
   }
 
@@ -683,9 +749,12 @@ export class UserHub extends DurableObject {
       if (request.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
       const uid = url.searchParams.get("uid") || "";
       if (!UID_RE.test(uid)) return new Response("bad uid", { status: 400 });
+      this.sweepUnauthed();
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
-      pair[1].serializeAttachment({ uid, authed: false });
+      // ipk: the caller's address key (friendsFetch sets x-rh-ip; "" = loopback or unknown), t: when the socket arrived (the
+      // hello deadline), pf: frames it has sent before authenticating.
+      pair[1].serializeAttachment({ uid, authed: false, ipk: ipKey(request.headers.get("x-rh-ip")), t: now(), pf: 0 });
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     if (url.pathname.startsWith("/i/") && request.method === "POST" && request.headers.get("x-rh-internal") === "1") {
@@ -950,6 +1019,10 @@ export class UserHub extends DurableObject {
     if (typeof message !== "string") return;
     const att = ws.deserializeAttachment();
     if (!att) return;
+    // A socket that has not said hello yet is handled apart from everything else, BEFORE the account's shared budget below is
+    // touched: anyone who knows a uid (friends see it, the admin's is public) can open a socket for it, and junk frames from
+    // that stranger must never be able to use up the real owner's 300 frames a minute.
+    if (!att.authed) { await this.preAuth(ws, att, message); return; }
     if (message.length > (isLibraryFrame(message) ? MAX_LIB_JSON : MAX_JSON)) {
       this.err(ws, "bad-request", undefined, "too-large");
       return;
@@ -957,29 +1030,71 @@ export class UserHub extends DurableObject {
     let msg;
     try { msg = JSON.parse(message); } catch { return; }
     if (!msg || typeof msg !== "object" || typeof msg.type !== "string") return;
-    // Per-account budget for all API traffic (in-memory, per UserHub instance).
-    // hello and keepalive are exempt so reconnect storms can't lock an account out.
+    // Per-account budget for all API traffic (in-memory, per UserHub instance), spent by authenticated sockets only.
+    // hello (a reconnect storm arrives as unauthenticated sockets, see preAuth) and keepalive are exempt.
     if (msg.type !== "hello" && msg.type !== "keepalive" && !this.msgLimit.hit("m")) {
       this.err(ws, "rate-limited", msg.type);
       return;
     }
-
-    if (msg.type === "hello") {
-      this.helloChain = this.helloChain.then(() => this.hello(ws, msg)).catch(() => {
-        try { ws.close(4002, "bad-hello"); } catch { /* closed */ }
-      });
-      await this.helloChain;
-      return;
-    }
-    if (!att.authed) {
-      try { ws.close(4002, "hello-required"); } catch { /* closed */ }
-      return;
-    }
+    if (msg.type === "hello") return;   // already authenticated: nothing to do
     try {
       await this.dispatch(ws, att, msg);
     } catch (e) {
       this.err(ws, "bad-request", msg.type, "internal");
     }
+  }
+
+  /* An unauthenticated socket may only say hello: within HELLO_DEADLINE_MS of the upgrade and in at most PREAUTH_MAX_FRAMES
+   * frames. Anything else closes it (4002) without spending a single unit of the account's message budget. */
+  async preAuth(ws, att, message) {
+    const drop = (why) => { try { ws.close(4002, why); } catch { /* closed */ } };
+    if (message.length > MAX_JSON) return drop("hello-required");
+    if (now() - (att.t || 0) > this.helloDeadlineMs()) return drop("hello-timeout");
+    const used = (att.pf || 0) + 1;
+    if (used > PREAUTH_MAX_FRAMES) return drop("hello-required");
+    let msg;
+    try { msg = JSON.parse(message); } catch { return drop("hello-required"); }
+    if (!msg || typeof msg !== "object" || msg.type !== "hello") return drop("hello-required");
+    ws.serializeAttachment({ ...att, pf: used });
+    this.helloChain = this.helloChain.then(() => this.hello(ws, msg)).catch(() => {
+      try { ws.close(4002, "bad-hello"); } catch { /* closed */ }
+    });
+    await this.helloChain;
+  }
+
+  helloDeadlineMs() {   // the var is for local tests only
+    const t = Number(this.env.HELLO_DEADLINE_MS);
+    return t > 0 ? t : HELLO_DEADLINE_MS;
+  }
+
+  /* Sockets parked without a hello: close the ones past the deadline and, if still MAX_UNAUTHED_SOCKETS or more, the oldest, so
+   * the socket being accepted always fits. Authenticated sockets (the account's own devices) are never touched. Runs on every
+   * upgrade; there is no timer, so it costs nothing while the account is idle. */
+  sweepUnauthed() {
+    const t = now();
+    const deadline = this.helloDeadlineMs();
+    const parked = [];
+    for (const ws of this.ctx.getWebSockets()) {
+      const a = ws.deserializeAttachment();
+      if (!a || a.authed) continue;
+      if (t - (a.t || 0) > deadline) { try { ws.close(4002, "hello-timeout"); } catch { /* closed */ } continue; }
+      parked.push({ ws, t: a.t || 0 });
+    }
+    parked.sort((x, y) => x.t - y.t);
+    while (parked.length >= MAX_UNAUTHED_SOCKETS) { try { parked.shift().ws.close(4002, "hello-timeout"); } catch { /* closed */ } }
+  }
+
+  /* Registration was refused (see Directory "/register"): tell the client why, with the seconds until the daily counters reset.
+   * The socket is deliberately left OPEN. Every shipped client reconnects after any close (backoff 1 s doubling to 30 s) and
+   * would hit the capped server again and again; an open, unanswered socket costs nothing (hibernated, no duration) and the
+   * client simply tries again next time it starts or its connection drops. */
+  refuseRegistration(ws, r) {
+    try {
+      ws.send(JSON.stringify({
+        type: "error", reason: "registration-limited", detail: r.scope === "ip" ? "ip" : "global",
+        retry_after: Number(r.retry_after) > 0 ? Math.floor(Number(r.retry_after)) : secondsToUtcMidnight(),
+      }));
+    } catch { /* closing */ }
   }
 
   async hello(ws, msg) {
@@ -994,21 +1109,26 @@ export class UserHub extends DurableObject {
     const name = cleanName(msg.name) || "player";
     let p = this.profile();
     if (!p) {
+      // A brand-new account. The Directory counts it against the caller's address (hashed: raw addresses are not stored) and
+      // the service-wide daily limit; a local wrangler (loopback) has no address key and is never limited.
       const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
+      const ipk = att.ipk ? (await sha256hex("rh-reg|" + att.ipk)).slice(0, 24) : "";
       const res = await dir.fetch("https://directory/register", {
         method: "POST",
         headers: { "x-rh-internal": "1", "content-type": "application/json" },
-        body: JSON.stringify({ prefix: uid.slice(0, 8), uid }),
+        body: JSON.stringify({ prefix: uid.slice(0, 8), uid, ipk, test: msg.test === true || isTestName(name) }),
       });
       const r = await res.json();
       if (!r.ok) {
-        ws.close(4004, "code-collision");
+        if (r.reason === "reg-limit") this.refuseRegistration(ws, r);   // the socket stays open on purpose, see refuseRegistration
+        else ws.close(4004, "code-collision");
         return;
       }
       p = this.profile(); // re-check after the await
       if (!p) {
         this.run("INSERT INTO profile (id, uid, secret_hash, name, code, created) VALUES (1, ?, ?, ?, ?, ?)",
           uid, hash, name, codeOf(uid), now());
+        noteRows(NEW_ACCOUNT_SCHEMA_ROWS);   // the ~16 CREATE TABLE/INDEX statements of this account's new hub report 0 rows; billing may count them
         p = this.profile();
       }
     }
@@ -1034,10 +1154,12 @@ export class UserHub extends DurableObject {
     if (msg.test === true || isTestName(name)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('is_test', '1')");
     if (typeof msg.auto_friend === "boolean") this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('auto_friend', ?)", msg.auto_friend ? "1" : "0");
     await this.autoLinkAdmin(p);
+    let announced = false;
     if (!wasOnline) {
       // First socket up: announce ourselves and pull friends' current statuses before the welcome.
       await this.setOnline(true);
       await this.broadcastPresence(true);
+      announced = true;
     }
 
     this.run("DELETE FROM inbox WHERE at < ?", now() - INBOX_TTL);
@@ -1061,7 +1183,9 @@ export class UserHub extends DurableObject {
       lib: glibInfo(this),
       inbox: this.all("SELECT json FROM inbox ORDER BY at").map((r) => JSON.parse(r.json)),
     }));
-    await this.broadcastPresence(renamed);
+    // A rename is announced once: the fan-out above already carried the new name (the profile row was updated before it), and a
+    // second forced fan-out in the same invocation would go over the 50-subrequest limit of the Workers Free plan.
+    await this.broadcastPresence(renamed && !announced);
   }
 
   // ---- usernames (registry = Directory, see usernames.js / docs/ACCOUNTS.md) ----
