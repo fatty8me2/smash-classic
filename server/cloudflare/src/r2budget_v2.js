@@ -28,8 +28,8 @@ const J = (o) => {
   if (o.r === "ok" && curD && curD.pendingDels && curD.pendingDels.length && !o.dels) { o = { ...o, dels: curD.pendingDels }; curD.pendingDels = []; }
   return new Response(JSON.stringify(o), { headers: { "content-type": "application/json" } });
 };
-const E = (status, code, extra = {}) => J({ r: "err", status, code, ...extra });
-export const isBlobKey = (rkey) => /\/o\/[0-9a-f]{64}(\.z)?$/.test(rkey);
+export const E = (status, code, extra = {}) => J({ r: "err", status, code, ...extra });
+export const isBlobKey = (rkey) => /\/(o\/[0-9a-f]{64}(\.z)?|a\/[0-9a-f]{32})$/.test(rkey);   // saves blobs and DM attachments (src/r2budget_attach.js)
 const blobKey = (uid, sha, enc) => `saves/${uid}/o/${sha}${enc === "deflate" ? ".z" : ""}`;
 class Rollback extends Error { constructor(why, extra = {}) { super(why); this.why = why; this.extra = extra; } }
 
@@ -58,7 +58,7 @@ export function initV2(d) {
 }
 
 // ---- config / small helpers ----
-const cfg = (d) => ({
+export const cfg = (d) => ({
   accountCap: num(d.env.ACCOUNT_CAP, ACCOUNT_CAP), protCap: num(d.env.PROT_CAP, PROT_CAP),
   tight: num(d.env.POOL_TIGHT, POOL_TIGHT), full: num(d.env.POOL_FULL, POOL_FULL),
   dayPuts: num(d.env.DAY_PUT_MAX, DAY_PUTS), dayGets: num(d.env.DAY_GET_MAX, DAY_GETS),
@@ -68,22 +68,22 @@ const poolOf = (d, c) => {
   const storage = d.caps().storage;
   return { state: poolState(d.st.total, storage, c.tight, c.full), frac: storage > 0 ? d.st.total / storage : 1, storage };
 };
-const sec = (now) => Math.floor(now / 1000);
+export const sec = (now) => Math.floor(now / 1000);
 const uuid = () => crypto.randomUUID().replace(/-/g, "");
 
-function getAcct(d, uid) {
+export function getAcct(d, uid) {
   let a = d.q(`SELECT * FROM accts WHERE uid=?`, uid)[0];
   if (!a) { d.q(`INSERT INTO accts(uid,used,n) VALUES(?,0,0)`, uid); a = d.q(`SELECT * FROM accts WHERE uid=?`, uid)[0]; }
   return a;
 }
-function rollDay(d, a) {
+export function rollDay(d, a) {
   if (a.day !== d.st.day) { d.q(`UPDATE accts SET day=?, a_ops=0, b_ops=0 WHERE uid=?`, d.st.day, a.uid); a.day = d.st.day; a.a_ops = 0; a.b_ops = 0; }
 }
 function liveRef(d, uid, rkey) { return d.q(`SELECT 1 FROM vers WHERE uid=? AND rkey=? AND state<>'evicted' LIMIT 1`, uid, rkey).length > 0; }
 function blobSize(d, rkey) { const r = d.q(`SELECT size FROM files WHERE rkey=?`, rkey)[0]; return r ? r.size : 0; }
 
 // Mark an R2 object as dead (index row kept until the Worker confirms the delete with v2_del_done).
-function markDead(d, rkey, nowS, dels) {
+export function markDead(d, rkey, nowS, dels) {
   d.q(`UPDATE files SET dead=? WHERE rkey=? AND dead IS NULL AND pend IS NULL`, nowS, rkey);
   dels.push(rkey);
 }
@@ -94,10 +94,11 @@ function freeIfUnref(d, uid, rkey, nowS, dels) {
   return sz;
 }
 
-function recomputeUsage(d, uid) {
+export function recomputeUsage(d, uid) {
   const rows = d.q(`SELECT rkey, MAX(stored) s, MAX(prot) p FROM vers WHERE uid=? AND state<>'evicted' AND rkey IS NOT NULL GROUP BY rkey`, uid);
   let used = 0, prot = 0;
   for (const r of rows) { used += r.s; if (r.p) prot += r.s; }
+  used += d.q(`SELECT COALESCE(SUM(size),0) s FROM attach WHERE uid=? AND expires>?`, uid, Math.floor(Date.now() / 1000))[0].s;   // DM attachments share the account pool (large, never protected)
   d.q(`UPDATE accts SET vused=?, vprot=? WHERE uid=?`, used, prot, uid);
   return { used, prot };
 }
@@ -120,7 +121,7 @@ function seen(d, uid, dev, nowS) {
 }
 
 // ---- common entry: flags, saves request share, daily guard, v1 conversion ----
-function enter(d, q, now, o = {}) {
+export function enter(d, q, now, o = {}) {
   d.roll();
   if (d.env.SAVES_V2 === "0") return { res: E(503, "cloud-saves-disabled") };
   const cap = num(d.env.DAILY_REQ_CAP, 100_000) * 0.35;      // saves get at most 35% of the daily request units

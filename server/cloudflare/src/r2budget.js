@@ -17,6 +17,7 @@
 // Callers must FAIL CLOSED when this DO errors.
 
 import { DurableObject } from "cloudflare:workers";
+import { attachHandle, initAttach } from "./r2budget_attach.js";
 import { initV2, v2Handle, v1Written, v1Deleted, v1OverCap, isBlobKey } from "./r2budget_v2.js";
 
 const GB = 1024 * 1024 * 1024;
@@ -40,6 +41,7 @@ export class R2Budget extends DurableObject {
     this.sql.exec(`CREATE INDEX IF NOT EXISTS files_pend ON files(pts) WHERE pend IS NOT NULL`);   // pending scans touch only pending rows
     this.sql.exec(`CREATE TABLE IF NOT EXISTS accts (uid TEXT PRIMARY KEY, used INTEGER NOT NULL, n INTEGER NOT NULL)`);
     initV2(this);   // cloud saves v2 tables + one-time column adds (schema tag in meta)
+    initAttach(this);   // DM attachments (7-day, 8 MB, same account pool)
     const r = this.sql.exec(`SELECT v FROM meta WHERE k='st'`).toArray()[0];
     this.st = Object.assign({ month: "", day: "", a: 0, b: 0, total: 0, rows: 0, reads: 0, ms: 0, last_try: 0, dirty: 0, recent_expire: 0,
       lock_until: 0, test_month: "", test_day: "", test_fail: 0, test_commit_fail: 0 }, r ? JSON.parse(r.v) : {});
@@ -177,7 +179,7 @@ export class R2Budget extends DurableObject {
 
     switch (q.op) {
       case "list": {
-        const files = this.q(`SELECT rkey,size,etag,hetag,sha,mtime FROM files WHERE uid=? AND etag IS NOT NULL AND dead IS NULL AND rkey NOT LIKE ? ORDER BY rkey`, q.uid, `saves/${q.uid}/o/%`)
+        const files = this.q(`SELECT rkey,size,etag,hetag,sha,mtime FROM files WHERE uid=? AND etag IS NOT NULL AND dead IS NULL AND rkey NOT LIKE ? AND rkey NOT LIKE ? ORDER BY rkey`, q.uid, `saves/${q.uid}/o/%`, `saves/${q.uid}/a/%`)
           .map((r) => ({ key: r.rkey.slice(`saves/${q.uid}/`.length), size: r.size, etag: r.hetag || r.etag, sha: r.sha || "", mtime: r.mtime || "0" }));
         return J({ r: "ok", files, used: files.reduce((s, f) => s + f.size, 0), quota: QUOTA });
       }
@@ -266,7 +268,9 @@ export class R2Budget extends DurableObject {
       case "test_reconcile": await this.maybeReconcile(now, true); return J({ r: "ok", total: this.st.total });
       case "test_acct": return J({ r: "ok", acct: this.q(`SELECT uid, used, n FROM accts ORDER BY uid`), real: this.q(`SELECT uid, SUM(COALESCE(pend,size)) AS used, COUNT(*) AS n FROM files GROUP BY uid ORDER BY uid`) });
       case "test_sum": return J({ r: "ok", sum: this.q(`SELECT COALESCE(SUM(COALESCE(pend,size)),0) AS s FROM files`)[0].s });
-      default: return (q.op.startsWith("v2_") || q.op.startsWith("test_v2_")) ? (v2Handle(this, q, now) || J({ r: "bad-op" })) : J({ r: "bad-op" });
+      default:
+        if (q.op.startsWith("v2_attach_") || q.op.startsWith("test_v2_attach")) return attachHandle(this, q, now) || J({ r: "bad-op" });
+        return (q.op.startsWith("v2_") || q.op.startsWith("test_v2_")) ? (v2Handle(this, q, now) || J({ r: "bad-op" })) : J({ r: "bad-op" });
     }
   }
 }

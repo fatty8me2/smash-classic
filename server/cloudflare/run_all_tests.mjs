@@ -15,6 +15,7 @@ const SUITE = [
   { file: "test_r2budget.mjs", kind: "self", env: { BUDGET_TEST_PORT: "10041" } },
   { file: "test_stats.mjs", kind: "self", env: { STATS_TEST_PORT: "10051" } },
   { file: "test_saves_v2.mjs", kind: "self", env: { SAVES_V2_PORT: "10021" } },
+  { file: "test_attach.mjs", kind: "self", env: { ATTACH_TEST_PORT: "10091" } },
   { file: "test_admin_autolink.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN } },
   { file: "test_autofriend.mjs", kind: "ws", vars: { TEST_FRIEND_CAP: "2" } },
   { file: "test_dupes2.mjs", kind: "ws", vars: { TEST_ALIAS: "1", ADMIN_UID: ADMIN } },
