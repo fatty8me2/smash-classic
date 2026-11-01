@@ -9,6 +9,7 @@ const ADMIN = "aaaaaaaaaaaaaaaaaaaaaaaaaa";
 // kind: "ws"/"http" = needs a server (URL passed as argument); "self" = starts its own servers; "pure" = no server
 const SUITE = [
   { file: "test_reqbudget.mjs", kind: "pure" },
+  { file: "test_stale.mjs", kind: "pure" },
   { file: "test_saves_pool.mjs", kind: "pure" },
   { file: "test_saves.mjs", kind: "self", env: { SAVES_TEST_PORT: "10031" } },
   { file: "test_saves.mjs", args: ["--nor2"], kind: "self", env: { SAVES_TEST_PORT: "10031" } },

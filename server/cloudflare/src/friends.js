@@ -18,7 +18,7 @@ import { normalizeUsername, lookupKey, reasonToError, HOLD_MS, LEGACY_WINDOW_MS 
 import { initGlib, isLibraryFrame, MAX_LIB_JSON, glibInfo, ownLibVer, setFriendLib, friendLibVer, dropFriendLib, clearAllLib, handleLibrary, handleFriendLibrary, internalLibGet } from "./gamelib.js";
 import {
   FixedWindow, FanoutRotation, FRIENDS_MSGS_PER_MIN, PRESENCE_FANOUT_CAP, HELLO_DEADLINE_MS, PREAUTH_MAX_FRAMES,
-  MAX_UNAUTHED_SOCKETS, ipKey, regLimits, regDecision, secondsToUtcMidnight,
+  MAX_UNAUTHED_SOCKETS, STALE_SOCKET_MS, staleSockets, ipKey, regLimits, regDecision, secondsToUtcMidnight,
 } from "./limits.js";
 
 const UID_RE = /^[a-z2-7]{26}$/;
@@ -636,8 +636,29 @@ export class UserHub extends DurableObject {
     } catch { /* storage alarm unavailable */ }
   }
 
+  reapStale() {
+    const t = Date.now();
+    const socks = this.authedSockets();
+    const lim = Number(this.env && this.env.STALE_SOCKET_MS) > 0 ? Number(this.env.STALE_SOCKET_MS) : STALE_SOCKET_MS;   // env: tests only
+    const info = socks.map((ws, i) => {
+      let last = null;
+      try { const d = this.ctx.getWebSocketAutoResponseTimestamp(ws); last = d ? d.getTime() : null; } catch { /* not available */ }
+      return { id: i, last };
+    });
+    const dead = staleSockets(info, t, lim).map((i) => socks[i]);
+    for (const ws of dead) {
+      try { const a = ws.deserializeAttachment(); ws.serializeAttachment({ ...a, authed: false }); } catch { /* closed */ }
+      try { ws.close(4006, "stale"); } catch { /* closed */ }
+    }
+    return dead.length;
+  }
+
   async alarm() {
     meter(this.env, this.ctx, "alarm");
+    if (this.reapStale()) {
+      if (this.authedSockets().length === 0) { await this.setOnline(false); await this.broadcastPresence(false); return; }
+      await this.broadcastPresence(false);
+    }
     if (this.authedSockets().length === 0) return;
     // Cost guard: at >=90% of the daily budget stop refreshing presence (leases lapse harmlessly). The alarm is moved to just
     // after the next 00:00 UTC (one row, once) rather than dropped: a dropped alarm left every connected account looking
