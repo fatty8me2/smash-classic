@@ -22,6 +22,7 @@ const SUITE = [
   { file: "test_friends_dedupe.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN } },
   { file: "test_friends_fixes.mjs", kind: "http" },
   { file: "test_hostmig.mjs", kind: "ws" },
+  { file: "test_hostgrace.mjs", kind: "ws", vars: { HOST_GRACE_MS: "1500" } },
   { file: "test_hub_reasons.mjs", kind: "ws" },
   { file: "test_invite.mjs", kind: "http" },
   { file: "test_limits.mjs", kind: "ws" },
