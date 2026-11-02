@@ -258,3 +258,12 @@ export function secondsToUtcMidnight(t = Date.now()) {
   const d = new Date(t);
   return Math.max(1, Math.ceil((Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - t) / 1000));
 }
+
+// A socket whose auto-answered keepalives stopped (the PC went to sleep / lost the network without a close) is reaped by the
+// next lease alarm, so a sleeping friend stops showing "Online". Free: the runtime keeps the auto-response timestamp and the alarm
+// already exists. Clients send a keepalive every 20 s, so 150 s = several missed.
+export const STALE_SOCKET_MS = 150 * 1000;
+// Pure: which of [{id, last}] (last = ms of the last keepalive answer, null = never answered, i.e. an old client) are dead at `nowMs`.
+export function staleSockets(list, nowMs, limitMs = STALE_SOCKET_MS) {
+  return list.filter((s) => typeof s.last === "number" && nowMs - s.last > limitMs).map((s) => s.id);
+}

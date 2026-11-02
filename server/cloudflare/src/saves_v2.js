@@ -9,6 +9,9 @@
 
 import { authenticate, budget, err, json, HEX64, MAX_OBJECT } from "./saves.js";
 import { gate } from "./reqbudget.js";
+import { ATTACH_MAX, ATTACH_KINDS, ATTACH_MAX_TO, cleanAttachName } from "./r2budget_attach.js";
+
+const UID_RE = /^[a-z2-7]{26}$/;
 
 const DEV_RE = /^[a-z0-9-]{8,40}$/;
 const ROUTES = {
@@ -25,6 +28,8 @@ const ROUTES = {
   "POST /saves/v2/game": { cls: "pc", op: "v2_game", body: 8192 },
   "POST /saves/v2/lease": { cls: "meta", op: "v2_lease", body: 8192, action: "take" },
   "POST /saves/v2/lease/beat": { cls: "meta", op: "v2_lease", body: 8192, action: "beat" },
+  "PUT /saves/v2/attach": { cls: "att", attach: true },   // DM attachment upload (8 MB, 7 days): src/r2budget_attach.js
+  "GET /saves/v2/attach": { cls: "get", attach: true },
   "POST /saves/v2/lease/release": { cls: "meta", op: "v2_lease", body: 8192, action: "release" },
 };
 
@@ -66,6 +71,11 @@ export async function savesV2Fetch(request, env, url) {
   if (request.method === "PUT") {
     const len = Number(request.headers.get("Content-Length"));
     if (!request.headers.has("Content-Length") || !Number.isFinite(len) || len < 0) return err(411, "length-required");
+    if (spec.attach) {
+      const amax = Number(env.ATTACH_MAX) > 0 ? Number(env.ATTACH_MAX) : ATTACH_MAX;
+      if (len > amax) return err(413, "attachment-too-large", { max: amax });
+      if (len === 0) return err(400, "bad-body");
+    }
     if (len > MAX_OBJECT) return err(413, "object-too-large", { max: MAX_OBJECT });
   }
   const au = await authenticate(request, env, url, request.method !== "GET", spec.cls);
@@ -74,6 +84,7 @@ export async function savesV2Fetch(request, env, url) {
   const devH = request.headers.get("X-RH-Device") || "";
   const dev = DEV_RE.test(devH) ? devH : "";
 
+  if (spec.attach) return attachRoute(request, env, url, uid, dev);
   if (spec.blob) return blobRoute(request, env, url, spec, uid, dev);
 
   let body;
@@ -152,4 +163,53 @@ async function blobRoute(request, env, url, spec, uid, dev) {
   try { await budget(env, commit); }
   catch { try { await budget(env, commit); } catch { return err(503, "cloud-saves-retry", { retryAfter: 30 }); } }
   return json({ ok: true });
+}
+
+// ---- DM attachments ----
+async function attachRoute(request, env, url, uid, dev) {
+  if (request.method === "GET") {
+    const g = await budget(env, { op: "v2_attach_get", uid, dev, id: url.searchParams.get("id") || "" });
+    if (g.r !== "ok") return reply(env, g);
+    const obj = await env.SAVES.get(g.rkey, { onlyIf: { etagMatches: g.rawEtag } });
+    if (!obj || !obj.body) return err(409, "changed-during-read", { retryAfter: 2 });
+    return new Response(obj.body, { headers: {
+      "content-type": "application/octet-stream", "X-RH-Sha": g.sha, "X-RH-Size": String(g.size), "X-RH-Kind": g.kind,
+      "X-RH-Name": encodeURIComponent(g.name), "X-RH-Expires": String(g.expires) } });
+  }
+  // PUT: ?to=uid[,uid...]&kind=shot|state|patch&name=...   X-RH-Sha = sha256 of the body
+  const len = Number(request.headers.get("Content-Length"));
+  const sha = (request.headers.get("X-RH-Sha") || "").toLowerCase();
+  const kind = url.searchParams.get("kind") || "";
+  const to = [...new Set((url.searchParams.get("to") || "").split(",").filter(Boolean))];
+  if (!HEX64.test(sha)) return err(400, "sha-required");
+  if (!ATTACH_KINDS.includes(kind)) return err(400, "bad-kind");
+  if (!to.length || to.length > ATTACH_MAX_TO || !to.every((u) => UID_RE.test(u) && u !== uid)) return err(400, "bad-recipient");
+  // only friends: ask the sender's own UserHub (the per-minute class limit is applied in saves_auth)
+  try {
+    const hub = env.USER_HUBS.get(env.USER_HUBS.idFromName(uid));
+    const fr = await (await hub.fetch("https://userhub/i/attach_to", { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: JSON.stringify({ uid, to }) })).json();
+    if (!fr || fr.r !== "ok" || !Array.isArray(fr.ok) || !to.every((u) => fr.ok.includes(u))) return err(403, "not-friends");
+  } catch { return err(503, "cloud-saves-error", { retryAfter: 30 }); }
+  const b = await budget(env, { op: "v2_attach_begin", uid, dev, to, kind, name: cleanAttachName(url.searchParams.get("name")), sha, len });
+  if (b.r === "ok" && b.reuse) { if (Array.isArray(b.dels) && b.dels.length) await sweepDeletes(env, b.dels); const { r, dels, reuse, ...rest } = b; return json({ ok: true, reused: true, ...rest }); }
+  if (b.r !== "ok") return reply(env, b);
+  const { rkey, tok, mtime, id, expires } = b;
+  const abort = async (unknown) => {
+    await budget(env, { op: "put_abort", rkey, tok, unknown }).catch(() => {});
+    await budget(env, { op: "v2_attach_abort", uid, id }).catch(() => {});
+  };
+  let put;
+  try {
+    const stream = request.body.pipeThrough(new FixedLengthStream(len));
+    put = await env.SAVES.put(rkey, stream, { sha256: sha, customMetadata: { sha, mtime }, onlyIf: { etagDoesNotMatch: "*" } });
+  } catch (e) { await abort(true); return err(400, "bad-body"); }
+  if (!put) { await abort(false); return err(409, "busy", { retryAfter: 5 }); }
+  const commit = { op: "put_commit", uid, rkey, tok, size: put.size, etag: put.etag, hetag: put.httpEtag || put.etag, sha, mtime };
+  try { await budget(env, commit); }
+  catch { try { await budget(env, commit); } catch { return err(503, "cloud-saves-retry", { retryAfter: 30 }); } }
+  const c2 = await budget(env, { op: "v2_attach_commit", uid, id, size: put.size });
+  if (c2.r !== "ok") return reply(env, c2);
+  if (Array.isArray(b.dels) && b.dels.length) await sweepDeletes(env, b.dels);
+  const { r, dels, ...rest } = c2;
+  return json({ ok: true, ...rest, expires });
 }

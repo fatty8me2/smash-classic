@@ -12,12 +12,13 @@
 // requires the x-rh-internal header on them.
 
 import { DurableObject } from "cloudflare:workers";
+import { budget } from "./saves.js";
 import { meter, gate, meteredSql, noteRows, utcDay, PRESENCE_LEASE_MS, presenceAlarmMs } from "./reqbudget.js";
 import { normalizeUsername, lookupKey, reasonToError, HOLD_MS, LEGACY_WINDOW_MS } from "./usernames.js";
 import { initGlib, isLibraryFrame, MAX_LIB_JSON, glibInfo, ownLibVer, setFriendLib, friendLibVer, dropFriendLib, clearAllLib, handleLibrary, handleFriendLibrary, internalLibGet } from "./gamelib.js";
 import {
   FixedWindow, FanoutRotation, FRIENDS_MSGS_PER_MIN, PRESENCE_FANOUT_CAP, HELLO_DEADLINE_MS, PREAUTH_MAX_FRAMES,
-  MAX_UNAUTHED_SOCKETS, ipKey, regLimits, regDecision, secondsToUtcMidnight,
+  MAX_UNAUTHED_SOCKETS, STALE_SOCKET_MS, staleSockets, ipKey, regLimits, regDecision, secondsToUtcMidnight,
 } from "./limits.js";
 
 const UID_RE = /^[a-z2-7]{26}$/;
@@ -635,8 +636,29 @@ export class UserHub extends DurableObject {
     } catch { /* storage alarm unavailable */ }
   }
 
+  reapStale() {
+    const t = Date.now();
+    const socks = this.authedSockets();
+    const lim = Number(this.env && this.env.STALE_SOCKET_MS) > 0 ? Number(this.env.STALE_SOCKET_MS) : STALE_SOCKET_MS;   // env: tests only
+    const info = socks.map((ws, i) => {
+      let last = null;
+      try { const d = this.ctx.getWebSocketAutoResponseTimestamp(ws); last = d ? d.getTime() : null; } catch { /* not available */ }
+      return { id: i, last };
+    });
+    const dead = staleSockets(info, t, lim).map((i) => socks[i]);
+    for (const ws of dead) {
+      try { const a = ws.deserializeAttachment(); ws.serializeAttachment({ ...a, authed: false }); } catch { /* closed */ }
+      try { ws.close(4006, "stale"); } catch { /* closed */ }
+    }
+    return dead.length;
+  }
+
   async alarm() {
     meter(this.env, this.ctx, "alarm");
+    if (this.reapStale()) {
+      if (this.authedSockets().length === 0) { await this.setOnline(false); await this.broadcastPresence(false); return; }
+      await this.broadcastPresence(false);
+    }
     if (this.authedSockets().length === 0) return;
     // Cost guard: at >=90% of the daily budget stop refreshing presence (leases lapse harmlessly). The alarm is moved to just
     // after the next 00:00 UTC (one row, once) rather than dropped: a dropped alarm left every connected account looking
@@ -871,13 +893,17 @@ export class UserHub extends DurableObject {
         // Cloud saves: hand the Worker the HMAC key (sha256hex of the secret) after rate limiting this account.
         if (from !== p.uid) return { r: "none" };
         const w = !!b.write;
-        const V2 = { pc: 30, put: 120, get: 300, meta: 60 };   // v2 per-account per-minute limits (docs/CLOUD_SAVES_V2.md 3.6)
+        const V2 = { pc: 30, put: 120, get: 300, meta: 60, att: 10 };   // v2 per-account per-minute limits (docs/CLOUD_SAVES_V2.md 3.6)
         if (b.cls && V2[b.cls]) {
           const ov = Number(this.env && this.env["SAVES_RATE_" + b.cls.toUpperCase()]);   // tests only; unset in production
           if (!this.hit("saves2:" + b.cls, ov > 0 ? ov : V2[b.cls], 60000)) return { r: "limited" };
         }
         else if (!this.hit(w ? "saves:w" : "saves:r", w ? 120 : 600, 60000)) return { r: "limited" };
         return { r: "ok", key: p.secret_hash };
+      }
+      case "attach_to": {   // DM attachments: which of these are my friends (the Worker asks before it accepts an upload)
+        if (from !== p.uid || !Array.isArray(b.to)) return { r: "none" };
+        return { r: "ok", ok: b.to.filter((u) => typeof u === "string" && UID_RE.test(u) && this.isFriend(u)) };
       }
       case "presence": {
         if (!this.isFriend(from)) return { r: "none" };
@@ -1572,13 +1598,26 @@ export class UserHub extends DurableObject {
       }
       case "message": {
         const to = uidArg(msg.to);
+        // Optional extras (Plan 4): `attach` {id} = a file already uploaded to /saves/v2/attach for this recipient (the metadata is
+        // taken from the budget DO, never from the client), `card` = a small opaque string (challenge cards, <= 1536 chars).
+        const hasAtt = msg.attach != null, hasCard = msg.card != null;
         const text = cleanText(msg.text);
-        if (!to || !text || typeof msg.text !== "string" || Array.from(text).length > MAX_TEXT) {
+        if (!to || (msg.text != null && typeof msg.text !== "string") || (!text && !hasAtt && !hasCard) || Array.from(text).length > MAX_TEXT
+            || (hasCard && (typeof msg.card !== "string" || !msg.card || msg.card.length > 1536))
+            || (hasAtt && (typeof msg.attach !== "object" || typeof msg.attach.id !== "string"))) {
           return this.err(ws, "bad-request", type, "text");
         }
         if (!this.isFriend(to)) return this.err(ws, "not-friends", type, to);
         if (!this.hit("msg", 60, 60 * 1000)) return this.err(ws, "rate-limited", type, to);
-        const m = { id: crypto.randomUUID(), from: p.uid, from_name: p.name, to, kind: "text", text, at: now() };
+        let att = null;
+        if (hasAtt) {
+          if (!this.hit("attmsg", 20, 60 * 1000)) return this.err(ws, "rate-limited", type, to);
+          try { att = await budget(this.env, { op: "v2_attach_check", id: msg.attach.id, from: p.uid, to }); } catch { att = null; }
+          if (!att || att.r !== "ok") return this.err(ws, "bad-request", type, att && att.code === "not-recipient" ? "attach-not-yours" : "attach-gone");
+        }
+        const m = { id: crypto.randomUUID(), from: p.uid, from_name: p.name, to, kind: "text", text: text || (att ? att.name : "card"), at: now() };
+        if (att) m.attach = { id: att.id, name: att.name, size: att.size, sha: att.sha, kind: att.kind, expires: att.expires };
+        if (hasCard) m.card = msg.card;
         const r = await this.call(to, "msg", { uid: p.uid, msg: m });
         if (r.r === "notfriend") return this.err(ws, "not-friends", type, to);
         if (r.r !== "ok") return this.err(ws, "bad-request", type, "undeliverable");
