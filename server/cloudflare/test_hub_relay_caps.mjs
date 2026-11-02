@@ -18,7 +18,7 @@ const rnd = (n) => Array.from({ length: n }, () => B32[Math.floor(Math.random() 
 
 // ---------------------------------------------------------------------------------------------------------------- pure
 {
-  check(RELAY_ROOM_MSGS_PER_SEC === 400, "a room's relay is capped at 400 frames/s (burst 2x), like /ws");
+  check(RELAY_ROOM_MSGS_PER_SEC >= 1000 && RELAY_ROOM_MSGS_PER_SEC <= 2000, "a room's relay cap (frames/s, burst 2x) fits a 4-player room: GameCube idles at ~380/s, N64 4p sends 720/s");
   let t = 0;
   const lim = new SocketLimiter(TEXT_MSGS_PER_SEC, TEXT_BURST, TEXT_ABUSE_MS, () => t);
   const ws = {}, other = {};
@@ -50,7 +50,7 @@ const rnd = (n) => Array.from({ length: n }, () => B32[Math.floor(Math.random() 
     t += 1500;                                                                              // then quiet
   }
   check(!closed, "bursts over budget separated by quiet gaps never close the socket");
-  // Real traffic never comes near the relay budget: a 4-player match is ~270 frames/s of ~100 bytes.
+  // Real traffic never comes near the relay budget: a 4-player match is 400-750 frames/s of ~100 bytes.
   const lim3 = new SocketLimiter(RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, RELAY_ABUSE_MS, () => t);
   const w3 = {};
   let any = false;
@@ -97,19 +97,36 @@ try {
   // A1. Per-room frame cap: 1500 frames in a burst, the room's bucket (800 burst) passes about that many and says why once.
   {
     const { h, g } = await pair(W1, code() + "-1");
-    const N = 4000;
+    const N = 8000;
     for (let i = 0; i < N; i++) h.ws.send(new Uint8Array([1, i & 255, i >> 8]));
     await sleep(2000);
     const got = g.bin.length;
-    check(got >= 700 && got <= 2400, `room frame bucket: ${got} of ${N} burst frames relayed (the 800 burst plus 400/s while they arrive)`);
+    check(got >= 2200 && got <= 6000, `room frame bucket: ${got} of ${N} burst frames relayed (the ${RELAY_ROOM_MSGS_PER_SEC * 2} burst plus ${RELAY_ROOM_MSGS_PER_SEC}/s while they arrive)`);
     const denied = h.text.filter((m) => m.type === "relay_denied");
     check(denied.length >= 1 && denied.length <= 2 && denied[0].reason === "rate-limited" && typeof denied[0].detail === "string",
       `the sender is told once why (relay_denied rate-limited, ${denied.length} notice(s))`);
     check(!h.closed && !g.closed, "a short over-budget burst never closes a socket");
-    await sleep(2500);   // the bucket refills (400/s)
+    await sleep(2500);   // the bucket refills
     const before = g.bin.length;
     for (let i = 0; i < 60; i++) h.ws.send(new Uint8Array([1, 7, i]));
     check(await g.wait(() => g.bin.length >= before + 60, 4000), "after a pause the relay carries frames again");
+    open.push(h.ws, g.ws);
+  }
+
+  // A1b. REGRESSION (4-player rooms froze): four players sending a sustained 4-player load (4 x 190 = 760 frames/s, the N64 worst case
+  // above the GameCube idle load of ~380/s) for 3 s must not lose a single frame to the room cap.
+  {
+    const c = code() + "-1";
+    const { h, g } = await pair(W1, c);
+    const N = 190 * 3 * 4;
+    for (let sec = 0; sec < 3; sec++) {
+      const t0 = Date.now();
+      for (let i = 0; i < 190 * 4; i++) { h.ws.send(new Uint8Array([1, 9, i & 255, sec])); if (i % 76 === 75) await sleep(100); }
+      await sleep(Math.max(0, 1000 - (Date.now() - t0)));
+    }
+    await sleep(500);
+    const denied = h.text.filter((m) => m.type === "relay_denied");
+    check(g.bin.filter((b) => b[1] === 9).length === N && denied.length === 0, `sustained 4-player load (${N} frames at ~760/s) relayed whole, got ${g.bin.filter((b) => b[1] === 9).length}, ${denied.length} relay_denied`);
     open.push(h.ws, g.ws);
   }
 
