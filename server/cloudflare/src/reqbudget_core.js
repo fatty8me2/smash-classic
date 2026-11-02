@@ -6,7 +6,11 @@ export const SPECTATE_FRAC = 0.5;
 export const ROOM_NEW_FRAC = 0.7;
 export const RELAY_STOP_FRAC = 0.9;
 export const FRAMES_PER_UNIT = 20;
-export const RELAY_ROOM_MSGS_PER_SEC = 400;   // game sends ~60 frames/s per player; 4 players -> ~240
+// Per-room relayed frames/s (sustained; burst is 2x). MEASURED, not guessed: a 4-player GameCube NetPlay room idling at the title screen
+// already relays 340-395 frames/s (Dolphin's ENet: pad stream + acks, host <-> 3 guests), and a 4-player N64 rollback room sends one
+// datagram per peer per frame (12 streams x 60 = 720/s). The old 400 cut real 4-player games off (dropped frames -> stalls/desyncs).
+// 1200/s is 3x the idle GameCube load and still a hard ceiling per room; the per-socket byte bucket and the daily budget gates remain.
+export const RELAY_ROOM_MSGS_PER_SEC = 1200;
 export const FLUSH_MS = 30 * 1000;
 
 export const utcDay = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
