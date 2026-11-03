@@ -1423,6 +1423,9 @@ export class UserHub extends DurableObject {
       r = await this.regCall("redeem", { uid: p.uid, name: p.name, created: p.created, code: typeof msg.code === "string" ? msg.code.slice(0, 40) : "" });
     } catch { return send({ type: "invite_result", ok: false, reason: "busy" }); }
     if (!r || !r.ok) return send({ type: "invite_result", ok: false, reason: INVITE_FAIL_REASONS.includes(r && r.reason) ? r.reason : "invalid" });
+    if (testsAllowed(this.env) && Number(this.env.REDEEM_TEST_DELAY_MS) > 0) await new Promise((res) => setTimeout(res, Number(this.env.REDEEM_TEST_DELAY_MS)));   // local tests only: widens the race window
+    // A ban / deny pushed while we waited for the registry is newer than the redemption: never overwrite it.
+    if (blockedStatus(this.gateLocal())) return send({ type: "invite_result", ok: false, reason: "invalid" });
     send({ type: "invite_result", ok: true });
     if (this.gateLocal() === "ok") this.closeUnauthed(4011, "approved");
     else await this.applyGate("ok");

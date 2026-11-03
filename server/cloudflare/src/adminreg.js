@@ -253,6 +253,7 @@ export class AdminRegistry extends DurableObject {
     if (route === "t_unset") { this.sql.exec("DELETE FROM kv WHERE k IN ('approval','cutoff')"); this.cfg = null; return json({ ok: true }); }
     if (route === "t_touch") return json(await this.touch(b));   // a hello with any `created` (0 = unknown), as an account's hub would send it
     if (route === "t_redeem") return json(await this.redeem(b));   // the hub's redeem call, without a socket
+    if (route === "t_invstat") return json({ global: this.gfail.n, uids: this.fails.size });
     if (route === "t_row") return json({ row: UID_RE.test(b.uid) ? this.row(b.uid) : null });
     return new Response("not found", { status: 404 });
   }
@@ -363,9 +364,10 @@ export class AdminRegistry extends DurableObject {
     const t = now();
     const rows = this.sql.exec("SELECT * FROM invites WHERE revoked=0 AND exp>? ORDER BY created DESC LIMIT 100", t - 7 * 86400000).toArray();
     const names = new Map();
-    if (rows.length) {
-      const marks = rows.map(() => "?").join(",");
-      for (const u of this.sql.exec(`SELECT code, name FROM invite_use WHERE code IN (${marks}) ORDER BY at DESC`, ...rows.map((r) => r.code)).toArray()) {
+    for (let i = 0; i < rows.length; i += 40) {   // chunked: a statement may bind only a limited number of parameters
+      const part = rows.slice(i, i + 40);
+      const marks = part.map(() => "?").join(",");
+      for (const u of this.sql.exec(`SELECT code, name FROM invite_use WHERE code IN (${marks}) ORDER BY at DESC`, ...part.map((r) => r.code)).toArray()) {
         const a = names.get(u.code) || []; if (a.length < 5) { a.push(u.name); names.set(u.code, a); }
       }
     }
@@ -377,7 +379,7 @@ export class AdminRegistry extends DurableObject {
     this.sql.exec("DELETE FROM invites WHERE exp<?", t - 7 * 86400000);
     const active = this.sql.exec("SELECT COUNT(*) AS c FROM invites WHERE revoked=0 AND exp>? AND used<uses", t).toArray()[0].c;
     if (active >= this.cap("INVITE_ACTIVE", 50)) return { ...this.inviteList(), ok: false, reason: "invite-cap" };
-    const uses = Math.min(num(b.uses, 1), 20), hours = Math.min(num(b.hours, 168), 720);
+    const uses = Math.min(Math.max(num(b.uses, 1), 1), 20), hours = Math.min(Math.max(num(b.hours, 168), 1), 720);   // 0, negatives, fractions below 1 and junk: the defaults / the minimum
     const note = cleanStr(b.note, 40);
     let code = null;
     for (let i = 0; i < 5 && !code; i++) {
@@ -412,8 +414,12 @@ export class AdminRegistry extends DurableObject {
       u = { start: t, n: 0 }; this.fails.set(key, u);
     }
     u.n++;
-    if (t - this.gfail.start >= win) this.gfail = { start: t, n: 0 };
-    this.gfail.n++;
+    // The registry-wide counter counts each uid at most ONCE per window: a few cheap waiting accounts cannot fill it with their own
+    // 5 tries each (that would lock everybody out). Guessing stays negligible: 31^8 codes, 5 tries per account, 200 accounts an hour.
+    if (u.n === 1) {
+      if (t - this.gfail.start >= win) this.gfail = { start: t, n: 0 };
+      this.gfail.n++;
+    }
   }
   async redeem(b) {
     const uid = String(b.uid || "");
@@ -447,7 +453,8 @@ export class AdminRegistry extends DurableObject {
 
   /* Owner approves the waiting account whose friend code (RH-XXXX-XXXX = the first 8 letters of its uid) was read off its screen. */
   async approveCode(b) {
-    const c = String(b.code ?? "").toUpperCase().replace(/[^A-Z2-7]/g, "").replace(/^RH(?=[A-Z2-7]{8}$)/, "");
+    let c = String(b.code ?? "").toUpperCase().replace(/[\s-]/g, "");   // spaces and dashes are formatting; any other character makes it not a friend code
+    if (/^RH[A-Z2-7]{8}$/.test(c)) c = c.slice(2);
     if (!/^[A-Z2-7]{8}$/.test(c)) return { ok: false, reason: "not-found" };
     const p = c.toLowerCase();
     const rows = this.sql.exec("SELECT uid, status FROM acct WHERE uid>=? AND uid<? LIMIT 5", p, p + "~").toArray();

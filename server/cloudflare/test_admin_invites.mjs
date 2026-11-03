@@ -48,7 +48,7 @@ check(Array.isArray(c1.created.by_names) && c1.created.by_names.length === 0 && 
 check(find(c1.invites, c1.created.code), "create: the reply lists it");
 const c2 = await mkInv(adm, { uses: 99, hours: 9999, note: "x".repeat(60) });
 check(c2.created.uses === 20 && c2.created.exp - c2.created.created === 720 * HOUR && c2.created.note === "x".repeat(40), "create clamps uses<=20, hours<=720, note<=40");
-const c3 = await mkInv(adm, { uses: 0, hours: -3, note: "Joe's cousin" });
+const c3 = await mkInv(adm, { uses: 0.4, hours: -3, note: "Joe's cousin" });
 check(c3.created.uses === 1 && c3.created.exp - c3.created.created === 168 * HOUR && c3.created.note === "Joe's cousin", "create: nonsense numbers fall back to the defaults; note kept");
 let L = await list(adm);
 check(L.length === 3 && L[0].code === c3.created.code && L[2].code === c1.created.code, "list: newest first");
@@ -145,6 +145,19 @@ await new Promise((r) => { raw.onopen = r; });
 raw.send(JSON.stringify({ type: "redeem_invite", code: live.code }));
 check(await untilTrue(() => rawClosed === 4002, 2500) && !rawGot, "redeem before any hello: socket dropped (4002), no answer");
 
+// ============ 6b. a ban that lands while the redeem is in flight wins ============
+const W = await mk(base, nm("Race"));
+const raceInv = (await mkInv(adm, { note: "race" })).created;
+const wconn = await again(W);
+wconn.send({ type: "redeem_invite", code: raceInv.code });
+await sleep(60);
+const wb = await ask(adm, { type: "admin_ban", uid: W.uid }, "admin_result");
+await sleep(900);
+check(wb.ok && !wconn.msgs.some((m) => m.type === "invite_result" && m.ok === true), "race: banned during the redeem -> the socket never hears ok:true");
+const wh = await again(W);
+check(wh.outcome === "error" && wh.error.reason === "account-unavailable", "race: the account is still banned at its next hello (not overwritten to ok)");
+check((await rowOf(W)).status === "banned", "race: registry says banned");
+
 // ============ 7. already-ok redeem consumes nothing ============
 const okr = await reg("t_redeem", { uid: E.uid, code: live.code, name: "e" });
 check(okr.ok === true, "already-ok account redeeming: ok:true");
@@ -164,6 +177,10 @@ check(pb.ok === false && pb.reason === "not-pending", "again on an approved acco
 const pc = await ask(adm, { type: "admin_approve_code", code: "RH-ZZZZ-ZZZZ" }, "admin_result");
 check(pc.ok === false && pc.reason === "not-found", "unknown code: not-found");
 const pd = await ask(adm, { type: "admin_approve_code", code: "!!" }, "admin_result");
+const pd2 = await ask(adm, { type: "admin_approve_code", code: code(P.uid).replace("RH-", "RH-1") }, "admin_result");
+check(pd2.ok === false && pd2.reason === "not-found", "a code with an invalid character is not-found (not silently cleaned)");
+const pd3 = await ask(adm, { type: "admin_approve_code", code: code(P.uid) + "!" }, "admin_result");
+check(pd3.ok === false && pd3.reason === "not-found", "trailing junk: not-found");
 check(pd.ok === false && pd.reason === "not-found", "malformed code: not-found");
 const Q = await mk(base, nm("Plain"));
 const pe = await ask(adm, { type: "admin_approve_code", code: code(Q.uid).slice(3).replace("-", "").toLowerCase() }, "admin_result");
@@ -183,6 +200,17 @@ check((await rowOf(R)).status === "pending", "...account still pending");
 const zr = await redeem(Z, live.code);
 check(zr.res && zr.res.ok === true, "another account is not affected by R's limit");
 check(find(await list(adm), live.code).used === 1, "...exactly one use consumed so far on the live invite");
+
+// each uid counts ONCE toward the global cap (a handful of accounts cannot lock everybody out)
+const st0 = await reg("t_invstat", {});
+const D = rnd(26);
+for (let i = 0; i < 5; i++) await reg("t_redeem", { uid: D, code: "ZZZZ-ZZZZ", name: "d" });
+const st1 = await reg("t_invstat", {});
+check(st1.global === st0.global + 1, "global limiter: 5 failures of one uid add 1 (not 5)");
+const d6 = await reg("t_redeem", { uid: D, code: live.code, name: "d" });
+check(d6.reason === "rate-limited" || d6.reason === "invalid", "...that uid is still limited by its own counter");
+check((await reg("t_redeem", { uid: D, code: "ZZZZ-ZZZZ", name: "d" })).reason === "rate-limited", "...and stays limited");
+check((await reg("t_invstat", {})).global === st1.global, "...without moving the global counter");
 
 // global brute-force cap (30 failures an hour here, 200 in production): spread over many different uids, no sockets needed
 let gl = 0;
