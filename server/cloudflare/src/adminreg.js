@@ -48,7 +48,9 @@ export class AdminRegistry extends DurableObject {
     this.sql = meteredSql(ctx.storage.sql);
     this.sql.exec("CREATE TABLE IF NOT EXISTS acct (uid TEXT PRIMARY KEY, name TEXT NOT NULL, username TEXT, created INTEGER NOT NULL DEFAULT 0, " +
       "first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL DEFAULT 0, pcs INTEGER NOT NULL DEFAULT 1, hub INTEGER NOT NULL DEFAULT 1, " +
-      "status TEXT NOT NULL DEFAULT 'ok', by TEXT NOT NULL DEFAULT '', st_at INTEGER NOT NULL DEFAULT 0, test INTEGER NOT NULL DEFAULT 0, pushed INTEGER NOT NULL DEFAULT 1)");
+      "status TEXT NOT NULL DEFAULT 'ok', by TEXT NOT NULL DEFAULT '', st_at INTEGER NOT NULL DEFAULT 0, test INTEGER NOT NULL DEFAULT 0, pushed INTEGER NOT NULL DEFAULT 1, " +
+      "tries INTEGER NOT NULL DEFAULT 0, unreach INTEGER NOT NULL DEFAULT 0)");
+    for (const col of ["tries INTEGER NOT NULL DEFAULT 0", "unreach INTEGER NOT NULL DEFAULT 0"]) { try { this.sql.exec("ALTER TABLE acct ADD COLUMN " + col); } catch { /* already there */ } }
     this.sql.exec("CREATE INDEX IF NOT EXISTS acct_last ON acct (last_seen)");
     this.sql.exec("CREATE INDEX IF NOT EXISTS acct_first ON acct (first_seen)");
     this.sql.exec("CREATE INDEX IF NOT EXISTS acct_status_last ON acct (status, last_seen)");
@@ -66,6 +68,8 @@ export class AdminRegistry extends DurableObject {
   // ---- limits (the vars are for local tests only) ----
   cap(name, dflt) { return num(this.env["REG_" + name + "_CAP"], dflt); }
   retryMs() { return num(this.env.REG_RETRY_MS, 60000); }
+  maxTries() { return num(this.env.REG_PUSH_TRIES, 10); }               // the retry alarm gives up after this many tries...
+  giveUpMs() { return num(this.env.REG_PUSH_GIVEUP_MS, 24 * 3600 * 1000); }   // ...or this long after the verdict, whichever comes first
 
   // ---- counters: group ("ok" | "pending" | "banned") x test flag. Nothing on a hot path counts rows by scanning. ----
   counters() {
@@ -114,7 +118,8 @@ export class AdminRegistry extends DurableObject {
 
   publicRow(r) {
     return { uid: r.uid, name: r.name, username: r.username || null, created: r.created, first_seen: r.first_seen, last_seen: r.last_seen,
-      pcs: r.pcs, status: r.status, by: r.by, st_at: r.st_at, test: r.test === 1, unapplied: r.hub === 1 && r.pushed === 0 };
+      pcs: r.pcs, status: r.status, by: r.by, st_at: r.st_at, test: r.test === 1,
+      unapplied: r.hub === 1 && r.pushed === 0 && r.unreach === 0, unreachable: r.hub === 1 && r.pushed === 0 && r.unreach === 1 };
   }
 
   async hubCall(uid, route, body) {
@@ -142,10 +147,11 @@ export class AdminRegistry extends DurableObject {
     try { await this.hubCall(admin, "admin_note", { pending: this.n("pending", false) }); } catch { /* the admin sees it on the next list */ }
   }
 
-  /* Push a verdict to the account's hub. true = the hub has it. */
+  /* Push a verdict to the account's hub. true = done: the hub has it, or there is no hub to push to (a retired / deleted account
+   * answers "none": nothing to enforce, nothing to retry). */
   async push(uid, status) {
     for (let i = 0; i < 2; i++) {
-      try { if ((await this.hubCall(uid, "gate", { status })).r === "ok") return true; } catch { /* retried */ }
+      try { const r = (await this.hubCall(uid, "gate", { status })).r; if (r === "ok" || r === "none") return true; } catch { /* retried */ }
     }
     return false;
   }
@@ -188,14 +194,21 @@ export class AdminRegistry extends DurableObject {
     return new Response("not found", { status: 404 });
   }
 
-  /* Retry verdicts that did not reach their hub (a failed push), a few per invocation: the alarm has its own subrequest budget. */
+  /* Retry verdicts that did not reach their hub, a few per invocation (the alarm has its own subrequest budget). A row is given up
+   * after maxTries() tries or giveUpMs() after the verdict, whichever comes first: it is then marked unreachable (shown to the owner)
+   * and no longer retried. The verdict is still enforced at that account's next hello through the registry (a banned hub re-checks
+   * within 10 minutes, an approved one at its next touch), and a touch clears the mark. */
   async alarm() {
     meter(this.env, this.ctx, "alarm");
-    const rows = this.sql.exec("SELECT uid, status FROM acct WHERE pushed=0 AND hub=1 LIMIT 10").toArray();
+    const t = now();
+    const rows = this.sql.exec("SELECT uid, status, tries, st_at FROM acct WHERE pushed=0 AND hub=1 AND unreach=0 LIMIT 10").toArray();
     for (const r of rows) {
-      if (await this.push(r.uid, r.status)) this.sql.exec("UPDATE acct SET pushed=1 WHERE uid=? AND status=?", r.uid, r.status);
+      if (await this.push(r.uid, r.status)) { this.sql.exec("UPDATE acct SET pushed=1, tries=0 WHERE uid=? AND status=?", r.uid, r.status); continue; }
+      const tries = r.tries + 1;
+      const giveUp = tries >= this.maxTries() || t - r.st_at > this.giveUpMs();
+      this.sql.exec("UPDATE acct SET tries=?, unreach=? WHERE uid=? AND status=?", tries, giveUp ? 1 : 0, r.uid, r.status);
     }
-    if (this.sql.exec("SELECT 1 FROM acct WHERE pushed=0 AND hub=1 LIMIT 1").toArray().length) await this.armRetry(5);
+    if (this.sql.exec("SELECT 1 FROM acct WHERE pushed=0 AND hub=1 AND unreach=0 LIMIT 1").toArray().length) await this.armRetry(5);
   }
   async armRetry(mult = 1) {
     try { await this.ctx.storage.setAlarm(now() + this.retryMs() * mult); } catch { /* storage alarm unavailable */ }
@@ -219,7 +232,7 @@ export class AdminRegistry extends DurableObject {
       if (status === "pending" && !s.approval) { status = "ok"; by = "mode-off"; }
       const testNow = test ? 1 : row.test;
       this.sql.exec("UPDATE acct SET name=?, username=COALESCE(?, username), last_seen=?, pcs=MAX(pcs, ?), created=CASE WHEN created=0 THEN ? ELSE created END, " +
-        "hub=1, status=?, by=?, st_at=CASE WHEN status<>? THEN ? ELSE st_at END, test=? WHERE uid=?",
+        "hub=1, status=?, by=?, st_at=CASE WHEN status<>? THEN ? ELSE st_at END, test=?, pushed=1, tries=0, unreach=0 WHERE uid=?",   // the reply below IS the verdict reaching the hub
         name, username, t, num(b.pcs, 1), created, status, by, status, t, testNow, uid);
       if (status !== row.status || testNow !== row.test) { this.bump(row.status, row.test === 1, -1); this.bump(status, testNow === 1, 1); }
       return { status, autofriend: test || testNow ? false : s.autofriend, approval: s.approval };
@@ -326,7 +339,7 @@ export class AdminRegistry extends DurableObject {
     } else if (row.status !== status) {
       this.bump(row.status, row.test === 1, -1); this.bump(status, row.test === 1, 1);
     }
-    this.sql.exec("UPDATE acct SET status=?, by='admin', st_at=?, pushed=? WHERE uid=?", status, t, registered ? 0 : 1, uid);
+    this.sql.exec("UPDATE acct SET status=?, by='admin', st_at=?, pushed=?, tries=0, unreach=0 WHERE uid=?", status, t, registered ? 0 : 1, uid);
     let applied = null;
     if (registered) {
       applied = await this.push(uid, status);

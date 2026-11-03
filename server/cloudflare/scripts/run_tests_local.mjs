@@ -10,7 +10,7 @@ const cfg = {
   "test_admin_autolink.mjs": [`ADMIN_UID:${ADMIN}`],
   "test_admin_api.mjs": [`ADMIN_UID:${ADMIN}`, "REG_PENDING_RECHECK_MS:300"],
   "test_admin_caps.mjs": [`ADMIN_UID:${ADMIN}`, "REG_ACCT_CAP:3", "REG_PENDING_CAP:2", "REG_BAN_CAP:2", "REG_VOUCH_CAP:1", "REG_TOUCH_MS:0"],
-  "test_admin_resilience.mjs": [`ADMIN_UID:${ADMIN}`, "REG_NEW_MS:1500", "REG_TOUCH_MS:0", "REG_RETRY_MS:600", "REG_BAN_RECHECK_MS:500", "REG_PENDING_RECHECK_MS:300"],
+  "test_admin_resilience.mjs": [`ADMIN_UID:${ADMIN}`, "REG_NEW_MS:1500", "REG_TOUCH_MS:0", "REG_RETRY_MS:600", "REG_BAN_RECHECK_MS:500", "REG_PENDING_RECHECK_MS:300", "REG_PUSH_TRIES:2"],
   "test_admin_testflag.mjs": [`ADMIN_UID:${ADMIN}`, "ALLOW_TEST_FLAG:0"],
   "test_autofriend.mjs": ["TEST_FRIEND_CAP:2"],
   "test_dupes2.mjs": ["TEST_ALIAS:1", `ADMIN_UID:${ADMIN}`],

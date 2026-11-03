@@ -1,7 +1,7 @@
 // Resilience of the account gate: no EXISTING account is ever locked out by a registry outage, a failed push, seeding or a rollback.
 // LOCAL wrangler only. Usage (fresh --persist-to dir):
 //   npx wrangler dev --ip 127.0.0.1 --port 8793 --var ADMIN_UID:aaaaaaaaaaaaaaaaaaaaaaaaaa --var TEST_REG:1 --var ALLOW_TEST_FLAG:1 \
-//     --var REG_NEW_MS:1500 --var REG_TOUCH_MS:0 --var REG_RETRY_MS:600 --var REG_BAN_RECHECK_MS:500 --var REG_PENDING_RECHECK_MS:300
+//     --var REG_NEW_MS:1500 --var REG_TOUCH_MS:0 --var REG_RETRY_MS:600 --var REG_BAN_RECHECK_MS:500 --var REG_PENDING_RECHECK_MS:300 --var REG_PUSH_TRIES:2
 //   node test_admin_resilience.mjs [ws://127.0.0.1:8793]
 import { ADMIN, ADMIN_SECRET, rnd, sleep, checker, connect, mk, again, ask, friendsOf, untilTrue } from "./admin_test_lib.mjs";
 
@@ -82,6 +82,34 @@ check(bq.ok && bq.applied === false, "push permanently failing: ban recorded, no
 const Q3 = await again(Q);
 check(Q3.outcome === "error" && Q3.error.reason === "account-unavailable", "…the account's next hello asks the registry and is refused");
 check(await untilTrue(() => Q.closed === 4010 && Q2.closed === 4010, 3000), "…and its other authenticated sockets are closed too");
+const qrow = (await reg("t_row", { uid: Q.uid })).row;
+check(qrow.pushed === 1 && qrow.unreach === 0, "a touch that delivers the verdict marks it pushed (no pointless retries)");
+await reg("t_failpush", { n: 0 });
+
+// a retired / deleted account has no hub to push to: its "none" answer counts as done (no endless retry loop)
+const D = await mk(base, nm("Deleted"));
+D.send({ type: "delete_account", confirm: true });
+await untilTrue(() => D.closed === 4005, 4000);
+const bd = await ask(adm, { type: "admin_ban", uid: D.uid }, "admin_result");
+check(bd && bd.ok && bd.applied === true, "banning a deleted account: its 'none' reply counts as done (applied)");
+check((await reg("t_row", { uid: D.uid })).row.pushed === 1, "…and nothing is left to retry");
+
+// an unreachable hub is given up on (REG_PUSH_TRIES=2 here; 10 tries or 24 h in production), shown, and the ban still lands at its next hello
+const Z = await mk(base, nm("Unreach"));
+await reg("t_failpush", { n: 100000 });
+const bz = await ask(adm, { type: "admin_ban", uid: Z.uid }, "admin_result");
+check(bz && bz.ok && bz.applied === false, "unreachable hub: ban recorded, push failed");
+check(await untilTrue(async () => (await list({ q: Z.name })).rows.find((r) => r.uid === Z.uid)?.unreachable === true, 9000), "the retry alarm gives up and the row is marked unreachable (shown in the dashboard)");
+const zr = (await reg("t_row", { uid: Z.uid })).row;
+check(zr.tries === 2 && zr.unreach === 1 && zr.pushed === 0, "it stopped after the configured number of tries (" + zr.tries + ")");
+await sleep(4500);                                          // longer than the 5x re-arm: a loop would have tried again
+check((await reg("t_row", { uid: Z.uid })).row.tries === 2, "no further retries after giving up (no endless alarm loop)");
+const zl = (await list({ q: Z.name })).rows.find((r) => r.uid === Z.uid);
+check(zl.unapplied === false && zl.unreachable === true, "the list shows unreachable, not 'retrying'");
+const Z2 = await again(Z);
+check(Z2.outcome === "error" && Z2.error.reason === "account-unavailable", "the ban is still enforced at the account's next hello through the registry");
+const zr2 = (await reg("t_row", { uid: Z.uid })).row;
+check(zr2.pushed === 1 && zr2.unreach === 0, "…and that hello clears the unreachable mark");
 await reg("t_failpush", { n: 0 });
 
 // a failed UNBAN push never leaves the account banned forever
