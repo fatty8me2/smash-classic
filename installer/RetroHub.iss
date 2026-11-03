@@ -21,6 +21,8 @@
 #endif
 
 [Setup]
+; refresh Explorer's icon cache at the end of install so a new app icon shows at once
+ChangesAssociations=yes
 ; Fixed AppId: upgrades replace in place. KEEP IN SYNC with src/hub/updater.cpp.
 AppId={{B7F3C1A2-5D4E-4F6A-9C8B-3E1D2A7F5C90}
 AppName=RetroHub
