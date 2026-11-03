@@ -22,6 +22,8 @@ const SUITE = [
   { file: "test_admin_api.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_PENDING_RECHECK_MS: "300" } },
   { file: "test_admin_caps.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_ACCT_CAP: "3", REG_PENDING_CAP: "2", REG_BAN_CAP: "2", REG_VOUCH_CAP: "1", REG_TOUCH_MS: "0" } },
   { file: "test_admin_resilience.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_NEW_MS: "1500", REG_TOUCH_MS: "0", REG_RETRY_MS: "600", REG_BAN_RECHECK_MS: "500", REG_PENDING_RECHECK_MS: "300", REG_PUSH_TRIES: "2" } },
+  // "A ban blocks RetroHub entirely": approval ON by default (REG_APPROVAL_DEFAULT back to 1), grandfathering, reasons, strict rooms
+  { file: "test_admin_lockout.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_APPROVAL_DEFAULT: "1", REG_TOUCH_MS: "0", REG_PENDING_RECHECK_MS: "300", STRICT_CACHE_MS: "0", STRICT_IDENT_MS: "1500" } },
   { file: "test_admin_testflag.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, ALLOW_TEST_FLAG: "0" } },
   { file: "test_admin_rollback.mjs", kind: "self", env: { ROLLBACK_PORT: "10111" } },
   { file: "test_autofriend.mjs", kind: "ws", vars: { TEST_FRIEND_CAP: "2" } },

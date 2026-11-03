@@ -27,7 +27,7 @@ async function startServer() {
   persist = mkdtempSync(join(tmpdir(), "rh-r2-"));
   const port = NOR2 ? PORT + 1 : PORT;
   proc = spawn(process.execPath, ["node_modules/wrangler/bin/wrangler.js", "dev", "-c", "wrangler.test.jsonc", "--port", String(port),
-    "--persist-to", persist, "--ip", "127.0.0.1"], { stdio: ["ignore", "pipe", "pipe"] });
+    "--persist-to", persist, "--ip", "127.0.0.1", "--var", "REG_APPROVAL_DEFAULT:0"], { stdio: ["ignore", "pipe", "pipe"] });
   let log = "";
   proc.stdout.on("data", (d) => { log += d; });
   proc.stderr.on("data", (d) => (log += d));

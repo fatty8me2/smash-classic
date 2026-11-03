@@ -32,7 +32,7 @@ export async function startServer({ port, vars = {}, nor2 = false, saves = true,
   const cfgName = `wrangler.v2test.${port}.jsonc`;
   writeFileSync(cfgName, JSON.stringify(j, null, 1));
   const args = ["node_modules/wrangler/bin/wrangler.js", "dev", "-c", cfgName, "--port", String(port), "--persist-to", persist, "--ip", "127.0.0.1"];
-  for (const [k, v] of Object.entries({ BUDGET_TEST: "1", ALLOW_TEST_FLAG: "1", TEST_REG: "1", ...vars })) args.push("--var", `${k}:${v}`);   // ALLOW_TEST_FLAG: local QA accounts (qa- names, test:true) stay test accounts; production never sets it
+  for (const [k, v] of Object.entries({ BUDGET_TEST: "1", ALLOW_TEST_FLAG: "1", TEST_REG: "1", REG_APPROVAL_DEFAULT: "0", ...vars })) args.push("--var", `${k}:${v}`);   // REG_APPROVAL_DEFAULT 0: approval mode is ON by default in production; the suite opts out (test_admin_lockout.mjs sets it back to 1). ALLOW_TEST_FLAG: local QA accounts (qa- names, test:true) stay test accounts; production never sets it
   const proc = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, WRANGLER_REGISTRY_PATH: registry, WRANGLER_SEND_METRICS: "false", NO_COLOR: "1" } });
   let log = "";

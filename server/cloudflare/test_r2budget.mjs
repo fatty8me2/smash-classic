@@ -25,7 +25,7 @@ async function start(vars) {
   writeFileSync("wrangler.budget.jsonc", JSON.stringify(j, null, 1));
   const persist = mkdtempSync(join(tmpdir(), "rh-r2b-"));
   const args = ["node_modules/wrangler/bin/wrangler.js", "dev", "-c", "wrangler.budget.jsonc", "--port", String(PORT), "--persist-to", persist, "--ip", "127.0.0.1"];
-  for (const [k, v] of Object.entries(vars)) args.push("--var", `${k}:${v}`);
+  for (const [k, v] of Object.entries({ REG_APPROVAL_DEFAULT: "0", ...vars })) args.push("--var", `${k}:${v}`);
   proc = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
   let log = "";
   proc.stdout.on("data", (d) => (log += d)); proc.stderr.on("data", (d) => (log += d));

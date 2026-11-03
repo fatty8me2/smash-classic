@@ -12,8 +12,23 @@
 //
 // Gate status:  ok | pending | banned | denied
 //   banned / denied  the account is refused for friends, rooms (ident), invites, saves and links ("account-unavailable").
-//   pending          approval mode is on and the account is new: refused online until the owner approves it.
-// Settings (kv): approval (default OFF), cutoff (when approval was switched on), vouch (default OFF), autofriend (default ON).
+//   pending          approval mode is on and the account is new: refused online until the owner approves it ("pending-approval").
+// Settings (kv): approval (DEFAULT ON while the kv is unset; the owner can switch it off in the Admin page), cutoff (when approval was
+//   switched on), dcut (the DEFAULT cutoff, see below), vouch (default OFF), autofriend (default ON), strict_rooms (default OFF).
+//
+// Default-on approval and grandfathering. While the approval kv has never been written, approval is ON and the cutoff is `dcut`: the
+//   moment this registry first ran with this code (written once; env REG_DEFAULT_CUTOFF pins it). An account is decided from its hub's
+//   own creation time (UserHub profile.created, set when the account registered, present since the first release): created <= cutoff, or
+//   no creation time at all (0) => grandfathered "ok"; created after the cutoff => "pending". So every account that existed before
+//   the deploy stays ok whenever the registry first sees it (hello, seed, or the owner's list), and only accounts created afterwards
+//   are held. The admin account is never gated. REG_APPROVAL_DEFAULT=0 (local tests only) restores the old default of OFF.
+//
+// Wire messages a refused client gets (all carry `reason`; "pending-approval" = waiting for the owner, "account-unavailable" = banned or
+//   denied, deliberately generic; "server-busy" = a brand-new account while the registry is unreachable):
+//   /friends hello      -> {type:"error", reason}, socket left open and unauthenticated (no welcome); an approval later closes it with 4011
+//   /hub ident          -> {type:"error", reason} then close 4012 "pending-approval" / 4010 "account-unavailable"
+//   /hub strict mode    -> a lobby seat that proves no account within the deadline: {type:"error", reason:"ident-required"} then close 4013
+//   /link/*  (403)      -> {error:"auth", reason}        /saves/*  (403)  -> {ok:false, error:reason, reason}
 //
 // Safety rule for everything here: no EXISTING account is ever locked out by an error, a bug, seeding or a rollback. Only an
 // explicit ban/deny, or a brand-new account while approval mode is on, is ever refused. Row counts are kept in counters (cnt) so
@@ -100,19 +115,34 @@ export class AdminRegistry extends DurableObject {
     if (!this.cfg) {
       const o = {};
       for (const r of this.sql.exec("SELECT k, v FROM kv").toArray()) o[r.k] = r.v;
-      this.cfg = { approval: o.approval === "1", cutoff: Number(o.cutoff) || 0, vouch: o.vouch === "1", autofriend: o.autofriend !== "0" };
+      // approval: explicit owner choice wins; never written => ON (REG_APPROVAL_DEFAULT=0 turns the default off, local tests only).
+      const defOn = String(this.env.REG_APPROVAL_DEFAULT ?? "1") !== "0";
+      const approval = o.approval === undefined ? defOn : o.approval === "1";
+      this.cfg = { approval, cutoff: Number(o.cutoff) || this.defaultCutoff(o), vouch: o.vouch === "1", autofriend: o.autofriend !== "0", strict: o.strict_rooms === "1" };
     }
     return this.cfg;
+  }
+  /* The grandfathering cutoff while the owner never switched approval on by hand: env pin, else the stored first-run time. */
+  defaultCutoff(o) {
+    const pin = Number(this.env.REG_DEFAULT_CUTOFF);
+    if (pin > 0) return pin;
+    let d = Number(o.dcut);
+    if (!(d > 0)) {
+      d = now();
+      try { this.sql.exec("INSERT OR IGNORE INTO kv (k, v) VALUES ('dcut', ?)", String(d)); } catch { /* read-only: keep the in-memory value */ }
+    }
+    return d;
   }
   setKv(k, v) { this.sql.exec("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", k, String(v)); this.cfg = null; }
 
   row(uid) { return this.sql.exec("SELECT * FROM acct WHERE uid=?", uid).toArray()[0] || null; }
 
-  /* Status for an account seen for the first time. approval off => ok; on => ok only if it is older than the switch-on moment. */
+  /* Status for an account seen for the first time. approval off => ok; on => ok only if it is not newer than the cutoff. An account
+   * without a creation time (0) is an old one that never recorded it: grandfathered, never held. */
   decide(created) {
     const s = this.settings();
     if (!s.approval) return { status: "ok", by: "auto" };
-    if (created > 0 && created < s.cutoff) return { status: "ok", by: "grandfathered" };
+    if (!(created > 0) || created <= s.cutoff) return { status: "ok", by: "grandfathered" };
     return { status: "pending", by: "" };
   }
 
@@ -169,6 +199,7 @@ export class AdminRegistry extends DurableObject {
     if (ADMIN_ROUTES.includes(route) && (!this.env.ADMIN_UID || b.admin !== this.env.ADMIN_UID)) return new Response("forbidden", { status: 403 });
     switch (route) {
       case "touch": return json(await this.touch(b));
+      case "flags": return json({ strict: this.settings().strict });   // HubRoom: do lobby seats have to prove an account?
       case "rename": return json(this.rename(b));
       case "vouch": return json(this.vouch(b));
       case "list": return json(this.list(b));
@@ -180,7 +211,7 @@ export class AdminRegistry extends DurableObject {
     }
   }
 
-  testRoute(route, b) {
+  async testRoute(route, b) {
     if (this.env.TEST_REG !== "1") return new Response("not found", { status: 404 });
     if (route === "t_down") { this.down = b.on === true; return json({ ok: true }); }
     if (route === "t_failpush") { this.failPush = num(b.n, 0); return json({ ok: true }); }
@@ -190,6 +221,9 @@ export class AdminRegistry extends DurableObject {
       return json({ ok: !!r });
     }
     if (route === "t_seed") return json(this.seed(b));
+    if (route === "t_cutoff") { this.setKv("dcut", String(num(b.at, now()))); return json({ ok: true, cutoff: this.settings().cutoff }); }   // move the default cutoff
+    if (route === "t_unset") { this.sql.exec("DELETE FROM kv WHERE k IN ('approval','cutoff')"); this.cfg = null; return json({ ok: true }); }
+    if (route === "t_touch") return json(await this.touch(b));   // a hello with any `created` (0 = unknown), as an account's hub would send it
     if (route === "t_row") return json({ row: UID_RE.test(b.uid) ? this.row(b.uid) : null });
     return new Response("not found", { status: 404 });
   }
@@ -309,7 +343,7 @@ export class AdminRegistry extends DurableObject {
     return { ok: true, rows, total, offset, counts: this.counts(), settings: this.publicSettings(), all: this.tracked() };
   }
 
-  publicSettings() { const s = this.settings(); return { approval: s.approval, vouch: s.vouch, autofriend: s.autofriend, cutoff: s.cutoff }; }
+  publicSettings() { const s = this.settings(); return { approval: s.approval, vouch: s.vouch, autofriend: s.autofriend, cutoff: s.cutoff, strict_rooms: s.strict }; }
 
   detail(b) {
     const uid = String(b.uid || "");
@@ -356,6 +390,7 @@ export class AdminRegistry extends DurableObject {
       this.setKv("approval", set.approval ? "1" : "0");
       if (set.approval) this.setKv("cutoff", String(now()));   // grandfathering: accounts created before this moment keep working
     }
+    if (typeof set.strict_rooms === "boolean") this.setKv("strict_rooms", set.strict_rooms ? "1" : "0");
     if (typeof set.vouch === "boolean") this.setKv("vouch", set.vouch ? "1" : "0");
     if (typeof set.autofriend === "boolean") this.setKv("autofriend", set.autofriend ? "1" : "0");
     return { ok: true, settings: this.publicSettings(), counts: this.counts() };

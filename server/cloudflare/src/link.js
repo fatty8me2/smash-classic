@@ -144,6 +144,10 @@ async function auth(env, uid, secret, count) {
   return r.r || "none";
 }
 
+// A refused account gets the reason (link_auth only answers a gate after the secret was proved).
+const gateReason = (g) => (g === "pending" ? "pending-approval" : "account-unavailable");
+const authFail = (af) => json(af && af.gate ? { error: "auth", reason: gateReason(af.gate) } : { error: "auth" }, 403);
+
 // Same check as auth(), but returns the whole reply ({r, username, prev}).
 async function authFull(env, uid, secret, count) {
   if (!UID_RE.test(uid) || typeof secret !== "string" || secret.length < 16 || secret.length > 128) return { r: "none" };
@@ -168,7 +172,7 @@ export async function linkFetch(request, env) {
     const af = await authFull(env, body.uid, body.secret, true);
     const a = af.r || "none";
     if (a === "rate") return json({ error: "rate-limited" }, 429);
-    if (a !== "ok") return json({ error: "auth" }, 403);
+    if (a !== "ok") return authFail(af);
     const username = typeof af.username === "string" ? af.username : "";
     const expires = now() + ttlMs(env);
     for (let i = 0; i < 3; i++) {
@@ -198,7 +202,7 @@ export async function linkFetch(request, env) {
     const af = await authFull(env, body.uid, body.secret, !removing);
     const a = af.r || "none";
     if (a === "rate") return json({ error: "rate-limited" }, 429);
-    if (a !== "ok") return json({ error: "auth" }, 403);
+    if (a !== "ok") return authFail(af);
     const hubSet = (box) => env.USER_HUBS.get(env.USER_HUBS.idFromName(body.uid)).fetch("https://userhub/i/link_set", {
       method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
       body: JSON.stringify({ uid: body.uid, secret: body.secret, kind: "keep", box }),
@@ -217,8 +221,8 @@ export async function linkFetch(request, env) {
   }
 
   if (url.pathname === "/link/put") {
-    const a = await auth(env, body.uid, body.secret, false);
-    if (a !== "ok") return json({ error: "auth" }, 403);
+    const af = await authFull(env, body.uid, body.secret, false);
+    if ((af.r || "none") !== "ok") return authFail(af);
     const code = normalizeCode(body.code);
     if (!code || !B64_RE.test(body.salt || "") || !B64_RE.test(body.iv || "") || !B64_RE.test(body.ct || "")) {
       return json({ error: "bad-request" }, 400);

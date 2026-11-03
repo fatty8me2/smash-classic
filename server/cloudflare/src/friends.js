@@ -854,7 +854,9 @@ export class UserHub extends DurableObject {
       // No verdict yet: an existing account is let in, nothing is cached. Only a genuinely new account is held, and only while
       // approval mode is known to be on.
       const brandNew = t - (Number(p.created) || 0) < newMs;
-      if (brandNew && approvalHint.on && t - approvalHint.at < 3600 * 1000) return { status: "busy" };
+      // Approval mode is ON unless the owner switched it off, so a hub that never heard from the registry assumes the default (env, tests only).
+      const approvalOn = approvalHint.at ? approvalHint.on && t - approvalHint.at < 3600 * 1000 : String(this.env.REG_APPROVAL_DEFAULT ?? "1") !== "0";
+      if (brandNew && approvalOn) return { status: "busy" };
       return { status: "ok", autofriend: null };   // null = unknown: the admin auto-link is retried at the next hello, never marked "done"
     }
     const status = STATUS_LIST.includes(r.status) ? r.status : "ok";   // an unreadable verdict never locks anybody out
@@ -1172,7 +1174,8 @@ export class UserHub extends DurableObject {
       }
       case "saves_auth": {
         // Cloud saves: hand the Worker the HMAC key (sha256hex of the secret) after rate limiting this account.
-        if (from !== p.uid || gl !== "ok") return { r: "none" };
+        if (from !== p.uid) return { r: "none" };
+        if (gl !== "ok") return { r: "gated", gate: gl, key: p.secret_hash };   // the Worker checks the signature first, then refuses with the reason (the key never leaves it)
         const w = !!b.write;
         const V2 = { pc: 30, put: 120, get: 300, meta: 60, att: 10 };   // v2 per-account per-minute limits (docs/CLOUD_SAVES_V2.md 3.6)
         if (b.cls && V2[b.cls]) {

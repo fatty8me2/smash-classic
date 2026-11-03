@@ -50,6 +50,8 @@ function safeEq(a, b) {
 
 export { cleanKey };
 
+export const gateReason = (g) => (g === "pending" ? "pending-approval" : "account-unavailable");
+
 export async function authenticate(request, env, url, write, cls) {
   const h = request.headers.get("Authorization") || "";
   const m = /^RHSIG uid=([a-z2-7]{26}),ts=(\d{10,16}),sig=([0-9a-f]{64})$/.exec(h);
@@ -64,10 +66,12 @@ export async function authenticate(request, env, url, write, cls) {
   });
   const a = await r.json();
   if (a.r === "limited") return { res: err(429, "rate-limited", { retryAfter: 60 }) };
-  if (a.r !== "ok" || typeof a.key !== "string") return { res: err(401, "unauthorized") };
+  if ((a.r !== "ok" && a.r !== "gated") || typeof a.key !== "string") return { res: err(401, "unauthorized") };
   const hv = (n) => request.headers.get(n) || "-";
   const msgS = `${request.method}\n${url.pathname}${url.search}\n${ts}\n${hv("X-RH-Sha")}\n${hv("If-Match")}\n${hv("If-None-Match")}\n${request.method === "PUT" ? hv("Content-Length") : "-"}\n${hv("X-RH-Mtime")}`; const want = await hmacHex(a.key, msgS);
   if (!safeEq(want, sig)) return { res: err(401, "unauthorized") };
+  // A banned / denied / waiting account: refused, and only the holder of the account secret (a valid signature) is told why.
+  if (a.r === "gated") { const reason = gateReason(a.gate); return { res: err(403, reason, { reason }) }; }
   return { uid };
 }
 

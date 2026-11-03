@@ -126,7 +126,7 @@ check(add.some((m) => m.type === "error" && m.reason === "unknown-code"), "addin
 const sign = (acct, path) => { const ts = Date.now(); const msg = `GET\n${path}\n${ts}\n-\n-\n-\n-\n-`; return `RHSIG uid=${acct.uid},ts=${ts},sig=${createHmac("sha256", sha(acct.secret)).update(msg).digest("hex")}`; };
 const sv = async (u) => (await fetch(http + "/saves/v2/status", { headers: { Authorization: sign(u, "/saves/v2/status") } })).status;
 check((await sv(U2)) === 200, "saves: a normal account is authorised");
-check((await sv(U1)) === 401, "saves: a banned account is refused (401)");
+check((await sv(U1)) === 403, "saves: a banned account is refused (403 account-unavailable)");
 const link = async (u) => (await fetch(http + "/link/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ uid: u.uid, secret: u.secret }) })).status;
 check((await link(U2)) === 200, "links: a normal account can create a link code");
 check((await link(U1)) === 403, "links: a banned account cannot (403)");
@@ -175,7 +175,7 @@ const pend = await waitMsg(adm, (m) => m.type === "admin_pending", 2000);
 check(pend && pend.pending >= 1, "the admin is pushed a pending notice");
 const lp = await list({ status: "pending", limit: 50 });
 check(lp.rows.some((r) => r.uid === N1.uid && r.status === "pending") && lp.counts.pending >= 1, "the Pending queue lists the new account");
-check((await sv(N1)) === 401 && (await link(N1)) === 403, "pending account: saves and links refused too");
+check((await sv(N1)) === 403 && (await link(N1)) === 403, "pending account: saves and links refused too");
 check((await seat(N1)) === 4012, "pending account: room seat closed 4012 at ident");
 const T3 = await mk(base, "qa-" + rnd(5));
 check(T3.outcome === "error" && !T3.welcome, "approval ON: a spoofed test account is not a way around the gate");

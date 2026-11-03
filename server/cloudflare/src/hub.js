@@ -77,6 +77,27 @@ const MAX_BINARY_BYTES = 1200;
 const SMASH_LINK_TTL_MS = 6 * 3600 * 1000;
 const isGameRoom = (room) => room.includes("-");
 
+// Strict rooms (owner switch, default OFF; registry flag strict_rooms): a LOBBY seat (not a "-N" game room) must prove a registered, approved
+// account with an ident within IDENT_WAIT_MS of its welcome, or it is closed (error ident-required, 4013). Spectators prove it too (they may
+// send ident). Off by default because shipped clients send ident only while "auto-friend" is on; see adminreg.js.
+const IDENT_WAIT_MS = 15000;
+const identWaitMs = (env) => { const v = Number(env && env.STRICT_IDENT_MS); return Number.isFinite(v) && v > 0 ? v : IDENT_WAIT_MS; };
+const strictCache = { v: false, at: -1e12 };   // per isolate: the flag is asked of the registry at most once a minute (STRICT_CACHE_MS overrides, tests)
+async function strictRooms(env) {
+  if (!env.ADMIN_REG) return false;
+  const ttl = env.STRICT_CACHE_MS !== undefined && env.STRICT_CACHE_MS !== "" && Number(env.STRICT_CACHE_MS) >= 0 ? Number(env.STRICT_CACHE_MS) : 60000;
+  const t = Date.now();
+  if (t - strictCache.at < ttl) return strictCache.v;
+  strictCache.at = t;   // set first: an unreachable registry is not asked again on every join
+  try {
+    const r = await env.ADMIN_REG.get(env.ADMIN_REG.idFromName("registry")).fetch("https://registry/flags", {
+      method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: "{}",
+    });
+    strictCache.v = r.ok && (await r.json()).strict === true;
+  } catch { strictCache.v = false; }   // never lock anybody out on an error
+  return strictCache.v;
+}
+
 function cleanName(raw) {
   let s = String(raw || "").replace(/[^\x20-\x7E]/g, "").trim();
   if (s.length > MAX_NAME) s = s.slice(0, MAX_NAME);
@@ -185,7 +206,7 @@ export class HubRoom extends DurableObject {
       if (ws === except) continue;
       const a = ws.deserializeAttachment();
       if (!a || typeof a.slot !== "number" || a.slot < 0) continue;
-      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs, uid: a.uid || null, spec: !!a.spec, dr: !!a.dr });
+      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs, uid: a.uid || null, spec: !!a.spec, dr: !!a.dr, idw: a.idw || 0, idok: !!a.idok });
     }
     return out;
   }
@@ -217,7 +238,7 @@ export class HubRoom extends DurableObject {
   }
 
   attach(ws, m) {
-    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs, uid: m.uid || null, spec: !!m.spec, dr: !!m.dr });
+    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs, uid: m.uid || null, spec: !!m.spec, dr: !!m.dr, idw: m.idw || 0, idok: !!m.idok });
   }
 
   sendPeers() {
@@ -343,7 +364,8 @@ export class HubRoom extends DurableObject {
 
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
-    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs, spec, dr: !!dropRec });
+    const idw = !isGameRoom(room) && await strictRooms(this.env) ? Date.now() + identWaitMs(this.env) : 0;
+    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs, spec, dr: !!dropRec, idw, idok: false });
     pair[1].send(JSON.stringify(spec ? (dropRec ? { type: "welcome", room, slot, spec: true, dropin: true } : { type: "welcome", room, slot, spec: true }) : { type: "welcome", room, slot }));
     if (spec && !isGameRoom(room)) {
       const l = dropRec || await this.getLaunch();
@@ -352,6 +374,7 @@ export class HubRoom extends DurableObject {
       }
     }
     this.sendMembers();
+    if (idw) await this.armAlarm(idw);
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -398,7 +421,7 @@ export class HubRoom extends DurableObject {
       return;
     }
     if (!msg || typeof msg !== "object") return;
-    if (me.spec && (msg.type !== "endpoint" || !me.game)) return;   // spectators never send msg/ident
+    if (me.spec && msg.type !== "ident" && (msg.type !== "endpoint" || !me.game)) return;   // spectators never send msg (they may prove their account with ident)
     switch (msg.type) {
       case "msg": {
         if (msg.body === null || typeof msg.body !== "object") return;
@@ -412,7 +435,7 @@ export class HubRoom extends DurableObject {
       case "ident": {
         // {type:"ident",uid,secret}: proves which account this seat is (checked against the account's own hub).
         // Only used for automatic friending; never forwarded to other members. One DO call per seat.
-        if (me.uid || typeof msg.uid !== "string" || !UID_RE.test(msg.uid) || typeof msg.secret !== "string") return;
+        if (me.uid || me.idok || typeof msg.uid !== "string" || !UID_RE.test(msg.uid) || typeof msg.secret !== "string") return;
         if (me.game) return;
         // A seat sends one ident per welcome. Retries are capped per seat and per room, and only REGISTERED accounts are woken:
         // an ident with a made-up uid used to make the Worker create (and write the schema of) a brand-new account hub, each time.
@@ -434,11 +457,18 @@ export class HubRoom extends DurableObject {
             if (rr.gate) gated = rr.gate;   // a banned / waiting account is not allowed in rooms either
           }
         } catch { /* unreachable: no auto friending */ }
-        if (gated) { try { ws.close(gated === "pending" ? 4012 : 4010, gated === "pending" ? "pending-approval" : "account-unavailable"); } catch { /* closed */ } return; }
+        if (gated) {   // a banned / denied / waiting account: told why, then closed
+          const reason = gated === "pending" ? "pending-approval" : "account-unavailable";
+          try { ws.send(JSON.stringify({ type: "error", reason })); } catch { /* closing */ }
+          try { ws.close(gated === "pending" ? 4012 : 4010, reason); } catch { /* closed */ }
+          return;
+        }
         const now = ws.deserializeAttachment();
-        if (!ok || !now || typeof now.slot !== "number" || now.slot < 0 || now.uid) return;
+        if (!ok || !now || typeof now.slot !== "number" || now.slot < 0 || now.uid || now.idok) return;
+        // Proof only (no pairing) for spectators and for {nopair:true} idents (a client whose auto-friend is off still proves its account).
+        if (me.spec || msg.nopair === true) { ws.serializeAttachment({ ...now, idok: true, idw: 0 }); return; }
         if (this.members().some((m) => m.uid === msg.uid)) return;   // one seat per account
-        ws.serializeAttachment({ ...now, uid: msg.uid });
+        ws.serializeAttachment({ ...now, uid: msg.uid, idok: true, idw: 0 });
         await this.pairAll(false, msg.uid);
         break;
       }
@@ -453,6 +483,8 @@ export class HubRoom extends DurableObject {
           rs: !!me.rs,
           uid: me.uid || null,
           spec: !!me.spec,
+          idw: me.idw || 0,
+          idok: !!me.idok,
         });
         this.sendPeers();
         break;
@@ -523,7 +555,7 @@ export class HubRoom extends DurableObject {
     this.grace = { ...g, until: Date.now() + graceMs(this.env) };
     this.graceLoaded = true;
     await this.ctx.storage.put("hostgrace", this.grace);
-    await this.ctx.storage.setAlarm(this.grace.until);
+    await this.armAlarm(this.grace.until);
     noteRows(2);
     this.sendMembers();   // placeholder keeps the host listed
   }
@@ -533,11 +565,45 @@ export class HubRoom extends DurableObject {
     this.graceLoaded = true;
     await this.ctx.storage.delete("hostgrace");
     try { await this.ctx.storage.deleteAlarm(); } catch { /* none */ }
+    await this.armIdent();   // a pending ident deadline must survive the grace ending
+  }
+
+  /* One storage alarm per room serves the host grace and the strict-room ident deadlines: it is only ever moved EARLIER here, and
+   * alarm() re-arms whatever is still pending. */
+  async armAlarm(at) {
+    try {
+      const cur = await this.ctx.storage.getAlarm();
+      if (cur && cur > Date.now() && cur <= at) return;
+      await this.ctx.storage.setAlarm(at);
+      noteRows(1);
+    } catch { /* storage alarm unavailable */ }
+  }
+
+  async armIdent() {
+    const due = this.members().filter((m) => m.idw > Date.now() && !m.idok && !m.uid).map((m) => m.idw);
+    if (due.length) await this.armAlarm(Math.min(...due));
+  }
+
+  /* Strict rooms: close every seat whose ident deadline passed without a proven account. */
+  async sweepIdent() {
+    const t = Date.now();
+    for (const m of this.members()) {
+      if (!m.idw || m.idok || m.uid || t < m.idw) continue;
+      try { m.ws.send(JSON.stringify({ type: "error", reason: "ident-required" })); } catch { /* closing */ }
+      try { m.ws.close(4013, "ident-required"); } catch { /* closed */ }
+    }
+    await this.armIdent();
   }
 
   // Grace over and the host never came back: the teardown webSocketClose would have done at once.
   async alarm() {
+    await this.sweepIdent();
     const g = this.grace && this.graceLoaded ? this.grace : await this.ctx.storage.get("hostgrace");
+    if (g && Date.now() < g.until - 50) {   // woken by an ident deadline, the grace is still running
+      this.grace = g; this.graceLoaded = true;
+      await this.armAlarm(g.until);
+      return;
+    }
     this.grace = null;
     this.graceLoaded = true;
     if (!g) return;
