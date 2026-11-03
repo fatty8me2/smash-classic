@@ -41,7 +41,7 @@ import { meter, meteredSql } from "./reqbudget.js";
 // Grandfathering cutoff used while approval was never switched on by hand (set at edit time, 2026-11-03). Every account created at or before
 // it stays ok - in the registry AND in a hub that cannot reach the registry. Accounts registered between this value and the deploy would
 // count as new, so bump it. REG_DEFAULT_CUTOFF (env, tests) overrides it.
-export const DEFAULT_CUTOFF = 1793724460515;
+export const DEFAULT_CUTOFF = 1793727166972;
 export const cutoffFor = (env) => { const pin = Number(env && env.REG_DEFAULT_CUTOFF); return pin > 0 ? pin : DEFAULT_CUTOFF; };
 const UID_RE = /^[a-z2-7]{26}$/;
 export const ACCT_CAP = 20000;      // ok + pending rows (test accounts included); past it new ok accounts are simply not tracked (never refused)
