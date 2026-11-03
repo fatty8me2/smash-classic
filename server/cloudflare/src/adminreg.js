@@ -37,9 +37,12 @@
 import { DurableObject } from "cloudflare:workers";
 import { meter, meteredSql } from "./reqbudget.js";
 
-// Grandfathering cutoff used while approval was never switched on by hand: 2026-11-03, set at edit time. Every account created before it
-// stays ok. BUMP IT to the deploy moment (Date.now()) right before deploying so accounts registered in between are grandfathered too.
+// ===== DEPLOY-TIME CONSTANT (the ONLY one): BUMP IT to Date.now() right before `wrangler deploy` =====
+// Grandfathering cutoff used while approval was never switched on by hand (set at edit time, 2026-11-03). Every account created at or before
+// it stays ok - in the registry AND in a hub that cannot reach the registry. Accounts registered between this value and the deploy would
+// count as new, so bump it. REG_DEFAULT_CUTOFF (env, tests) overrides it.
 export const DEFAULT_CUTOFF = 1793724460515;
+export const cutoffFor = (env) => { const pin = Number(env && env.REG_DEFAULT_CUTOFF); return pin > 0 ? pin : DEFAULT_CUTOFF; };
 const UID_RE = /^[a-z2-7]{26}$/;
 export const ACCT_CAP = 20000;      // ok + pending rows (test accounts included); past it new ok accounts are simply not tracked (never refused)
 export const PENDING_CAP = 500;     // rows waiting for approval; past it a new account is still refused but not queued
@@ -129,9 +132,7 @@ export class AdminRegistry extends DurableObject {
    * REG_DEFAULT_CUTOFF, else the fixed constant below. Nothing is written on a first run, so there is no "first account after deploy" edge. */
   defaultCutoff(o) {
     const d = Number(o.dcut);
-    if (d > 0) return d;
-    const pin = Number(this.env.REG_DEFAULT_CUTOFF);
-    return pin > 0 ? pin : DEFAULT_CUTOFF;
+    return d > 0 ? d : cutoffFor(this.env);
   }
   setKv(k, v) { this.sql.exec("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", k, String(v)); this.cfg = null; }
 
@@ -269,7 +270,7 @@ export class AdminRegistry extends DurableObject {
         "hub=1, status=?, by=?, st_at=CASE WHEN status<>? THEN ? ELSE st_at END, test=?, pushed=1, tries=0, unreach=0 WHERE uid=?",   // the reply below IS the verdict reaching the hub
         name, username, t, num(b.pcs, 1), created, status, by, status, t, testNow, uid);
       if (status !== row.status || testNow !== row.test) { this.bump(row.status, row.test === 1, -1); this.bump(status, testNow === 1, 1); }
-      return { status, autofriend: test || testNow ? false : s.autofriend, approval: s.approval };
+      return { status, autofriend: test || testNow ? false : s.autofriend, approval: s.approval, cutoff: s.cutoff };
     }
     const d = this.decide(created);
     const room = d.status === "pending" ? this.n("pending") < this.cap("PENDING", PENDING_CAP) : this.tracked() < this.cap("ACCT", ACCT_CAP);
@@ -279,7 +280,7 @@ export class AdminRegistry extends DurableObject {
       this.bump(d.status, test, 1);
       if (d.status === "pending" && !test) await this.notifyAdmin();
     }
-    return { status: d.status, autofriend: test ? false : s.autofriend, approval: s.approval, tracked: room };
+    return { status: d.status, autofriend: test ? false : s.autofriend, approval: s.approval, cutoff: s.cutoff, tracked: room };
   }
 
   rename(b) {

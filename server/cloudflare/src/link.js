@@ -145,7 +145,7 @@ async function auth(env, uid, secret, count) {
 }
 
 // A refused account gets the reason (link_auth only answers a gate after the secret was proved).
-const gateReason = (g) => (g === "pending" ? "pending-approval" : "account-unavailable");
+const gateReason = (g) => (g === "pending" ? "pending-approval" : g === "held" ? "server-busy" : "account-unavailable");
 const authFail = (af) => json(af && af.gate ? { error: "auth", reason: gateReason(af.gate) } : { error: "auth" }, 403);
 
 // Same check as auth(), but returns the whole reply ({r, username, prev}).

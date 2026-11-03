@@ -135,6 +135,29 @@ check(sBanSpec.code === 4010, "room (watcher): a banned spectator is closed 4010
 const again2 = await mk(base, nm("Troll"));
 check(again2.outcome === "error" && again2.error.reason === "pending-approval", "the same person on a brand-new account is held by approval mode");
 
+// ================= 4b. registry outage: a brand-new account is held on EVERY route, not only the friends hello ===============
+await settings(adm, { approval: true });   // the hub isolate learns approval ON and the cutoff from this reply
+await reg("t_down", { on: true });
+const HN = await mk(base, nm("Outage"));
+check(HN.outcome === "error" && HN.error.reason === "server-busy", "outage + approval ON: a brand-new account is held at hello (server-busy)");
+const hs = await saves(HN);
+check(hs.status === 403 && hs.body.reason === "server-busy", "outage: the held account is refused by saves too (403 server-busy)");
+const hl = await linkCall("/link/create", HN);
+check(hl.status === 403 && hl.body.reason === "server-busy", "outage: ...and by link codes");
+const hSeat = await seat(rcode(), { who: HN, role: "host", ms: 1500 });
+check(hSeat.code === 4014 && hSeat.msgs.some((m) => m.type === "error" && m.reason === "server-busy"), "outage: ...and by room ident (error server-busy, close 4014)");
+check((await again(open1)).outcome === "welcome", "outage: an account with an ok verdict is still welcomed");
+await reg("t_down", { on: false });
+const HN2 = await again(HN);
+check(HN2.outcome === "error" && HN2.error.reason === "pending-approval", "registry back: the held account gets its real verdict (pending)");
+check((await saves(HN)).body.reason === "pending-approval", "...and the transient hold is gone from the routes");
+await settings(adm, { approval: false });   // learned by the hub: no hold during an outage
+await reg("t_down", { on: true });
+const HO = await mk(base, nm("OutageOff"));
+check(HO.outcome === "welcome", "outage + approval switched OFF by the owner (learned): a new account is NOT held");
+await reg("t_down", { on: false });
+await settings(adm, { approval: true });
+
 // ================= 5. strict rooms ===========================================================================================
 const roomOff = rcode();
 const hOff = await seat(roomOff, { role: "host", ms: 300 });
@@ -154,7 +177,7 @@ const results = await Promise.all([
   (async () => { await sleep(250); return seat(room, { who: E, nopair: true, ms: 4200 }); })(),     // proven, no pairing
   (async () => { await sleep(250); return seat(room, { role: "watch", ms: 4200 }); })(),            // anonymous spectator
   (async () => { await sleep(250); return seat(room, { who: E, role: "watch", ms: 4200 }); })(),    // proven spectator
-  (async () => { await sleep(250); return seat(room, { who: N2, ms: 4200 }); })(),                  // pending account
+  (async () => { const pr = rcode(); const ph = await seat(pr, { who: good, role: "host", ms: 400 }); const r = await seat(pr, { who: N2, ms: 2500 }); ph.close(); return r; })(),   // pending account (own room: this one is full)
 ]);
 const [rHost, rAnon, rProven, rNoPair, rAnonW, rProvenW, rPend] = results;
 check(rHost.open && rHost.welcome, "strict: a proven host keeps its seat");
@@ -164,11 +187,30 @@ check(told(rAnonW, "ident-required"), "strict: an anonymous spectator is closed 
 check(!told(rProvenW) && rProvenW.open, "strict: a spectator that proves its account keeps its seat");
 check(told(rPend, "pending-approval"), "strict: a pending account is closed 4012 pending-approval");
 results.forEach((r) => r.close());
-// "-N" game rooms are not enforced (their members came through a lobby)
+// "-N" game rooms are enforced too (a game-room name is no way around strict mode); a proven seat there is proof only (no pairing)
 const gRoom = rcode() + "-1";
-const gHost = await seat(gRoom, { role: "host", ms: 2400 });
-check(gHost.open && gHost.welcome, "strict: game rooms (-N) are not enforced");
-gHost.close();
+const gHost = await seat(gRoom, { who: good, role: "host", nopair: true, ms: 4200 });
+const gAnon = await (async () => seat(gRoom, { ms: 4200 }))();
+check(gHost.open && !told(gHost), "strict: a proven game-room host keeps its seat");
+check(told(gAnon, "ident-required") || told(gAnon, "no-such-room") || told(gAnon, "host-reconnecting"), "strict: an anonymous game-room seat does not get in");
+const gRoom2 = rcode() + "-2";
+const gAnonHost = await seat(gRoom2, { role: "host", ms: 4200 });
+check(told(gAnonHost, "ident-required"), "strict: an anonymous game-room HOST is told ident-required");
+gHost.close(); gAnon.close(); gAnonHost.close();
+// two joiners racing for a slot never share one (the strict flag is read before the slot is chosen)
+const raceRoom = rcode();
+const rh = await seat(raceRoom, { who: good, role: "host", ms: 500 });
+const racers = await Promise.all([1, 2, 3].map(() => seat(raceRoom, { who: hostAcct, nopair: true, ms: 1200 })));
+const slots = racers.map((r) => (r.msgs.find((m) => m.type === "welcome") || {}).slot).filter((x) => x !== undefined);
+check(slots.length === 3 && new Set(slots).size === 3, "three simultaneous joiners get three different slots (" + slots.join(",") + ")");
+rh.close(); racers.forEach((r) => r.close());
+// a second PC of the same account in one room is proof only (not closed), and only the first one pairs
+const dupRoom = rcode();
+const dh = await seat(dupRoom, { who: good, role: "host", ms: 400 });
+const d1 = await seat(dupRoom, { who: hostAcct, ms: 4200 });
+const d2 = await seat(dupRoom, { who: hostAcct, ms: 4200 });
+check(d1.open && d2.open && !told(d1) && !told(d2), "strict: two seats of one account in a room both stay (second is proof only)");
+dh.close(); d1.close(); d2.close();
 s = await settings(adm, { strict_rooms: false });
 check(s.strict_rooms === false, "admin_settings {set:{strict_rooms:false}} switches strict rooms off again");
 const room2 = rcode();

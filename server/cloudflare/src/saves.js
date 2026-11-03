@@ -50,7 +50,7 @@ function safeEq(a, b) {
 
 export { cleanKey };
 
-export const gateReason = (g) => (g === "pending" ? "pending-approval" : "account-unavailable");
+export const gateReason = (g) => (g === "pending" ? "pending-approval" : g === "held" ? "server-busy" : "account-unavailable");
 
 export async function authenticate(request, env, url, write, cls) {
   const h = request.headers.get("Authorization") || "";

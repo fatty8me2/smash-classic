@@ -77,7 +77,7 @@ const MAX_BINARY_BYTES = 1200;
 const SMASH_LINK_TTL_MS = 6 * 3600 * 1000;
 const isGameRoom = (room) => room.includes("-");
 
-// Strict rooms (owner switch, default OFF; registry flag strict_rooms): a LOBBY seat (not a "-N" game room) must prove a registered, approved
+// Strict rooms (owner switch, default OFF; registry flag strict_rooms): EVERY seat (lobby and "-N" game rooms, spectators too) must prove a registered, approved
 // account with an ident within IDENT_WAIT_MS of its welcome, or it is closed (error ident-required, 4013). Spectators prove it too (they may
 // send ident). Off by default because shipped clients send ident only while "auto-friend" is on; see adminreg.js.
 const IDENT_WAIT_MS = 15000;
@@ -320,6 +320,8 @@ export class HubRoom extends DurableObject {
     const mig = caps.includes("hostmig");
     const rs = caps.includes("reasons");
 
+    // The strict flag is read BEFORE the roster and the slot are chosen: awaiting it in between let two joiners pick the same slot.
+    const strict = await strictRooms(this.env);
     const members = this.members();
     const taken = new Set(members.map((m) => m.slot));
     const grace = !taken.has(0) && members.length > 0 ? await this.getGrace() : null;
@@ -364,7 +366,7 @@ export class HubRoom extends DurableObject {
 
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
-    const idw = !isGameRoom(room) && await strictRooms(this.env) ? Date.now() + identWaitMs(this.env) : 0;
+    const idw = strict ? Date.now() + identWaitMs(this.env) : 0;   // lobby AND "-N" game rooms: a game-room name is no way around it
     pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs, spec, dr: !!dropRec, idw, idok: false });
     pair[1].send(JSON.stringify(spec ? (dropRec ? { type: "welcome", room, slot, spec: true, dropin: true } : { type: "welcome", room, slot, spec: true }) : { type: "welcome", room, slot }));
     if (spec && !isGameRoom(room)) {
@@ -436,13 +438,12 @@ export class HubRoom extends DurableObject {
         // {type:"ident",uid,secret}: proves which account this seat is (checked against the account's own hub).
         // Only used for automatic friending; never forwarded to other members. One DO call per seat.
         if (me.uid || me.idok || typeof msg.uid !== "string" || !UID_RE.test(msg.uid) || typeof msg.secret !== "string") return;
-        if (me.game) return;
         // A seat sends one ident per welcome. Retries are capped per seat and per room, and only REGISTERED accounts are woken:
         // an ident with a made-up uid used to make the Worker create (and write the schema of) a brand-new account hub, each time.
         const tries = (this.identTries.get(ws) || 0) + 1;
         this.identTries.set(ws, tries);
         if (tries > IDENT_TRIES_PER_SOCKET || !this.identWin.hit("r")) return;
-        let ok = false, gated = "";
+        let ok = false, gated = "", unreachable = false;
         try {
           const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
           const known = await (await dir.fetch("https://directory/lookup?prefix=" + msg.uid.slice(0, 8), { headers: { "x-rh-internal": "1" } })).json();
@@ -456,18 +457,19 @@ export class HubRoom extends DurableObject {
             ok = rr.r === "ok";
             if (rr.gate) gated = rr.gate;   // a banned / waiting account is not allowed in rooms either
           }
-        } catch { /* unreachable: no auto friending */ }
-        if (gated) {   // a banned / denied / waiting account: told why, then closed
-          const reason = gated === "pending" ? "pending-approval" : "account-unavailable";
+        } catch { unreachable = true; /* no auto friending; in strict rooms an outage must not evict anybody (below) */ }
+        if (gated) {   // a banned / denied / waiting account: told why, then closed ("held" = new account while the registry is down)
+          const reason = gated === "pending" ? "pending-approval" : gated === "held" ? "server-busy" : "account-unavailable";
           try { ws.send(JSON.stringify({ type: "error", reason })); } catch { /* closing */ }
-          try { ws.close(gated === "pending" ? 4012 : 4010, reason); } catch { /* closed */ }
+          try { ws.close(gated === "pending" ? 4012 : gated === "held" ? 4014 : 4010, reason); } catch { /* closed */ }
           return;
         }
         const now = ws.deserializeAttachment();
+        if (unreachable && now && typeof now.slot === "number" && now.slot >= 0 && !now.idok) { ws.serializeAttachment({ ...now, idok: true, idw: 0 }); return; }
         if (!ok || !now || typeof now.slot !== "number" || now.slot < 0 || now.uid || now.idok) return;
-        // Proof only (no pairing) for spectators and for {nopair:true} idents (a client whose auto-friend is off still proves its account).
-        if (me.spec || msg.nopair === true) { ws.serializeAttachment({ ...now, idok: true, idw: 0 }); return; }
-        if (this.members().some((m) => m.uid === msg.uid)) return;   // one seat per account
+        // Proof only (no pairing) for spectators, game-room seats and {nopair:true} idents (a client whose auto-friend is off still proves its
+        // account). A second seat of an account already in the room (a second PC) is proof only too: one pairing per account, any number of seats.
+        if (me.spec || me.game || msg.nopair === true || this.members().some((m) => m.uid === msg.uid)) { ws.serializeAttachment({ ...now, idok: true, idw: 0 }); return; }
         ws.serializeAttachment({ ...now, uid: msg.uid, idok: true, idw: 0 });
         await this.pairAll(false, msg.uid);
         break;

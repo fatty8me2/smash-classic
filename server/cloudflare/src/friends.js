@@ -13,6 +13,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { budget } from "./saves.js";
+import { cutoffFor } from "./adminreg.js";
 import { meter, gate, meteredSql, noteRows, utcDay, PRESENCE_LEASE_MS, presenceAlarmMs } from "./reqbudget.js";
 import { normalizeUsername, lookupKey, reasonToError, HOLD_MS, LEGACY_WINDOW_MS } from "./usernames.js";
 import { initGlib, isLibraryFrame, MAX_LIB_JSON, glibInfo, ownLibVer, setFriendLib, friendLibVer, dropFriendLib, clearAllLib, handleLibrary, handleFriendLibrary, internalLibGet } from "./gamelib.js";
@@ -78,14 +79,13 @@ export function cleanWatch(list, isFriend) {
 const REG_TOUCH_MS = 6 * 3600 * 1000;
 const PENDING_RECHECK_MS = 2 * 60 * 1000;
 const BAN_RECHECK_MS = 10 * 60 * 1000;           // a local "banned" is never trusted for longer than this without asking the registry
-const NEW_ACCOUNT_MS = 24 * 3600 * 1000;         // younger than this = "brand new" (only those can be held while the registry is unreachable)
 // Test-only flags (the Worker's own QA clients and the local test suite). PRODUCTION NEVER SETS THIS VAR, so a stranger cannot hide
 // from the owner, skip auto-linking or dodge approval by sending test:true or a "qa-" name.
 const testsAllowed = (env) => !!env && env.ALLOW_TEST_FLAG === "1";
 // Last approval-mode value this isolate saw (touch replies, the owner's settings). Only used to decide whether a brand-new account
 // is held while the registry cannot be reached; it never locks out an existing account.
-const approvalHint = { on: false, at: 0 };
-const noteApproval = (on) => { approvalHint.on = on === true; approvalHint.at = Date.now(); };
+const approvalHint = { on: false, at: 0, cutoff: 0 };
+const noteApproval = (on, cutoff) => { approvalHint.on = on === true; approvalHint.at = Date.now(); if (Number(cutoff) > 0) approvalHint.cutoff = Number(cutoff); };
 const ADMIN_CALLS_PER_MIN = 60;
 const STATUS_LIST = ["ok", "pending", "banned", "denied"];
 const blockedStatus = (s) => s === "banned" || s === "denied";
@@ -828,7 +828,7 @@ export class UserHub extends DurableObject {
 
   /* Hello time: may this account use online features? Rules, in order of importance:
    *  - an EXISTING account is never locked out by an error, a bug, seeding or a rollback: when the registry cannot answer, an account
-   *    with an "ok" verdict, or with no verdict but older than NEW_ACCOUNT_MS, is let in (nothing is cached for the second kind);
+   *    with an "ok" verdict, or with no verdict but created at or before the grandfathering cutoff, is let in (nothing is cached for the second kind);
    *  - only an explicit ban / deny, or a brand-new account while approval mode is on, is ever refused;
    *  - a local "banned" is re-checked with the registry at least every BAN_RECHECK_MS (a failed unban push must not stick);
    *  - an approved account re-checks at most every REG_TOUCH_MS, a pending one every PENDING_RECHECK_MS. */
@@ -840,7 +840,6 @@ export class UserHub extends DurableObject {
     const banMs = ms(this.env.REG_BAN_RECHECK_MS, BAN_RECHECK_MS);
     const touchMs = ms(this.env.REG_TOUCH_MS, REG_TOUCH_MS);
     const pendMs = ms(this.env.REG_PENDING_RECHECK_MS, PENDING_RECHECK_MS);
-    const newMs = ms(this.env.REG_NEW_MS, NEW_ACCOUNT_MS);
     if (g && blockedStatus(g.s) && t - (g.at || 0) < banMs) return { status: g.s };
     if (g && g.s === "ok" && t - (g.at || 0) < touchMs) return { status: "ok", autofriend: g.af !== false };
     if (g && g.s === "pending" && t - (g.at || 0) < pendMs) return { status: "pending" };
@@ -850,17 +849,26 @@ export class UserHub extends DurableObject {
       r = await this.regCall("touch", { uid: p.uid, name: p.name, username: this.kvGet("username") || undefined, created: p.created, pcs, test: isTest });
     } catch {
       // The registry is unreachable. Keep whatever verdict we hold (ok stays ok, an explicit ban stays banned, pending stays pending).
-      if (g) return { status: g.s, autofriend: g.s === "ok" && g.af !== false ? true : null };
-      // No verdict yet: an existing account is let in, nothing is cached. Only a genuinely new account is held, and only while
-      // approval mode is known to be on.
-      const brandNew = t - (Number(p.created) || 0) < newMs;
-      // Approval mode is ON unless the owner switched it off, so a hub that never heard from the registry assumes the default (env, tests only).
-      const approvalOn = approvalHint.at ? approvalHint.on && t - approvalHint.at < 3600 * 1000 : String(this.env.REG_APPROVAL_DEFAULT ?? "1") !== "0";
-      if (brandNew && approvalOn) return { status: "busy" };
+      if (g && g.s !== "held") return { status: g.s, autofriend: g.s === "ok" && g.af !== false ? true : null };
+      // No verdict yet (or a transient "held" one): an account created at or before the grandfathering cutoff is NEVER held, whatever its
+      // age; only a genuinely new account is, and only while approval mode is on. The cutoff and the switch are what the last registry
+      // reply told this isolate; a cold isolate falls back to the Worker's fixed default cutoff and to approval ON (unless REG_APPROVAL_DEFAULT=0,
+      // tests). Remaining edge: owner switched approval OFF + registry down + cold isolate + brand-new account => held "server-busy" until it recovers.
+      const cutoff = approvalHint.at && approvalHint.cutoff > 0 ? approvalHint.cutoff : cutoffFor(this.env);
+      const created = Number(p.created) || 0;
+      const brandNew = created > cutoff;
+      const approvalOn = approvalHint.at ? approvalHint.on : String(this.env.REG_APPROVAL_DEFAULT ?? "1") !== "0";
+      if (brandNew && approvalOn) {
+        // Fail closed for the routes that only look at the stored verdict (link codes, saves, room ident): a transient "held" verdict,
+        // re-checked with the registry at the next hello (acctGate never caches it).
+        this.setGstate({ s: "held", at: t, af: false, un: this.kvGet("username") || null });
+        return { status: "busy" };
+      }
+      if (g) this.setGstate(null);   // a stale "held" no longer applies
       return { status: "ok", autofriend: null };   // null = unknown: the admin auto-link is retried at the next hello, never marked "done"
     }
     const status = STATUS_LIST.includes(r.status) ? r.status : "ok";   // an unreadable verdict never locks anybody out
-    if (typeof r.approval === "boolean") noteApproval(r.approval);
+    if (typeof r.approval === "boolean") noteApproval(r.approval, r.cutoff);
     const prev = g ? g.s : null;
     this.setGstate({ s: status, at: t, af: r.autofriend !== false, un: this.kvGet("username") || null });
     if (blockedStatus(status)) {
@@ -971,7 +979,7 @@ export class UserHub extends DurableObject {
           if (pos >= nf) { this.kvSet("seed_nf", String(nf)); this.kvSet("seed_at", String(now())); }
         }
         const out = await REG("list", { q: msg.q, sort: msg.sort, order: msg.order, status: msg.status, offset: msg.offset, limit: msg.limit, tests: msg.tests === true });
-        if (out.settings) noteApproval(out.settings.approval);
+        if (out.settings) noteApproval(out.settings.approval, out.settings.cutoff);
         const uids = out.rows.map((r) => r.uid);
         const marks = uids.map(() => "?").join(",");
         const fr = new Set(uids.length ? this.all(`SELECT uid FROM friends WHERE uid IN (${marks})`, ...uids).map((r) => r.uid) : []);
@@ -1017,7 +1025,7 @@ export class UserHub extends DurableObject {
       }
       case "admin_settings": {
         const r = await REG("settings", { set: msg.set });
-        if (r.settings) noteApproval(r.settings.approval);
+        if (r.settings) noteApproval(r.settings.approval, r.settings.cutoff);
         send({ type: "admin_settings", settings: r.settings, counts: r.counts });
         break;
       }
