@@ -83,7 +83,7 @@ const isGameRoom = (room) => room.includes("-");
 const IDENT_WAIT_MS = 15000;
 const identWaitMs = (env) => { const v = Number(env && env.STRICT_IDENT_MS); return Number.isFinite(v) && v > 0 ? v : IDENT_WAIT_MS; };
 const strictCache = { v: false, at: -1e12 };   // per isolate: the flag is asked of the registry at most once a minute (STRICT_CACHE_MS overrides, tests)
-async function strictRooms(env) {
+export async function strictRooms(env) {
   if (!env.ADMIN_REG) return false;
   const ttl = env.STRICT_CACHE_MS !== undefined && env.STRICT_CACHE_MS !== "" && Number(env.STRICT_CACHE_MS) >= 0 ? Number(env.STRICT_CACHE_MS) : 60000;
   const t = Date.now();
@@ -96,6 +96,27 @@ async function strictRooms(env) {
     strictCache.v = r.ok && (await r.json()).strict === true;
   } catch { strictCache.v = false; }   // never lock anybody out on an error
   return strictCache.v;
+}
+
+/* Verifies {uid, secret} against the account's own hub (registered accounts only: a made-up uid never wakes/creates a hub).
+ * -> {ok, gated:""|"pending"|"banned"|"denied"|"held", unreachable}. Shared by /hub seats and the Smash /ws lobby (index.js). */
+export async function checkIdent(env, uid, secret) {
+  let ok = false, gated = "", unreachable = false;
+  try {
+    const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+    const known = await (await dir.fetch("https://directory/lookup?prefix=" + uid.slice(0, 8), { headers: { "x-rh-internal": "1" } })).json();
+    if (known.uid === uid) {
+      const stub = env.USER_HUBS.get(env.USER_HUBS.idFromName(uid));
+      const res = await stub.fetch("https://userhub/i/link_auth", {
+        method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+        body: JSON.stringify({ uid, secret }),
+      });
+      const rr = await res.json();
+      ok = rr.r === "ok";
+      if (rr.gate) gated = rr.gate;   // a banned / waiting account is not allowed in rooms either
+    }
+  } catch { unreachable = true; /* no auto friending; in strict rooms an outage must not evict anybody */ }
+  return { ok, gated, unreachable };
 }
 
 function cleanName(raw) {
@@ -443,21 +464,7 @@ export class HubRoom extends DurableObject {
         const tries = (this.identTries.get(ws) || 0) + 1;
         this.identTries.set(ws, tries);
         if (tries > IDENT_TRIES_PER_SOCKET || !this.identWin.hit("r")) return;
-        let ok = false, gated = "", unreachable = false;
-        try {
-          const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
-          const known = await (await dir.fetch("https://directory/lookup?prefix=" + msg.uid.slice(0, 8), { headers: { "x-rh-internal": "1" } })).json();
-          if (known.uid === msg.uid) {
-            const stub = this.env.USER_HUBS.get(this.env.USER_HUBS.idFromName(msg.uid));
-            const res = await stub.fetch("https://userhub/i/link_auth", {
-              method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
-              body: JSON.stringify({ uid: msg.uid, secret: msg.secret }),
-            });
-            const rr = await res.json();
-            ok = rr.r === "ok";
-            if (rr.gate) gated = rr.gate;   // a banned / waiting account is not allowed in rooms either
-          }
-        } catch { unreachable = true; /* no auto friending; in strict rooms an outage must not evict anybody (below) */ }
+        const { ok, gated, unreachable } = await checkIdent(this.env, msg.uid, msg.secret);
         if (gated) {   // a banned / denied / waiting account: told why, then closed ("held" = new account while the registry is down)
           const reason = gated === "pending" ? "pending-approval" : gated === "held" ? "server-busy" : "account-unavailable";
           try { ws.send(JSON.stringify({ type: "error", reason })); } catch { /* closing */ }

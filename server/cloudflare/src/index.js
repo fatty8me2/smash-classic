@@ -22,6 +22,10 @@
 //          every member of the room (including the receiver); sent again
 //          whenever someone joins, leaves or reports an endpoint. public and
 //          local are "-" until that member has reported its endpoint.
+//   C->S {type:"ident", uid, secret[, nopair:true]}   the RetroHub account behind this seat (checked like /hub, see adminreg.js).
+//          banned/denied -> {type:"error",reason:"account-unavailable"} + close 4010; waiting for approval -> "pending-approval" 4012;
+//          new account while the registry is down -> "server-busy" 4014. Owner switch strict_rooms ON: a seat with no approved account
+//          after 15 s -> "ident-required" 4013. OFF: seats without ident work exactly as before (older clients).
 //   C->S {type:"relay"}          direct UDP failed for some pair; allow relaying
 //   S->C {type:"relaying"}       to everyone; binary frames are now forwarded. (The room's relay flag is stored once, when it turns
 //          on; a repeated request only repeats this message. Text frames are limited to TEXT_MSGS_PER_SEC per socket, a socket
@@ -54,14 +58,14 @@
 // decided by its host; the other kind is refused with a readable reason.
 
 import { DurableObject } from "cloudflare:workers";
-import { hubFetch, HubRoom } from "./hub.js";
+import { hubFetch, HubRoom, strictRooms, checkIdent } from "./hub.js";
 
 import { friendsFetch, UserHub, Directory } from "./friends.js";
 import { inviteFetch } from "./invite.js";
 import { linkFetch, LinkBox } from "./link.js";
 import {
   FixedWindow, ByteBucket, SocketLimiter, VersionKeys, ipKey, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, ROOMS_PER_IP_PER_MIN, RELAY_ABUSE_MS,
-  HUB_ROOMS_PER_IP_PER_MIN, HUB_SOCKETS_PER_IP_PER_MIN, TEXT_MSGS_PER_SEC, TEXT_BURST, TEXT_ABUSE_MS,
+  HUB_ROOMS_PER_IP_PER_MIN, HUB_SOCKETS_PER_IP_PER_MIN, TEXT_MSGS_PER_SEC, TEXT_BURST, TEXT_ABUSE_MS, IDENT_TRIES_PER_SOCKET, IDENT_PER_ROOM_PER_HOUR,
 } from "./limits.js";
 import { savesFetch } from "./saves.js";
 import { R2Budget } from "./r2budget.js";
@@ -75,6 +79,13 @@ const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;
 const MAX_BINARY_BYTES = 1024;
 const MAX_PLAYERS = 4;
+const UID_RE = /^[a-z2-7]{26}$/;
+// Account proof on /ws (the Smash Classic lobby), same rules as /hub (hub.js): C->S {type:"ident", uid, secret[, nopair:true]}. A banned/denied
+// account is told {type:"error", reason:"account-unavailable"} and closed 4010, a waiting one "pending-approval" 4012, a new account while the
+// registry is down "server-busy" 4014. With the owner's strict_rooms switch ON a seat that has not proven an approved account within
+// STRICT_IDENT_MS (15 s) gets {type:"error", reason:"ident-required"} and 4013; with it OFF a seat without ident works as before (old clients).
+const IDENT_WAIT_MS = 15000;
+const identWaitMs = (env) => { const v = Number(env && env.STRICT_IDENT_MS); return Number.isFinite(v) && v > 0 ? v : IDENT_WAIT_MS; };
 
 // In-memory per-isolate limiter for room creation on /ws. Local `wrangler dev` reports 127.0.0.1 as the client address, so it
 // applies there too (the /hub limiters below skip loopback instead).
@@ -204,6 +215,8 @@ export class NetplayRoom extends DurableObject {
     this.relay = null;
     this.legacy = null;
     this.hostSlot = null;   // slot that leads the room (v2); null = no room
+    this.identTries = new WeakMap();                                    // socket -> ident attempts
+    this.identWin = new FixedWindow(IDENT_PER_ROOM_PER_HOUR, 3600 * 1000);
     this.texts = new SocketLimiter(TEXT_MSGS_PER_SEC, TEXT_BURST, TEXT_ABUSE_MS);   // text frames per socket (in memory)
     this.ctx.blockConcurrencyWhile(async () => {
       this.relay = (await this.ctx.storage.get("relay")) === true;
@@ -281,6 +294,8 @@ export class NetplayRoom extends DurableObject {
     const room = url.searchParams.get("room").toUpperCase();
     const role = url.searchParams.get("role");
     this.roomCode = room;
+    // The strict flag is read BEFORE the occupancy checks and the slot are chosen: awaiting it in between lets two joiners pick the same slot.
+    const strict = await strictRooms(this.env);
     // &hs=K: the slot this player holds in the RetroHub room with the same code (RetroHub launches only).
     // The two rosters are tied together through it (see hubSync and HubRoom's smash link).
     const hsParam = url.searchParams.get("hs");
@@ -332,7 +347,8 @@ export class NetplayRoom extends DurableObject {
       this.ctx.acceptWebSocket(pair[1], hm ? [role, `s${slot}`, "hm"] : [role, `s${slot}`]);
       this.addSocket(pair[1], slot);
     }
-    pair[1].serializeAttachment({ endpoint: null, toks: {}, hs });
+    const idw = strict ? Date.now() + identWaitMs(this.env) : 0;
+    pair[1].serializeAttachment({ endpoint: null, toks: {}, hs, idw, idok: false });
     if (hs >= 0 && !legacy && !this.hubLinked) {
       this.hubLinked = true;
       this.ctx.waitUntil(this.env.HUB_ROOMS.get(this.env.HUB_ROOMS.idFromName(room))
@@ -345,6 +361,7 @@ export class NetplayRoom extends DurableObject {
       : { type: "welcome", room, role, slot, max: MAX_PLAYERS, host: this.hostSlot }));
     this.announce();
     if (role === "host") { count("rooms"); flushDue(this.env, (p) => this.ctx.waitUntil(p)); }
+    if (idw) await this.armIdent();   // after the host's deleteAll above
 
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
@@ -468,6 +485,26 @@ export class NetplayRoom extends DurableObject {
     }
     if (msg === null || typeof msg !== "object") return;
     switch (msg.type) {
+      case "ident": {
+        const me = ws.deserializeAttachment() || {};
+        if (me.idok || typeof msg.uid !== "string" || !UID_RE.test(msg.uid) || typeof msg.secret !== "string") return;
+        // One ident per welcome; retries are capped per seat and per room (a wrong secret is simply ignored: no reason is revealed, and in
+        // strict rooms the seat is closed ident-required when its deadline passes).
+        const tries = (this.identTries.get(ws) || 0) + 1;
+        this.identTries.set(ws, tries);
+        if (tries > IDENT_TRIES_PER_SOCKET || !this.identWin.hit("r")) return;
+        const { ok, gated, unreachable } = await checkIdent(this.env, msg.uid, msg.secret);
+        if (gated) {
+          const reason = gated === "pending" ? "pending-approval" : gated === "held" ? "server-busy" : "account-unavailable";
+          send(ws, JSON.stringify({ type: "error", reason }));
+          try { ws.close(gated === "pending" ? 4012 : gated === "held" ? 4014 : 4010, reason); } catch { /* closed */ }
+          return;
+        }
+        const now = ws.deserializeAttachment();
+        if (!now || this.slotOf(ws) < 0 || now.idok) return;
+        if (ok || unreachable) ws.serializeAttachment({ ...now, idok: true, idw: 0 });   // an outage never evicts anybody
+        break;
+      }
       case "endpoint":
         ws.serializeAttachment({
           ...(ws.deserializeAttachment() || {}),
@@ -586,6 +623,30 @@ export class NetplayRoom extends DurableObject {
     this.announce();
     await this.ctx.storage.put("host", next);
     noteRows(1);
+  }
+
+  // Strict rooms: one storage alarm serves the ident deadlines. It is only moved EARLIER here; alarm() re-arms what is still pending.
+  async armIdent() {
+    const due = this.members().map((m) => m.ws.deserializeAttachment() || {}).filter((a) => a.idw > Date.now() && !a.idok).map((a) => a.idw);
+    if (!due.length) return;
+    const at = Math.min(...due);
+    try {
+      const cur = await this.ctx.storage.getAlarm();
+      if (cur && cur > Date.now() && cur <= at) return;
+      await this.ctx.storage.setAlarm(at);
+      noteRows(1);
+    } catch { /* storage alarm unavailable */ }
+  }
+
+  async alarm() {
+    const t = Date.now();
+    for (const { ws } of this.members()) {
+      const a = ws.deserializeAttachment() || {};
+      if (!a.idw || a.idok || t < a.idw) continue;
+      send(ws, JSON.stringify({ type: "error", reason: "ident-required" }));
+      try { ws.close(4013, "ident-required"); } catch { /* closed */ }
+    }
+    await this.armIdent();
   }
 
   // RetroHub's room changed (HubRoom -> here): {gone:[hub slots that left], remap:{from,to}|null (a new RetroHub host is

@@ -27,6 +27,8 @@
  *   SSBL ABORT                                host -> players: the start was cancelled */
 #include "netlobby.h"
 #include "hello_auth.h"
+#include "lobby_ident.h"
+#include "../app_paths.h"
 #include "port_udp.h"
 #include "port_ws.h"
 #include "port_log.h"
@@ -41,6 +43,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
@@ -130,6 +134,7 @@ struct Lobby {
     bool stun_done = false;
     uint8_t stun_txid[12] = {};
     bool ws_welcomed = false;
+    bool ident_sent = false;         // the account proof (lobby_ident.h) went out on this connection
     bool endpoint_sent = false;
     int code_retries = 0;
     Peer peers[kMaxPlayers];
@@ -378,6 +383,39 @@ std::string new_code(void)
     return code;
 }
 
+/* The account proof for the lobby server `server`, or "" (none available: older/standalone setups keep working unless the owner
+ * switched strict rooms on). Never logged. */
+std::string ident_frame(const std::string &server)
+{
+    std::string f = lobby_ident::from_env(server, std::getenv("RETROHUB_IDENT"));
+    if (!f.empty()) {
+        return f;
+    }
+    /* No/foreign RETROHUB_IDENT (the game was started by hand): RetroHub's own identity file, next to RetroHub.exe in the package. Official server only. */
+    std::ifstream in(std::string(ssb64::RealAppBundlePath()) + "/userdata/identity.json", std::ios::binary);
+    if (!in) {
+        return std::string();
+    }
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (text.size() > 4096) {
+        return std::string();
+    }
+    return lobby_ident::from_identity_file(server, PORT_NETLOBBY_DEFAULT_SERVER, text);
+}
+
+void send_ident_once(void)
+{
+    if (sLobby.ident_sent) {
+        return;
+    }
+    sLobby.ident_sent = true;
+    std::string f = ident_frame(sLobby.server);
+    if (!f.empty()) {
+        port_ws_send_text(f.c_str());
+        f.assign(f.size(), '\0');   // do not leave the secret lying around
+    }
+}
+
 void connect_server(void)
 {
     std::string url = sLobby.server;
@@ -391,6 +429,7 @@ void connect_server(void)
         }
     }
     sLobby.ws_welcomed = false;
+    sLobby.ident_sent = false;
     sLobby.endpoint_sent = false;
     sLobby.connect_ms = port_udp_now_ms();
     port_ws_connect(url.c_str());
@@ -891,6 +930,7 @@ void handle_server(const std::string &msg)
 
     if (type == "welcome") {
         sLobby.ws_welcomed = true;
+        send_ident_once();      // who we are: a banned / unapproved account is closed by the server (the "error" case below)
         std::string slot = json_field(msg, "slot");
         if (slot.empty()) {
             fail("The lobby server is out of date and can't host 3-4 player rooms yet");
@@ -929,7 +969,9 @@ void handle_server(const std::string &msg)
         }
     } else if (type == "error") {
         std::string reason = json_field(msg, "reason");
-        if (reason == "room-in-use" && sLobby.want_host && !sAuto.fixed_code.empty()) {
+        if (const char *refusal = lobby_ident::refusal_text(reason); refusal[0] != '\0') {
+            fail(refusal);      // account refusals never retry: fail() stops the connection and the auto-join only retries no-such-room
+        } else if (reason == "room-in-use" && sLobby.want_host && !sAuto.fixed_code.empty()) {
             /* The code is fixed (RetroHub launch): never switch to another one, the guests only know this one.
              * A reconnecting host may still be holding the room for a moment - retry, then explain. */
             if (sAuto.host_retries++ < kMaxFixedCodeRetries) {
@@ -1291,7 +1333,20 @@ extern "C" void port_netlobby_update(void)
         if (l.state == PORT_NETLOBBY_IN_MATCH && !any_relayed()) {
             return;     // direct match: losing the lobby server doesn't matter
         }
-        fail(sLobby.electing ? std::string("The host closed the room") : std::string("Lobby server: ") + port_ws_error());
+        /* The server's refusal ("error" frame, then close) may still be queued: read it first so its reason wins over "connection lost". */
+        char text[1024];
+        while (port_ws_poll_text(text, sizeof(text))) {
+            handle_server(text);
+            if (l.state == PORT_NETLOBBY_FAILED) {
+                return;
+            }
+        }
+        const std::string why = port_ws_error();
+        if (const char *refusal = lobby_ident::refusal_text(why); refusal[0] != '\0') {
+            fail(refusal);      // the close reason carries it too
+            return;
+        }
+        fail(sLobby.electing ? std::string("The host closed the room") : std::string("Lobby server: ") + why);
         return;
     }
     receive();
