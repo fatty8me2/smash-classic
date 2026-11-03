@@ -65,10 +65,11 @@ import {
 } from "./limits.js";
 import { savesFetch } from "./saves.js";
 import { R2Budget } from "./r2budget.js";
+import { AdminRegistry } from "./adminreg.js";
 import { ReqBudget, gate, meter, noteRequest, noteRelayFrame, noteRows, flushForTests, RELAY_ROOM_MSGS_PER_SEC } from "./reqbudget.js";
 import { OpsStats, adminStatsFetch, count, countVersion, flushDue } from "./stats.js";
 
-export { HubRoom, UserHub, Directory, LinkBox, R2Budget, OpsStats, ReqBudget };
+export { HubRoom, UserHub, Directory, LinkBox, R2Budget, OpsStats, ReqBudget, AdminRegistry };
 
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;

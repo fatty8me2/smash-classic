@@ -18,6 +18,9 @@ const SUITE = [
   { file: "test_saves_v2.mjs", kind: "self", env: { SAVES_V2_PORT: "10021" } },
   { file: "test_attach.mjs", kind: "self", env: { ATTACH_TEST_PORT: "10091" } },
   { file: "test_admin_autolink.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN } },
+  // Owner dashboard: admin-only API, blacklist, approval mode, auto-friend toggle, vouching, registry caps
+  { file: "test_admin_api.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_PENDING_RECHECK_MS: "300" } },
+  { file: "test_admin_caps.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_ACCT_CAP: "3", REG_PENDING_CAP: "2", REG_BAN_CAP: "2", REG_VOUCH_CAP: "1", REG_TOUCH_MS: "0" } },
   { file: "test_autofriend.mjs", kind: "ws", vars: { TEST_FRIEND_CAP: "2" } },
   { file: "test_dupes2.mjs", kind: "ws", vars: { TEST_ALIAS: "1", ADMIN_UID: ADMIN } },
   { file: "test_fix3.mjs", kind: "ws", vars: { TEST_ALIAS: "1", TEST_ALIAS_FAIL_ONCE: "1", TEST_FRIEND_CAP: "2" } },

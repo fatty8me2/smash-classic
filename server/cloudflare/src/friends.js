@@ -74,6 +74,16 @@ export function cleanWatch(list, isFriend) {
   return out;
 }
 
+// Account gate (adminreg.js). An approved account re-confirms with the registry at most this often; a waiting one more often.
+const REG_TOUCH_MS = 6 * 3600 * 1000;
+const PENDING_RECHECK_MS = 2 * 60 * 1000;
+const ADMIN_CALLS_PER_MIN = 60;
+const STATUS_LIST = ["ok", "pending", "banned", "denied"];
+const blockedStatus = (s) => s === "banned" || s === "denied";
+// Internal routes a banned / waiting account's hub still answers (everything else answers "none": the account looks gone).
+const GATE_OPEN = new Set(["gate", "link_auth", "saves_auth", "admin_peek", "admin_note"]);
+const ADMIN_MSG_RE = /^admin_[a-z]+$/;
+
 const now = () => Date.now();
 const codeOf = (uid) => {
   const p = uid.slice(0, 8).toUpperCase();
@@ -655,6 +665,7 @@ export class UserHub extends DurableObject {
 
   async alarm() {
     meter(this.env, this.ctx, "alarm");
+    if (blockedStatus(this.gateLocal())) { await this.banSweepStep(); return; }   // a banned account has no presence to refresh
     if (this.reapStale()) {
       if (this.authedSockets().length === 0) { await this.setOnline(false); await this.broadcastPresence(false); return; }
       await this.broadcastPresence(false);
@@ -673,11 +684,12 @@ export class UserHub extends DurableObject {
     await this.setOnline(true);
   }
 
-  addFriendRow(uid, name, status) {
+  addFriendRow(uid, name, status, src) {
     // A person is either a friend or a pending request, never both.
     this.run("DELETE FROM requests WHERE uid=?", uid);
     this.run("INSERT OR REPLACE INTO friends (uid, code, name, status, since) VALUES (?, ?, ?, ?, ?)",
       uid, codeOf(uid), cleanName(name) || "player", JSON.stringify(status || offlineStatus()), now());
+    if (src) this.noteSrc(uid, src);
     return this.friendObj(this.one("SELECT * FROM friends WHERE uid=?", uid));
   }
 
@@ -696,6 +708,15 @@ export class UserHub extends DurableObject {
     this.run("DELETE FROM requests WHERE dir='out' AND uid IN (SELECT uid FROM requests WHERE dir='in')");
     // an outgoing request nobody answered for 60 days is stale (the target is gone or never coming back)
     this.run("DELETE FROM requests WHERE dir='out' AND at < ?", now() - 60 * 86400 * 1000);
+    if (this._fsrc) this.run("DELETE FROM fsrc WHERE uid NOT IN (SELECT uid FROM friends)");
+  }
+
+  /* After a username change the registry's copy follows (one call per change; the first claim happens after the first touch). */
+  async regRename(p, username) {
+    const g = this.gstate();
+    if (!this.env.ADMIN_REG || this.isAdminUid(p.uid) || !g || g.s !== "ok" || (g.un || null) === (username || null) || this.isTestAccount()) return;
+    this.setGstate({ ...g, un: username || null });
+    try { await this.regCall("rename", { uid: p.uid, name: p.name, username: username || "" }); } catch { /* the next change repairs it */ }
   }
 
   /* Swap every retired identity still sitting in our lists for the identity that replaced it (Directory alias map),
@@ -762,6 +783,205 @@ export class UserHub extends DurableObject {
       peer, peer, MAX_HISTORY);
   }
 
+  // ---- account gate + owner controls (adminreg.js, docs/ADMIN.md) -----------
+
+  isAdminUid(uid) { return !!this.env.ADMIN_UID && uid === this.env.ADMIN_UID; }
+
+  /* Local copy of the registry's verdict: {s: ok|pending|banned|denied, at: when the registry last confirmed it, af: autofriend}.
+   * No record = an account from before the registry existed = ok. Memoised for the life of this instance. */
+  gstate() {
+    if (this._gs === undefined) {
+      let g = null;
+      try { g = JSON.parse(this.kvGet("gstate") || "null"); } catch { /* unreadable: treated as none */ }
+      this._gs = g && typeof g === "object" ? g : null;
+    }
+    return this._gs;
+  }
+  setGstate(g) { this._gs = g; this.kvSet("gstate", JSON.stringify(g)); }
+  gateLocal() { const g = this.gstate(); return g && g.s ? g.s : "ok"; }
+
+  async regCall(route, body) {
+    const stub = this.env.ADMIN_REG.get(this.env.ADMIN_REG.idFromName("registry"));
+    const res = await stub.fetch(`https://registry/${route}`, {
+      method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error("registry " + res.status);
+    return res.json();
+  }
+
+  /* Hello time: may this account use online features? Bans are trusted locally (an unban pushes "ok" here); an approved account
+   * checks in with the registry at most every REG_TOUCH_MS, a pending one every PENDING_RECHECK_MS. */
+  async acctGate(p, isTest) {
+    if (this.isAdminUid(p.uid) || !this.env.ADMIN_REG) return { status: "ok", autofriend: true };
+    const g = this.gstate();
+    const t = now();
+    if (g && (g.s === "banned" || g.s === "denied")) return { status: g.s };
+    const touchMs = this.env.REG_TOUCH_MS !== undefined && Number(this.env.REG_TOUCH_MS) >= 0 ? Number(this.env.REG_TOUCH_MS) : REG_TOUCH_MS;   // the var is for local tests only
+    if (g && g.s === "ok" && t - (g.at || 0) < touchMs) return { status: "ok", autofriend: g.af !== false };
+    const pendMs = Number(this.env.REG_PENDING_RECHECK_MS) >= 0 && this.env.REG_PENDING_RECHECK_MS !== undefined ? Number(this.env.REG_PENDING_RECHECK_MS) : PENDING_RECHECK_MS;   // local tests only
+    if (g && g.s === "pending" && t - (g.at || 0) < pendMs) return { status: "pending" };
+    let r;
+    try {
+      const pcs = this.authedSockets().length + 1;
+      r = await this.regCall("touch", { uid: p.uid, name: p.name, username: this.kvGet("username") || undefined, created: p.created, pcs, test: isTest });
+    } catch {
+      if (g && g.s === "ok") return { status: "ok", autofriend: g.af !== false };   // an approved account is never locked out by a registry hiccup
+      this.setGstate({ s: "pending", at: t - PENDING_RECHECK_MS + 20000, af: false });   // a new one is held and re-checked in 20 s
+      return { status: "busy" };
+    }
+    const status = STATUS_LIST.includes(r.status) ? r.status : "pending";
+    this.setGstate({ s: status, at: t, af: r.autofriend !== false, un: this.kvGet("username") || null });
+    if (blockedStatus(status)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('ban_sweep', '1')");
+    return { status, autofriend: r.autofriend !== false };
+  }
+
+  /* The socket stays OPEN and unauthenticated (like registration-limited): shipped clients reconnect after any close, and an idle
+   * hibernated socket costs nothing. The message is generic for bans on purpose. */
+  refuseGate(ws, status) {
+    const reason = status === "pending" ? "pending-approval" : status === "busy" ? "server-busy" : "account-unavailable";
+    try { ws.send(JSON.stringify({ type: "error", reason })); } catch { /* closing */ }
+  }
+
+  closeUnauthed(code, why) {
+    for (const ws of this.ctx.getWebSockets()) {
+      let a = null;
+      try { a = ws.deserializeAttachment(); } catch { /* closed */ }
+      if (a && a.authed) continue;
+      try { ws.close(code, why); } catch { /* closed */ }
+    }
+  }
+
+  /* Registry -> this hub: the verdict changed. Bans close every socket and start the clean-up of friends and requests (alarm,
+   * 25 per step: the Workers Free plan allows 50 subrequests per invocation). Approvals wake the waiting client with a close. */
+  async applyGate(status) {
+    const prev = this.gateLocal();
+    const old = this.gstate() || {};
+    this.setGstate({ s: status, at: now(), af: old.af, un: old.un });
+    if (blockedStatus(status)) {
+      this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('ban_sweep', '1')");
+      for (const ws of this.ctx.getWebSockets()) {
+        try { ws.send(JSON.stringify({ type: "error", reason: "account-unavailable" })); } catch { /* closing */ }
+        try { const a = ws.deserializeAttachment(); ws.serializeAttachment({ ...a, authed: false }); } catch { /* closed */ }
+        try { ws.close(4010, "account-unavailable"); } catch { /* closed */ }
+      }
+      try { await this.setOnline(false); } catch { /* lease expires on its own */ }
+      try { await this.ctx.storage.setAlarm(now() + 300); noteRows(1); } catch { /* storage alarm unavailable */ }
+    } else if (status === "ok" && prev !== "ok") {
+      this.run("DELETE FROM kv WHERE k='ban_sweep'");
+      this.closeUnauthed(4011, "approved");
+    }
+  }
+
+  /* One slice of a banned account's clean-up. Returns true while there is more to do (the alarm re-arms itself). */
+  async banSweepStep() {
+    if (!this.kvGet("ban_sweep")) return false;
+    const p = this.profile();
+    let left = 25;
+    for (const f of this.all("SELECT uid FROM friends LIMIT ?", left)) {
+      this.run("DELETE FROM friends WHERE uid=?", f.uid);
+      left--;
+      try { await this.call(f.uid, "friend_removed", { uid: p.uid }); } catch { /* peer unreachable */ }
+    }
+    if (left > 0) {
+      for (const r of this.all("SELECT uid, dir FROM requests LIMIT ?", left)) {
+        this.run("DELETE FROM requests WHERE uid=? AND dir=?", r.uid, r.dir);
+        try { await this.call(r.uid, "request_update", { uid: p.uid, result: r.dir === "out" ? "cancelled" : "declined" }); } catch { /* peer unreachable */ }
+      }
+    }
+    if (this.count("friends") + this.count("requests") > 0) {
+      try { await this.ctx.storage.setAlarm(now() + 2000); noteRows(1); } catch { /* storage alarm unavailable */ }
+      return true;
+    }
+    this.run("DELETE FROM kv WHERE k='ban_sweep'");
+    return false;
+  }
+
+  fsrcReady() {
+    if (this._fsrc) return;
+    this.run("CREATE TABLE IF NOT EXISTS fsrc (uid TEXT PRIMARY KEY, src TEXT NOT NULL, at INTEGER NOT NULL)");
+    this._fsrc = true;
+  }
+  /* Admin hub only: how a friend got onto the list (auto | request | room), kept for the owner's account detail. */
+  noteSrc(uid, src) {
+    if (!src || !this.env.ADMIN_UID || this.profile().uid !== this.env.ADMIN_UID) return;
+    this.fsrcReady();
+    this.run("INSERT OR REPLACE INTO fsrc (uid, src, at) VALUES (?, ?, ?)", uid, src, now());
+  }
+
+  /* ---- owner-only messages. Anyone else gets exactly what an unknown message type gets: nothing. ---- */
+  async adminDispatch(ws, p, msg) {
+    if (!this.isAdminUid(p.uid)) return;
+    this.adminRl = this.adminRl || new FixedWindow(ADMIN_CALLS_PER_MIN, 60 * 1000);
+    if (!this.adminRl.hit("a")) return this.err(ws, "rate-limited", msg.type);
+    if (!this.env.ADMIN_REG) return this.err(ws, "bad-request", msg.type, "unavailable");
+    const send = (o) => { try { ws.send(JSON.stringify(o)); } catch { /* closing */ } };
+    const REG = (route, body) => this.regCall(route, { ...body, admin: p.uid });
+    const target = () => (typeof msg.uid === "string" && UID_RE.test(msg.uid) && msg.uid !== p.uid ? msg.uid : null);
+    switch (msg.type) {
+      case "admin_list": {
+        // Seed the registry from our own friend list (every auto-linked account is on it), a few hundred per call.
+        const nf = this.count("friends");
+        let pos = Number(this.kvGet("seed_pos") || 0);
+        for (let i = 0; i < 4 && pos < nf; i++) {
+          const rows = this.all("SELECT uid, name, since FROM friends ORDER BY since LIMIT 300 OFFSET ?", pos);
+          if (!rows.length) break;
+          await REG("seed", { rows: rows.filter((r) => !isTestName(r.name)) });
+          pos += rows.length;
+          this.kvSet("seed_pos", String(pos));
+        }
+        const out = await REG("list", { q: msg.q, sort: msg.sort, order: msg.order, status: msg.status, offset: msg.offset, limit: msg.limit });
+        const uids = out.rows.map((r) => r.uid);
+        const marks = uids.map(() => "?").join(",");
+        const fr = new Set(uids.length ? this.all(`SELECT uid FROM friends WHERE uid IN (${marks})`, ...uids).map((r) => r.uid) : []);
+        const reqs = new Map(uids.length ? this.all(`SELECT uid, dir FROM requests WHERE uid IN (${marks})`, ...uids).map((r) => [r.uid, r.dir]) : []);
+        send({ type: "admin_list", rows: out.rows.map((r) => ({ ...r, code: codeOf(r.uid), friend: fr.has(r.uid), req: reqs.get(r.uid) || null })),
+               total: out.total, offset: out.offset, counts: out.counts, settings: out.settings, tracked: out.all });
+        break;
+      }
+      case "admin_detail": {
+        const uid = target();
+        if (!uid) return this.err(ws, "bad-request", msg.type);
+        const d = await REG("detail", { uid });
+        this.fsrcReady();
+        const src = this.one("SELECT src, at FROM fsrc WHERE uid=?", uid);
+        const fr = this.one("SELECT name, since FROM friends WHERE uid=?", uid);
+        const rq = this.one("SELECT dir, at FROM requests WHERE uid=?", uid);
+        let peek = null;
+        if (d.found && d.hub && !blockedStatus(d.row.status)) { try { peek = await this.call(uid, "admin_peek", { uid: p.uid }); } catch { peek = null; } }
+        send({ type: "admin_detail", uid, found: !!d.found, row: d.row || null, code: codeOf(uid),
+               rel: fr ? "friend" : rq ? (rq.dir === "in" ? "requested_you" : "you_requested") : "none",
+               friend_since: fr ? fr.since : null, how: src ? src.src : fr ? "unknown" : null, how_at: src ? src.at : null,
+               peek: peek && peek.r === "ok" ? { friends: peek.friends, nfriends: peek.nfriends, created: peek.created, test: peek.test } : null });
+        break;
+      }
+      case "admin_ban": case "admin_deny": case "admin_unban": case "admin_approve": {
+        const uid = target();
+        if (!uid) return this.err(ws, "bad-request", msg.type);
+        const status = msg.type === "admin_ban" ? "banned" : msg.type === "admin_deny" ? "denied" : "ok";
+        const r = await REG("set_status", { uid, status });
+        if (r.ok && blockedStatus(status)) {
+          // Out of our friends and requests at once, and never auto-linked again (the account itself is refused at hello).
+          const wasFriend = this.isFriend(uid);
+          this.run("DELETE FROM friends WHERE uid=?", uid);
+          dropFriendLib(this, uid);
+          const hadReq = !!this.one("SELECT 1 FROM requests WHERE uid=?", uid);
+          this.run("DELETE FROM requests WHERE uid=?", uid);
+          this.run("DELETE FROM inbox WHERE json LIKE ?", `%"from":"${uid}"%`);
+          if (wasFriend) this.push({ type: "friend_removed", uid });
+          if (hadReq) this.push({ type: "request_update", uid, result: "cancelled" });
+        }
+        send({ type: "admin_result", op: msg.type.slice(6), uid, ok: !!r.ok, status: r.status || null, applied: r.applied ?? null, reason: r.reason || null });
+        break;
+      }
+      case "admin_settings": {
+        const r = await REG("settings", { set: msg.set });
+        send({ type: "admin_settings", settings: r.settings, counts: r.counts });
+        break;
+      }
+      default: break;
+    }
+  }
+
   // ---- fetch (WebSocket upgrade + internal routes) -----------------------
 
   async fetch(request) {
@@ -795,7 +1015,26 @@ export class UserHub extends DurableObject {
     if (!b || !UID_RE.test(b.uid || "")) return { r: "none" };
     const from = b.uid;
     if (this.retiredTo() && route !== "retire_begin" && route !== "retire_done" && route !== "link_auth") return { r: "none" };
+    // A banned / denied / waiting account answers nothing (it looks like it does not exist), except the routes below. A waiting
+    // account can be vouched for by an approved person who adds it by friend code (see "request").
+    const gl = this.gateLocal();
+    if (gl !== "ok" && !GATE_OPEN.has(route) && !(route === "request" && gl === "pending" && b.vouch === 1)) return { r: "none" };
     switch (route) {
+      case "gate": {   // registry -> this hub: the verdict changed (ban / unban / approve / deny)
+        if (b.uid !== p.uid || !STATUS_LIST.includes(b.status) || this.isAdminUid(p.uid)) return { r: "none" };
+        await this.applyGate(b.status);
+        return { r: "ok" };
+      }
+      case "admin_note": {   // registry -> the admin's hub: a new account is waiting for approval
+        if (!this.isAdminUid(p.uid)) return { r: "none" };
+        this.push({ type: "admin_pending", pending: Number(b.pending) || 0 });
+        return { r: "ok" };
+      }
+      case "admin_peek": {   // the admin's hub asks for the facts the owner may see about this account (names only, no addresses)
+        if (!this.env.ADMIN_UID || b.uid !== this.env.ADMIN_UID) return { r: "none" };
+        return { r: "ok", friends: this.all("SELECT name FROM friends ORDER BY since DESC LIMIT 30").map((f) => cleanName(f.name)),
+                 nfriends: this.count("friends"), created: p.created, test: this.isTestAccount() };
+      }
       case "retire_begin": {
         // Called by the successor identity's hub with this (old) account's secret: hand over everything
         // and become inert. Idempotent for the same successor.
@@ -874,6 +1113,7 @@ export class UserHub extends DurableObject {
       case "link_auth": {
         // Secret check for /link/* (see link.js). Optionally rate-limits link-code creation.
         if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
+        if (gl !== "ok") return { r: "none", gate: gl };   // banned / waiting: links, saves and room identification are refused
         if (b.count && !this.hit(`link:${from}`, 5, 60 * 60 * 1000)) return { r: "rate" };
         // username: shown on the new PC ("Linking as NAME"); prev: the still-open code of this account, revoked when a new one is made.
         return { r: "ok", username: this.kvGet("username"), prev: b.count ? this.kvGet("last_link") : undefined, keep: this.kvGet("last_keep") || undefined };
@@ -891,7 +1131,7 @@ export class UserHub extends DurableObject {
       }
       case "saves_auth": {
         // Cloud saves: hand the Worker the HMAC key (sha256hex of the secret) after rate limiting this account.
-        if (from !== p.uid) return { r: "none" };
+        if (from !== p.uid || gl !== "ok") return { r: "none" };
         const w = !!b.write;
         const V2 = { pc: 30, put: 120, get: 300, meta: 60, att: 10 };   // v2 per-account per-minute limits (docs/CLOUD_SAVES_V2.md 3.6)
         if (b.cls && V2[b.cls]) {
@@ -924,6 +1164,12 @@ export class UserHub extends DurableObject {
       }
       case "request": {
         const name = cleanName(b.name) || "player";
+        if (gl === "pending") {   // vouching: an approved person added this waiting account by its friend code
+          let v = null;
+          try { v = await this.regCall("vouch", { uid: p.uid, by: from, created: p.created }); } catch { /* registry unreachable: stays waiting */ }
+          if (!v || v.status !== "ok") return { r: "none" };
+          await this.applyGate("ok");
+        }
         // Blocked sender: fake "ok" so they cannot tell they are blocked (privacy). Their pending-request entry
         // then looks accepted-but-unanswered until it is cleared; if they query the pair later they only ever see
         // "removed". Accepted trade-off, documented in docs.
@@ -937,7 +1183,7 @@ export class UserHub extends DurableObject {
         if (this.one("SELECT 1 FROM requests WHERE uid=? AND dir='out'", from)) {
           if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
-          const f = this.addFriendRow(from, name, sanitizeStatus(b.status));
+          const f = this.addFriendRow(from, name, sanitizeStatus(b.status), "request");
           this.push({ type: "request_update", uid: from, result: "accepted" });
           this.push({ type: "friend_added", friend: f });
           return { r: "accepted", friend: this.me() };
@@ -962,7 +1208,7 @@ export class UserHub extends DurableObject {
           if (!okRow || this.isBlocked(from)) return { r: "none" };
           if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
-          const f = this.addFriendRow(from, b.name, sanitizeStatus(b.status));
+          const f = this.addFriendRow(from, b.name, sanitizeStatus(b.status), "request");
           this.push({ type: "request_update", uid: from, result: "accepted" });
           this.push({ type: "friend_added", friend: f });
           return { r: "ok", friend: this.me() };
@@ -981,7 +1227,7 @@ export class UserHub extends DurableObject {
         if (!this.isFriend(from)) {
           if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
           this.run("DELETE FROM requests WHERE uid=?", from);
-          const f = this.addFriendRow(from, cleanName(b.name) || "player", sanitizeStatus(b.status));
+          const f = this.addFriendRow(from, cleanName(b.name) || "player", sanitizeStatus(b.status), "auto");
           this.push({ type: "friend_added", friend: f });
         }
         return { r: "ok", friend: this.me() };
@@ -996,7 +1242,7 @@ export class UserHub extends DurableObject {
         if (!back || back.r !== "ok" || !back.friend) return { r: (back && back.r) || "none" };
         if (!this.isFriend(from) && this.count("friends") < this.friendCap(p)) {
           this.run("DELETE FROM requests WHERE uid=?", from);
-          const f = this.addFriendRow(from, back.friend.name, sanitizeStatus(back.friend.status));
+          const f = this.addFriendRow(from, back.friend.name, sanitizeStatus(back.friend.status), "room");
           this.push({ type: "friend_added", friend: f, auto: true });
         }
         return { r: "ok" };
@@ -1006,7 +1252,7 @@ export class UserHub extends DurableObject {
         if (bad === "already") return { r: "ok", friend: this.me() };   // finish a one-sided link
         if (bad) return { r: bad };
         this.run("DELETE FROM requests WHERE uid=?", from);
-        const f = this.addFriendRow(from, b.name || codeOf(from), sanitizeStatus(b.status));
+        const f = this.addFriendRow(from, b.name || codeOf(from), sanitizeStatus(b.status), "room");
         this.push({ type: "friend_added", friend: f, auto: true });
         return { r: "ok", friend: this.me() };
       }
@@ -1167,6 +1413,9 @@ export class UserHub extends DurableObject {
       return;
     }
     const isTestAcct = msg.test === true || isTestName(name) || !!this.one("SELECT 1 FROM kv WHERE k='is_test'");
+    // Account gate: banned / denied / waiting-for-approval accounts get a message and nothing else (no welcome, no username claim).
+    const gate = await this.acctGate(p, isTestAcct);
+    if (gate.status !== "ok") { this.refuseGate(ws, gate.status); return; }
     const un = await this.helloUsername(msg, name, isTestAcct);
     const shownName = un.username || name;   // a claimed username always wins over whatever name a device sends
     let renamed = false;
@@ -1179,7 +1428,8 @@ export class UserHub extends DurableObject {
     ws.serializeAttachment({ uid, authed: true, status: { state: "online", updated: now() } });
     if (msg.test === true || isTestName(name)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('is_test', '1')");
     if (typeof msg.auto_friend === "boolean") this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('auto_friend', ?)", msg.auto_friend ? "1" : "0");
-    await this.autoLinkAdmin(p);
+    await this.autoLinkAdmin(p, gate.autofriend);
+    await this.regRename(p, un.username);
     let announced = false;
     if (!wasOnline) {
       // First socket up: announce ourselves and pull friends' current statuses before the welcome.
@@ -1197,6 +1447,7 @@ export class UserHub extends DurableObject {
     ws.send(JSON.stringify({
       type: "welcome",
       code: p.code,
+      ...(this.isAdminUid(p.uid) ? { admin: true } : {}),
       username: un.username || null,
       username_status: un.status,
       ...(un.error ? { username_error: un.error } : {}),
@@ -1297,6 +1548,8 @@ export class UserHub extends DurableObject {
     const p = this.profile();
     const type = msg.type;
     const uidArg = (v) => (typeof v === "string" && UID_RE.test(v) ? v : null);
+    if (ADMIN_MSG_RE.test(type)) return this.adminDispatch(ws, p, msg);   // checks the admin identity itself; silent for everyone else
+    if (this.gateLocal() !== "ok") return;   // banned after this socket authenticated (the ban also closes it)
     switch (type) {
       case "status": {
         const st = sanitizeStatus(msg.status);
@@ -1508,7 +1761,7 @@ export class UserHub extends DurableObject {
         if (this.count("requests", "dir='out'") >= MAX_OUT_REQ) return this.err(ws, "bad-request", type, "too-many-requests");
         if (this.count("friends") >= this.friendCap(p)) return this.err(ws, "bad-request", type, "friends-full");
         const me = this.me();
-        const r = await this.call(target, "request", { uid: p.uid, code: p.code, name: p.name, status: me.status, at: now() });
+        const r = await this.call(target, "request", { uid: p.uid, code: p.code, name: p.name, status: me.status, at: now(), vouch: 1 });
         if (r.r === "ok" && this.isFriend(target)) {
           // the friendship completed while the request was in flight (crossed requests): nothing to record
         } else if (r.r === "ok") {
@@ -1521,7 +1774,7 @@ export class UserHub extends DurableObject {
           this.push({ type: "request", req, dir: "out" });
         } else if (r.r === "accepted") {
           this.run("DELETE FROM requests WHERE uid=?", target);
-          const f = this.addFriendRow(target, r.friend.name, sanitizeStatus(r.friend.status));
+          const f = this.addFriendRow(target, r.friend.name, sanitizeStatus(r.friend.status), "request");
           this.push({ type: "friend_added", friend: f });
         } else if (r.r === "full") {
           this.err(ws, "bad-request", type, "target-full");
@@ -1745,10 +1998,11 @@ export class UserHub extends DurableObject {
   /* Every RetroHub user starts out friends with the admin (env ADMIN_UID), both
    * ways. Done once per user: if either side removes or blocks the other later,
    * it is not re-added. If the admin's side is full, retry after a day. */
-  async autoLinkAdmin(p) {
+  async autoLinkAdmin(p, autofriend) {
     const admin = this.env.ADMIN_UID;
     if (!admin || !UID_RE.test(admin) || p.uid === admin) return;
     if (this.one("SELECT 1 FROM kv WHERE k='admin_linked'")) return;
+    if (autofriend === false) { this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('admin_linked', '1')"); return; }   // the owner switched auto-friending off: skipped for good
     if (this.one("SELECT 1 FROM kv WHERE k='is_test'") || isTestName(p.name)) return;   // QA/test accounts never touch the admin's list
     const retry = this.one("SELECT v FROM kv WHERE k='admin_link_retry'");
     if (retry && now() < Number(retry.v)) return;
@@ -1791,7 +2045,7 @@ export class UserHub extends DurableObject {
     }
     this.run("DELETE FROM requests WHERE uid=?", uid);
     this.push({ type: "request_update", uid, result: "accepted" });
-    const f = this.addFriendRow(uid, r.friend.name, sanitizeStatus(r.friend.status));
+    const f = this.addFriendRow(uid, r.friend.name, sanitizeStatus(r.friend.status), "request");
     this.push({ type: "friend_added", friend: f });
   }
 
