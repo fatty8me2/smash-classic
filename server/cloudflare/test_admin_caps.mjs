@@ -12,14 +12,16 @@ const settings = async (set) => (await ask(adm, { type: "admin_settings", ...(se
 const list = (o = {}) => ask(adm, { type: "admin_list", limit: 50, ...o }, "admin_list");
 const ban = (uid) => ask(adm, { type: "admin_ban", uid }, "admin_result");
 
-// accounts cap: 3 tracked, the rest connect fine but are not tracked
+// accounts cap: 3 tracked (test accounts count too), the rest connect fine but are not tracked
+const T1 = await mk(base, "qa-" + rnd(5)), T2 = await mk(base, "qa-" + rnd(5));
 const A = [];
 for (let i = 0; i < 5; i++) A.push(await mk(base, nm("Acct" + i)));
-check(A.every((u) => u.outcome === "welcome"), "over the registry cap new accounts are NEVER refused (approval off)");
+check([T1, T2, ...A].every((u) => u.outcome === "welcome"), "over the registry cap new accounts are NEVER refused (approval off)");
 let l = await list();
-check(l.rows.length === 3 && l.tracked === 3, "registry holds at most the cap (3) of ok accounts (rows " + l.rows.length + ")");
-const T = await mk(base, "qa-" + rnd(5));
-check(T.outcome === "welcome" && !(await list()).rows.some((r) => r.uid === T.uid), "test accounts take no registry row and are not listed");
+check(l.tracked === 3 && l.rows.length === 1 && l.rows[0].uid === A[0].uid, "the registry holds at most the cap (3): two test accounts + one real one (visible rows " + l.rows.length + ")");
+const lt = await ask(adm, { type: "admin_list", limit: 50, tests: true }, "admin_list");
+check(lt.rows.length === 3 && lt.rows.some((r) => r.uid === T1.uid && r.test === true), "test accounts are stored and flagged, hidden by default, shown with the test filter");
+check(l.counts.all === 1, "the counts exclude test accounts");
 
 // grandfathering of an untracked old account: approval on, then it connects with a fresh touch
 await settings({ approval: true });
@@ -48,6 +50,9 @@ const voucher = N[0];
 const v1 = await again(voucher);
 v1.send({ type: "add_friend", code: code(W1.uid) });
 check(await untilTrue(() => W1.closed === 4011), "vouch #1 approves");
+const w1c = await again(W1);
+w1c.send({ type: "add_friend", code: code(W2.uid) }); await sleep(800);
+check(W2.closed !== 4011, "a vouched account cannot vouch for anyone else (no chains)");
 v1.send({ type: "add_friend", code: code(W2.uid) }); await sleep(800);
 check(W2.closed !== 4011, "vouch #2 from the same account is refused (limit)");
 

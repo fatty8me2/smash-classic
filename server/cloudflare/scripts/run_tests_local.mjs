@@ -10,13 +10,15 @@ const cfg = {
   "test_admin_autolink.mjs": [`ADMIN_UID:${ADMIN}`],
   "test_admin_api.mjs": [`ADMIN_UID:${ADMIN}`, "REG_PENDING_RECHECK_MS:300"],
   "test_admin_caps.mjs": [`ADMIN_UID:${ADMIN}`, "REG_ACCT_CAP:3", "REG_PENDING_CAP:2", "REG_BAN_CAP:2", "REG_VOUCH_CAP:1", "REG_TOUCH_MS:0"],
+  "test_admin_resilience.mjs": [`ADMIN_UID:${ADMIN}`, "REG_NEW_MS:1500", "REG_TOUCH_MS:0", "REG_RETRY_MS:600", "REG_BAN_RECHECK_MS:500", "REG_PENDING_RECHECK_MS:300"],
+  "test_admin_testflag.mjs": [`ADMIN_UID:${ADMIN}`, "ALLOW_TEST_FLAG:0"],
   "test_autofriend.mjs": ["TEST_FRIEND_CAP:2"],
   "test_dupes2.mjs": ["TEST_ALIAS:1", `ADMIN_UID:${ADMIN}`],
   "test_fix3.mjs": ["TEST_ALIAS:1", "TEST_ALIAS_FAIL_ONCE:1", "TEST_FRIEND_CAP:2"],
   "test_friends_dedupe.mjs": [`ADMIN_UID:${ADMIN}`],
   "test_retire.mjs": ["TEST_RETIRE_FAIL_AFTER:1", `ADMIN_UID:${ADMIN}`],
 };
-const selfStarting = new Set(["test_saves.mjs", "test_r2budget.mjs", "test_stats.mjs", "test_reqbudget.mjs"]);
+const selfStarting = new Set(["test_admin_rollback.mjs", "test_saves.mjs", "test_r2budget.mjs", "test_stats.mjs", "test_reqbudget.mjs"]);
 const filter = process.argv[2] || "";
 const files = fs.readdirSync(ROOT).filter((f) => /^test_.*\.mjs$/.test(f) && f.includes(filter)).sort();
 let port = 10200, bad = 0;
@@ -34,7 +36,8 @@ for (const f of files) {
   const env = { WRANGLER_REGISTRY_PATH: `C:\\rhq\\reg${p}` };
   if (!selfStarting.has(f)) {
     const dir = `C:\\rhq\\${p}`; fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true });
-    const vars = (cfg[f] || []).flatMap((v) => ["--var", v]);
+    const own = cfg[f] || [];
+    const vars = [...(own.some((v) => v.startsWith("ALLOW_TEST_FLAG")) ? [] : ["ALLOW_TEST_FLAG:1"]), "TEST_REG:1", ...own].flatMap((v) => ["--var", v]);
     srv = spawn(process.execPath, ["node_modules/wrangler/bin/wrangler.js", "dev", "--ip", "127.0.0.1", "--port", String(p), "--persist-to", dir, ...vars],
       { cwd: ROOT, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
     let log = ""; srv.stdout.on("data", (d) => (log += d)); srv.stderr.on("data", (d) => (log += d));

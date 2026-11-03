@@ -61,7 +61,10 @@ check((await ask(adm, { type: "admin_settings" }, "admin_settings")) !== null, "
 let l = await list({ limit: 50 });
 const ids = l.rows.map((r) => r.uid);
 check([U1, U2, U3].every((u) => ids.includes(u.uid)), "admin_list shows the real accounts");
-check(!ids.includes(T1.uid) && !ids.includes(T2.uid), "test accounts (qa- name, test:true) are not listed");
+check(!ids.includes(T1.uid) && !ids.includes(T2.uid), "test accounts (qa- name, test:true) are not listed by default");
+const withTests = await list({ tests: true });
+check(withTests.rows.some((r) => r.uid === T1.uid && r.test === true) && withTests.rows.some((r) => r.uid === T2.uid && r.test === true), "…and appear, flagged, behind the test-accounts filter");
+check(l.counts.all === l.counts.ok + l.counts.pending + l.counts.banned && !(l.counts.all > l.total + 50), "counts come from the counters and exclude test accounts");
 check(l.rows.find((r) => r.uid === U1.uid).friend === true && l.rows.find((r) => r.uid === U1.uid).status === "ok", "list marks friend-of-yours and status ok");
 check(!ids.includes(ADMIN), "the admin account itself is not listed");
 check((await list({ q: U2.name.slice(0, 7).toLowerCase() })).rows.some((r) => r.uid === U2.uid), "search matches a name fragment (case-insensitive)");

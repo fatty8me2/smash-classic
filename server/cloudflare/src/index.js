@@ -134,6 +134,11 @@ export default {
       const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
       return dir.fetch("https://directory/alias", { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: await request.text() });
     }
+    if (url.pathname === "/__test/reg" && env.TEST_REG === "1" && request.method === "POST" && env.ADMIN_REG) {   // local tests only (never set in production): registry outage / push failure / row hooks
+      const op = url.searchParams.get("op") || "";
+      if (!/^t_[a-z]+$/.test(op)) return new Response("not found", { status: 404 });
+      return env.ADMIN_REG.get(env.ADMIN_REG.idFromName("registry")).fetch("https://registry/" + op, { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: await request.text() });
+    }
     if (url.pathname === "/__test/budget" && env.TEST_BUDGET === "1") {   // local tests only (never set in production): the day's REQ_BUDGET totals
       return Response.json(await flushForTests(env));
     }

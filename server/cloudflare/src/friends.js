@@ -77,6 +77,15 @@ export function cleanWatch(list, isFriend) {
 // Account gate (adminreg.js). An approved account re-confirms with the registry at most this often; a waiting one more often.
 const REG_TOUCH_MS = 6 * 3600 * 1000;
 const PENDING_RECHECK_MS = 2 * 60 * 1000;
+const BAN_RECHECK_MS = 10 * 60 * 1000;           // a local "banned" is never trusted for longer than this without asking the registry
+const NEW_ACCOUNT_MS = 24 * 3600 * 1000;         // younger than this = "brand new" (only those can be held while the registry is unreachable)
+// Test-only flags (the Worker's own QA clients and the local test suite). PRODUCTION NEVER SETS THIS VAR, so a stranger cannot hide
+// from the owner, skip auto-linking or dodge approval by sending test:true or a "qa-" name.
+const testsAllowed = (env) => !!env && env.ALLOW_TEST_FLAG === "1";
+// Last approval-mode value this isolate saw (touch replies, the owner's settings). Only used to decide whether a brand-new account
+// is held while the registry cannot be reached; it never locks out an existing account.
+const approvalHint = { on: false, at: 0 };
+const noteApproval = (on) => { approvalHint.on = on === true; approvalHint.at = Date.now(); };
 const ADMIN_CALLS_PER_MIN = 60;
 const STATUS_LIST = ["ok", "pending", "banned", "denied"];
 const blockedStatus = (s) => s === "banned" || s === "denied";
@@ -798,7 +807,15 @@ export class UserHub extends DurableObject {
     return this._gs;
   }
   setGstate(g) { this._gs = g; this.kvSet("gstate", JSON.stringify(g)); }
-  gateLocal() { const g = this.gstate(); return g && g.s ? g.s : "ok"; }
+  gateLocal() {
+    if (!this.env.ADMIN_REG) return "ok";   // rolled back / feature absent: no stored verdict can lock anybody out
+    const g = this.gstate();
+    return g && g.s ? g.s : "ok";
+  }
+
+  /* The client's test flag (or a "qa-" name) counts only where the deployment allows it (local wrangler / test suite). */
+  wantsTest(msg, name) { return testsAllowed(this.env) && (msg.test === true || isTestName(name)); }
+  testNameOk(n) { return testsAllowed(this.env) && isTestName(n); }
 
   async regCall(route, body) {
     const stub = this.env.ADMIN_REG.get(this.env.ADMIN_REG.idFromName("registry"));
@@ -809,29 +826,47 @@ export class UserHub extends DurableObject {
     return res.json();
   }
 
-  /* Hello time: may this account use online features? Bans are trusted locally (an unban pushes "ok" here); an approved account
-   * checks in with the registry at most every REG_TOUCH_MS, a pending one every PENDING_RECHECK_MS. */
+  /* Hello time: may this account use online features? Rules, in order of importance:
+   *  - an EXISTING account is never locked out by an error, a bug, seeding or a rollback: when the registry cannot answer, an account
+   *    with an "ok" verdict, or with no verdict but older than NEW_ACCOUNT_MS, is let in (nothing is cached for the second kind);
+   *  - only an explicit ban / deny, or a brand-new account while approval mode is on, is ever refused;
+   *  - a local "banned" is re-checked with the registry at least every BAN_RECHECK_MS (a failed unban push must not stick);
+   *  - an approved account re-checks at most every REG_TOUCH_MS, a pending one every PENDING_RECHECK_MS. */
   async acctGate(p, isTest) {
     if (this.isAdminUid(p.uid) || !this.env.ADMIN_REG) return { status: "ok", autofriend: true };
     const g = this.gstate();
     const t = now();
-    if (g && (g.s === "banned" || g.s === "denied")) return { status: g.s };
-    const touchMs = this.env.REG_TOUCH_MS !== undefined && Number(this.env.REG_TOUCH_MS) >= 0 ? Number(this.env.REG_TOUCH_MS) : REG_TOUCH_MS;   // the var is for local tests only
+    const ms = (v, d) => (v !== undefined && Number(v) >= 0 ? Number(v) : d);   // the vars are for local tests only
+    const banMs = ms(this.env.REG_BAN_RECHECK_MS, BAN_RECHECK_MS);
+    const touchMs = ms(this.env.REG_TOUCH_MS, REG_TOUCH_MS);
+    const pendMs = ms(this.env.REG_PENDING_RECHECK_MS, PENDING_RECHECK_MS);
+    const newMs = ms(this.env.REG_NEW_MS, NEW_ACCOUNT_MS);
+    if (g && blockedStatus(g.s) && t - (g.at || 0) < banMs) return { status: g.s };
     if (g && g.s === "ok" && t - (g.at || 0) < touchMs) return { status: "ok", autofriend: g.af !== false };
-    const pendMs = Number(this.env.REG_PENDING_RECHECK_MS) >= 0 && this.env.REG_PENDING_RECHECK_MS !== undefined ? Number(this.env.REG_PENDING_RECHECK_MS) : PENDING_RECHECK_MS;   // local tests only
     if (g && g.s === "pending" && t - (g.at || 0) < pendMs) return { status: "pending" };
     let r;
     try {
       const pcs = this.authedSockets().length + 1;
       r = await this.regCall("touch", { uid: p.uid, name: p.name, username: this.kvGet("username") || undefined, created: p.created, pcs, test: isTest });
     } catch {
-      if (g && g.s === "ok") return { status: "ok", autofriend: g.af !== false };   // an approved account is never locked out by a registry hiccup
-      this.setGstate({ s: "pending", at: t - PENDING_RECHECK_MS + 20000, af: false });   // a new one is held and re-checked in 20 s
-      return { status: "busy" };
+      // The registry is unreachable. Keep whatever verdict we hold (ok stays ok, an explicit ban stays banned, pending stays pending).
+      if (g) return { status: g.s, autofriend: g.s === "ok" && g.af !== false ? true : null };
+      // No verdict yet: an existing account is let in, nothing is cached. Only a genuinely new account is held, and only while
+      // approval mode is known to be on.
+      const brandNew = t - (Number(p.created) || 0) < newMs;
+      if (brandNew && approvalHint.on && t - approvalHint.at < 3600 * 1000) return { status: "busy" };
+      return { status: "ok", autofriend: null };   // null = unknown: the admin auto-link is retried at the next hello, never marked "done"
     }
-    const status = STATUS_LIST.includes(r.status) ? r.status : "pending";
+    const status = STATUS_LIST.includes(r.status) ? r.status : "ok";   // an unreadable verdict never locks anybody out
+    if (typeof r.approval === "boolean") noteApproval(r.approval);
+    const prev = g ? g.s : null;
     this.setGstate({ s: status, at: t, af: r.autofriend !== false, un: this.kvGet("username") || null });
-    if (blockedStatus(status)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('ban_sweep', '1')");
+    if (blockedStatus(status)) {
+      if (!blockedStatus(prev)) await this.applyGate(status, true);   // a ban the push never delivered lands now: close the authenticated sockets too
+      else this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('ban_sweep', '1')");
+    } else if (status === "ok" && blockedStatus(prev)) {
+      this.run("DELETE FROM kv WHERE k='ban_sweep'");   // an unban the push never delivered
+    }
     return { status, autofriend: r.autofriend !== false };
   }
 
@@ -853,13 +888,14 @@ export class UserHub extends DurableObject {
 
   /* Registry -> this hub: the verdict changed. Bans close every socket and start the clean-up of friends and requests (alarm,
    * 25 per step: the Workers Free plan allows 50 subrequests per invocation). Approvals wake the waiting client with a close. */
-  async applyGate(status) {
+  async applyGate(status, onlyAuthed = false) {
     const prev = this.gateLocal();
     const old = this.gstate() || {};
     this.setGstate({ s: status, at: now(), af: old.af, un: old.un });
     if (blockedStatus(status)) {
       this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('ban_sweep', '1')");
       for (const ws of this.ctx.getWebSockets()) {
+        if (onlyAuthed) { let a0 = null; try { a0 = ws.deserializeAttachment(); } catch { /* closed */ } if (!(a0 && a0.authed)) continue; }   // the hello that triggered this is answered by refuseGate
         try { ws.send(JSON.stringify({ type: "error", reason: "account-unavailable" })); } catch { /* closing */ }
         try { const a = ws.deserializeAttachment(); ws.serializeAttachment({ ...a, authed: false }); } catch { /* closed */ }
         try { ws.close(4010, "account-unavailable"); } catch { /* closed */ }
@@ -922,14 +958,18 @@ export class UserHub extends DurableObject {
         // Seed the registry from our own friend list (every auto-linked account is on it), a few hundred per call.
         const nf = this.count("friends");
         let pos = Number(this.kvGet("seed_pos") || 0);
+        // Seeding finished earlier: start over when the friend list grew or a day has passed, so a friend the registry missed is picked up.
+        if (pos >= nf && (nf > Number(this.kvGet("seed_nf") || 0) || now() - Number(this.kvGet("seed_at") || 0) > 24 * 3600 * 1000)) pos = 0;
         for (let i = 0; i < 4 && pos < nf; i++) {
           const rows = this.all("SELECT uid, name, since FROM friends ORDER BY since LIMIT 300 OFFSET ?", pos);
           if (!rows.length) break;
-          await REG("seed", { rows: rows.filter((r) => !isTestName(r.name)) });
+          await REG("seed", { rows: rows.filter((r) => !this.testNameOk(r.name)) });
           pos += rows.length;
           this.kvSet("seed_pos", String(pos));
+          if (pos >= nf) { this.kvSet("seed_nf", String(nf)); this.kvSet("seed_at", String(now())); }
         }
-        const out = await REG("list", { q: msg.q, sort: msg.sort, order: msg.order, status: msg.status, offset: msg.offset, limit: msg.limit });
+        const out = await REG("list", { q: msg.q, sort: msg.sort, order: msg.order, status: msg.status, offset: msg.offset, limit: msg.limit, tests: msg.tests === true });
+        if (out.settings) noteApproval(out.settings.approval);
         const uids = out.rows.map((r) => r.uid);
         const marks = uids.map(() => "?").join(",");
         const fr = new Set(uids.length ? this.all(`SELECT uid FROM friends WHERE uid IN (${marks})`, ...uids).map((r) => r.uid) : []);
@@ -975,6 +1015,7 @@ export class UserHub extends DurableObject {
       }
       case "admin_settings": {
         const r = await REG("settings", { set: msg.set });
+        if (r.settings) noteApproval(r.settings.approval);
         send({ type: "admin_settings", settings: r.settings, counts: r.counts });
         break;
       }
@@ -1222,7 +1263,7 @@ export class UserHub extends DurableObject {
       case "admin_link": {
         // Only the configured admin's own UserHub accepts automatic links.
         if (!this.env.ADMIN_UID || p.uid !== this.env.ADMIN_UID) return { r: "none" };
-        if (isTestName(b.name)) return { r: "blocked" };
+        if (this.testNameOk(b.name)) return { r: "blocked" };
         if (this.isBlocked(from)) return { r: "blocked" };
         if (!this.isFriend(from)) {
           if (this.count("friends") >= this.friendCap(p)) return { r: "full" };
@@ -1388,7 +1429,7 @@ export class UserHub extends DurableObject {
       const res = await dir.fetch("https://directory/register", {
         method: "POST",
         headers: { "x-rh-internal": "1", "content-type": "application/json" },
-        body: JSON.stringify({ prefix: uid.slice(0, 8), uid, ipk, test: msg.test === true || isTestName(name) }),
+        body: JSON.stringify({ prefix: uid.slice(0, 8), uid, ipk, test: this.wantsTest(msg, name) }),
       });
       const r = await res.json();
       if (!r.ok) {
@@ -1412,7 +1453,7 @@ export class UserHub extends DurableObject {
       ws.close(4005, "retired");
       return;
     }
-    const isTestAcct = msg.test === true || isTestName(name) || !!this.one("SELECT 1 FROM kv WHERE k='is_test'");
+    const isTestAcct = this.wantsTest(msg, name) || !!this.one("SELECT 1 FROM kv WHERE k='is_test'");
     // Account gate: banned / denied / waiting-for-approval accounts get a message and nothing else (no welcome, no username claim).
     const gate = await this.acctGate(p, isTestAcct);
     if (gate.status !== "ok") { this.refuseGate(ws, gate.status); return; }
@@ -1426,7 +1467,7 @@ export class UserHub extends DurableObject {
     }
     const wasOnline = this.authedSockets().length > 0;
     ws.serializeAttachment({ uid, authed: true, status: { state: "online", updated: now() } });
-    if (msg.test === true || isTestName(name)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('is_test', '1')");
+    if (this.wantsTest(msg, name)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('is_test', '1')");
     if (typeof msg.auto_friend === "boolean") this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('auto_friend', ?)", msg.auto_friend ? "1" : "0");
     await this.autoLinkAdmin(p, gate.autofriend);
     await this.regRename(p, un.username);
@@ -1984,7 +2025,7 @@ export class UserHub extends DurableObject {
   autoPairCheck(other, otherName, skipRate) {
     const p = this.profile();
     if (!UID_RE.test(other || "") || other === p.uid) return "skip";
-    if (this.one("SELECT 1 FROM kv WHERE k='is_test'") || isTestName(p.name) || isTestName(otherName)) return "test";
+    if (this.one("SELECT 1 FROM kv WHERE k='is_test'") || this.testNameOk(p.name) || this.testNameOk(otherName)) return "test";
     const t = this.one("SELECT v FROM kv WHERE k='auto_friend'");
     if (t && t.v === "0") return "off";
     if (this.isBlocked(other)) return "blocked";
@@ -2002,8 +2043,9 @@ export class UserHub extends DurableObject {
     const admin = this.env.ADMIN_UID;
     if (!admin || !UID_RE.test(admin) || p.uid === admin) return;
     if (this.one("SELECT 1 FROM kv WHERE k='admin_linked'")) return;
+    if (autofriend === null) return;   // the registry could not be asked: do nothing now and retry at the next hello (never mark it done)
     if (autofriend === false) { this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('admin_linked', '1')"); return; }   // the owner switched auto-friending off: skipped for good
-    if (this.one("SELECT 1 FROM kv WHERE k='is_test'") || isTestName(p.name)) return;   // QA/test accounts never touch the admin's list
+    if (this.one("SELECT 1 FROM kv WHERE k='is_test'") || this.testNameOk(p.name)) return;   // QA/test accounts never touch the admin's list (local only: see testsAllowed)
     const retry = this.one("SELECT v FROM kv WHERE k='admin_link_retry'");
     if (retry && now() < Number(retry.v)) return;
     if (this.isFriend(admin) || this.isBlocked(admin)) {
