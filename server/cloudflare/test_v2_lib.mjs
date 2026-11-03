@@ -18,21 +18,21 @@ export function makeChecker() {
   return { st, check };
 }
 
-export async function startServer({ port, vars = {}, nor2 = false, saves = true }) {
+export async function startServer({ port, vars = {}, nor2 = false, saves = true, noreg = false, keep = false }) {
   const root = process.env.RHQ_ROOT || "C:\\rhq";
   const persist = join(root, String(port));
   const registry = join(root, "reg" + port);
-  rmSync(persist, { recursive: true, force: true });
-  rmSync(registry, { recursive: true, force: true });
+  if (!keep) { rmSync(persist, { recursive: true, force: true }); rmSync(registry, { recursive: true, force: true }); }
   mkdirSync(persist, { recursive: true });
   mkdirSync(registry, { recursive: true });
   const cfg = readFileSync("wrangler.jsonc", "utf8").split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
   const j = JSON.parse(cfg);
   if (nor2) delete j.r2_buckets; else j.r2_buckets = [{ binding: "SAVES", bucket_name: "retrohub-saves-test" }];
+  if (noreg) j.durable_objects.bindings = j.durable_objects.bindings.filter((x) => x.name !== "ADMIN_REG");   // rollback test: the feature binding is gone, the class and migration stay
   const cfgName = `wrangler.v2test.${port}.jsonc`;
   writeFileSync(cfgName, JSON.stringify(j, null, 1));
   const args = ["node_modules/wrangler/bin/wrangler.js", "dev", "-c", cfgName, "--port", String(port), "--persist-to", persist, "--ip", "127.0.0.1"];
-  for (const [k, v] of Object.entries({ BUDGET_TEST: "1", ...vars })) args.push("--var", `${k}:${v}`);
+  for (const [k, v] of Object.entries({ BUDGET_TEST: "1", ALLOW_TEST_FLAG: "1", TEST_REG: "1", ...vars })) args.push("--var", `${k}:${v}`);   // ALLOW_TEST_FLAG: local QA accounts (qa- names, test:true) stay test accounts; production never sets it
   const proc = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, WRANGLER_REGISTRY_PATH: registry, WRANGLER_SEND_METRICS: "false", NO_COLOR: "1" } });
   let log = "";

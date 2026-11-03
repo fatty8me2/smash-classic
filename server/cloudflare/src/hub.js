@@ -419,7 +419,7 @@ export class HubRoom extends DurableObject {
         const tries = (this.identTries.get(ws) || 0) + 1;
         this.identTries.set(ws, tries);
         if (tries > IDENT_TRIES_PER_SOCKET || !this.identWin.hit("r")) return;
-        let ok = false;
+        let ok = false, gated = "";
         try {
           const dir = this.env.DIRECTORY.get(this.env.DIRECTORY.idFromName("directory"));
           const known = await (await dir.fetch("https://directory/lookup?prefix=" + msg.uid.slice(0, 8), { headers: { "x-rh-internal": "1" } })).json();
@@ -429,9 +429,12 @@ export class HubRoom extends DurableObject {
               method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
               body: JSON.stringify({ uid: msg.uid, secret: msg.secret }),
             });
-            ok = (await res.json()).r === "ok";
+            const rr = await res.json();
+            ok = rr.r === "ok";
+            if (rr.gate) gated = rr.gate;   // a banned / waiting account is not allowed in rooms either
           }
         } catch { /* unreachable: no auto friending */ }
+        if (gated) { try { ws.close(gated === "pending" ? 4012 : 4010, gated === "pending" ? "pending-approval" : "account-unavailable"); } catch { /* closed */ } return; }
         const now = ws.deserializeAttachment();
         if (!ok || !now || typeof now.slot !== "number" || now.slot < 0 || now.uid) return;
         if (this.members().some((m) => m.uid === msg.uid)) return;   // one seat per account

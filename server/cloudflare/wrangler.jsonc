@@ -6,6 +6,7 @@
   "main": "src/index.js",
   "compatibility_date": "2026-09-23",
   "workers_dev": true,
+  // ALLOW_TEST_FLAG (never set here): local wrangler / tests only, makes the Worker honour the client test flag and qa- names.
   // RetroHub admin: every user is auto-friended with this account once (src/friends.js autoLinkAdmin)
   // Cloud saves v2 rollout switches (docs/CLOUD_SAVES_V2.md section 7.6; all optional, these are the defaults):
   //   SAVES_V2 "0" turns every /saves/v2 route off (v1 keeps working); ACCOUNT_CAP / PROT_CAP in bytes (50 MB / 20 MB);
@@ -23,7 +24,9 @@
       // Daily operational counters for /admin/stats (src/stats.js). Free-plan SQLite class.
       { "name": "OPS_STATS", "class_name": "OpsStats" },
       // Global daily request budget / relay cost guard (src/reqbudget.js). Free-plan SQLite class.
-      { "name": "REQ_BUDGET", "class_name": "ReqBudget" }
+      { "name": "REQ_BUDGET", "class_name": "ReqBudget" },
+      // Account registry + owner controls: bans, approval queue, settings (src/adminreg.js). Free-plan SQLite class.
+      { "name": "ADMIN_REG", "class_name": "AdminRegistry" }
     ]
   },
   // Optional cloud saves (src/saves.js). Without this binding every /saves route answers 503 and nothing else
@@ -37,6 +40,7 @@
     { "tag": "v4", "new_sqlite_classes": ["LinkBox"] },
     { "tag": "v5", "new_sqlite_classes": ["R2Budget"] },
     { "tag": "v6", "new_sqlite_classes": ["OpsStats"] },
-    { "tag": "v7", "new_sqlite_classes": ["ReqBudget"] }
+    { "tag": "v7", "new_sqlite_classes": ["ReqBudget"] },
+    { "tag": "v8", "new_sqlite_classes": ["AdminRegistry"] }
   ]
 }

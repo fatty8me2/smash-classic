@@ -65,10 +65,11 @@ import {
 } from "./limits.js";
 import { savesFetch } from "./saves.js";
 import { R2Budget } from "./r2budget.js";
+import { AdminRegistry } from "./adminreg.js";
 import { ReqBudget, gate, meter, noteRequest, noteRelayFrame, noteRows, flushForTests, RELAY_ROOM_MSGS_PER_SEC } from "./reqbudget.js";
 import { OpsStats, adminStatsFetch, count, countVersion, flushDue } from "./stats.js";
 
-export { HubRoom, UserHub, Directory, LinkBox, R2Budget, OpsStats, ReqBudget };
+export { HubRoom, UserHub, Directory, LinkBox, R2Budget, OpsStats, ReqBudget, AdminRegistry };
 
 const CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_TEXT_BYTES = 2048;
@@ -132,6 +133,11 @@ export default {
     if (url.pathname === "/__test/alias" && env.TEST_ALIAS === "1" && request.method === "POST") {   // local tests only (never set in production)
       const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
       return dir.fetch("https://directory/alias", { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: await request.text() });
+    }
+    if (url.pathname === "/__test/reg" && env.TEST_REG === "1" && request.method === "POST" && env.ADMIN_REG) {   // local tests only (never set in production): registry outage / push failure / row hooks
+      const op = url.searchParams.get("op") || "";
+      if (!/^t_[a-z]+$/.test(op)) return new Response("not found", { status: 404 });
+      return env.ADMIN_REG.get(env.ADMIN_REG.idFromName("registry")).fetch("https://registry/" + op, { method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: await request.text() });
     }
     if (url.pathname === "/__test/budget" && env.TEST_BUDGET === "1") {   // local tests only (never set in production): the day's REQ_BUDGET totals
       return Response.json(await flushForTests(env));
