@@ -24,6 +24,8 @@ const SUITE = [
   { file: "test_admin_resilience.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_NEW_MS: "1500", REG_TOUCH_MS: "0", REG_RETRY_MS: "600", REG_BAN_RECHECK_MS: "500", REG_PENDING_RECHECK_MS: "300", REG_PUSH_TRIES: "2" } },
   // "A ban blocks RetroHub entirely": approval ON by default (REG_APPROVAL_DEFAULT back to 1), grandfathering, reasons, strict rooms
   { file: "test_admin_lockout.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_APPROVAL_DEFAULT: "1", REG_DEFAULT_CUTOFF: "4102444800000", REG_TOUCH_MS: "0", REG_PENDING_RECHECK_MS: "300", STRICT_CACHE_MS: "0", STRICT_IDENT_MS: "1500" } },
+  // Invite codes + approve-by-friend-code (an invite "hour" lasts 1 s so expiry is testable; tiny caps)
+  { file: "test_admin_invites.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_APPROVAL_DEFAULT: "1", REG_DEFAULT_CUTOFF: "4102444800000", REG_TOUCH_MS: "0", REG_PENDING_RECHECK_MS: "300", REG_INVITE_HOUR_MS: "1000", REG_INVITE_ACTIVE_CAP: "6", REG_INVITE_GLOBAL_CAP: "30" } },
   { file: "test_ws_ident.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, REG_APPROVAL_DEFAULT: "1", REG_DEFAULT_CUTOFF: "4102444800000", REG_TOUCH_MS: "0", REG_PENDING_RECHECK_MS: "300", STRICT_CACHE_MS: "0", STRICT_IDENT_MS: "1500" } },
   { file: "test_admin_testflag.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN, ALLOW_TEST_FLAG: "0" } },
   { file: "test_admin_rollback.mjs", kind: "self", env: { ROLLBACK_PORT: "10111" } },

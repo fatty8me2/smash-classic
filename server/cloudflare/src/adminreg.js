@@ -30,6 +30,18 @@
 //   /hub strict mode    -> a lobby seat that proves no account within the deadline: {type:"error", reason:"ident-required"} then close 4013
 //   /link/*  (403)      -> {error:"auth", reason}        /saves/*  (403)  -> {ok:false, error:reason, reason}
 //
+// Invite codes (owner hands a code to a newcomer; a waiting account redeems it and is approved at once). Table `invites` (code, note, uses,
+//   used, exp, created, revoked) + `invite_use` (who used it). Code = XXXX-XXXX from a 31-letter alphabet (no 0 O 1 I L), 8 chars of crypto
+//   randomness; at most 50 active; expired ones are kept 7 days for the list, then purged. Friends-socket messages (the owner's hub relays them):
+//   admin_invite_create {uses:1..20=1, hours:1..720=168, note<=40} -> {type:"admin_invites", ok, invites:[{code,note,uses,used,exp,created,by_names<=5}],
+//     created:{...}} or {ok:false, reason:"invite-cap", invites}        admin_invite_list {} -> {type:"admin_invites", invites}
+//   admin_invite_revoke {code} -> {type:"admin_invites", invites}      admin_approve_code {code:"RH-XXXX-XXXX"} -> {type:"admin_result", op:"approve", uid, ok, reason}
+//   redeem_invite {code} (from a WAITING account's own socket, after its hello was answered "pending-approval"; a banned/denied/unknown account is dropped)
+//     -> {type:"invite_result", ok:true} then the usual 4011 close + fresh welcome, or {ok:false, reason:"invalid"|"expired"|"used-up"|"rate-limited"|"busy"}
+//     ("invalid" = unknown or revoked). An already-approved account gets ok:true and consumes nothing. 5 failed tries per account per hour and 200
+//     per hour for the whole registry (memory counters; a restart only forgives); above them everyone is "rate-limited".
+//   Pushes to the owner's hub: admin_pending {pending, latest:{uid,name,code,created}|null}, admin_invite_used {code,name,uid}.
+//
 // Safety rule for everything here: no EXISTING account is ever locked out by an error, a bug, seeding or a rollback. Only an
 // explicit ban/deny, or a brand-new account while approval mode is on, is ever refused. Row counts are kept in counters (cnt) so
 // nothing on a hot path scans the table.
@@ -80,6 +92,13 @@ export class AdminRegistry extends DurableObject {
     this.sql.exec("CREATE INDEX IF NOT EXISTS acct_pushed ON acct (pushed)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS cnt (k TEXT PRIMARY KEY, n INTEGER NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '', uses INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, " +
+      "exp INTEGER NOT NULL, created INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS invites_exp ON invites (exp)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS invite_use (code TEXT NOT NULL, uid TEXT NOT NULL, name TEXT NOT NULL, at INTEGER NOT NULL)");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS invite_use_code ON invite_use (code, at)");
+    this.fails = new Map();   // redeem failures per uid: {start, n} (memory only)
+    this.gfail = { start: 0, n: 0 };
     this.cfg = null;
     this.cn = null;
     this.down = false;       // local tests only (t_down): every route answers 503, like an outage
@@ -172,10 +191,13 @@ export class AdminRegistry extends DurableObject {
     } catch { return false; }
   }
 
-  async notifyAdmin() {
+  /* Tell the owner's hub the waiting count and the newest waiting account (and, after a redemption, who used which code). */
+  async notifyAdmin(used = null) {
     const admin = this.env.ADMIN_UID;
     if (!admin || !UID_RE.test(admin)) return;
-    try { await this.hubCall(admin, "admin_note", { pending: this.n("pending", false) }); } catch { /* the admin sees it on the next list */ }
+    const pending = this.n("pending", false);
+    const l = pending > 0 ? this.sql.exec("SELECT uid, name, created FROM acct WHERE status='pending' AND test=0 ORDER BY first_seen DESC LIMIT 1").toArray()[0] : null;
+    try { await this.hubCall(admin, "admin_note", { pending, latest: l ? { uid: l.uid, name: l.name, created: l.created } : null, ...(used ? { used } : {}) }); } catch { /* the admin sees it on the next list */ }
   }
 
   /* Push a verdict to the account's hub. true = done: the hub has it, or there is no hub to push to (a retired / deleted account
@@ -196,7 +218,7 @@ export class AdminRegistry extends DurableObject {
     try { b = (await request.json()) || {}; } catch { return json({ ok: false }, 400); }
     if (route.startsWith("t_")) return this.testRoute(route, b);   // local tests only (TEST_REG=1, see index.js)
     if (this.down) return new Response("down", { status: 503 });
-    const ADMIN_ROUTES = ["list", "detail", "set_status", "settings", "seed"];
+    const ADMIN_ROUTES = ["list", "detail", "set_status", "settings", "seed", "approve_code", "invite_create", "invite_list", "invite_revoke"];
     if (ADMIN_ROUTES.includes(route) && (!this.env.ADMIN_UID || b.admin !== this.env.ADMIN_UID)) return new Response("forbidden", { status: 403 });
     switch (route) {
       case "touch": return json(await this.touch(b));
@@ -208,6 +230,11 @@ export class AdminRegistry extends DurableObject {
       case "set_status": return json(await this.setStatus(b));
       case "settings": return json(this.setSettings(b));
       case "seed": return json(this.seed(b));
+      case "approve_code": return json(await this.approveCode(b));
+      case "invite_create": return json(this.inviteCreate(b));
+      case "invite_list": return json(this.inviteList());
+      case "invite_revoke": return json(this.inviteRevoke(b));
+      case "redeem": return json(await this.redeem(b));
       default: return new Response("not found", { status: 404 });
     }
   }
@@ -225,6 +252,7 @@ export class AdminRegistry extends DurableObject {
     if (route === "t_cutoff") { this.setKv("dcut", String(num(b.at, now()))); return json({ ok: true, cutoff: this.settings().cutoff }); }   // move the default cutoff
     if (route === "t_unset") { this.sql.exec("DELETE FROM kv WHERE k IN ('approval','cutoff')"); this.cfg = null; return json({ ok: true }); }
     if (route === "t_touch") return json(await this.touch(b));   // a hello with any `created` (0 = unknown), as an account's hub would send it
+    if (route === "t_redeem") return json(await this.redeem(b));   // the hub's redeem call, without a socket
     if (route === "t_row") return json({ row: UID_RE.test(b.uid) ? this.row(b.uid) : null });
     return new Response("not found", { status: 404 });
   }
@@ -314,6 +342,119 @@ export class AdminRegistry extends DurableObject {
       this.bump("ok", false, 1);
     }
     return { status: "ok", by };
+  }
+
+  // ---- invite codes ----
+  hourMs() { return num(this.env.REG_INVITE_HOUR_MS, 3600000); }   // the var shortens an "hour" (local tests only)
+  invCode() {
+    const A = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";   // 31 letters, no 0 O 1 I L
+    let out = "";
+    while (out.length < 8) {
+      for (const b of crypto.getRandomValues(new Uint8Array(16))) { if (b < 248 && out.length < 8) out += A[b % 31]; }   // 248 = 31 * 8: no modulo bias
+    }
+    return out.slice(0, 4) + "-" + out.slice(4);
+  }
+  normCode(raw) {
+    const c = String(raw ?? "").toUpperCase().replace(/[\s-]/g, "");
+    return /^[A-HJKMNP-Z2-9]{8}$/.test(c) ? c.slice(0, 4) + "-" + c.slice(4) : null;
+  }
+  inviteView(r, names) { return { code: r.code, note: r.note, uses: r.uses, used: r.used, exp: r.exp, created: r.created, by_names: names || [] }; }
+  inviteList() {
+    const t = now();
+    const rows = this.sql.exec("SELECT * FROM invites WHERE revoked=0 AND exp>? ORDER BY created DESC LIMIT 100", t - 7 * 86400000).toArray();
+    const names = new Map();
+    if (rows.length) {
+      const marks = rows.map(() => "?").join(",");
+      for (const u of this.sql.exec(`SELECT code, name FROM invite_use WHERE code IN (${marks}) ORDER BY at DESC`, ...rows.map((r) => r.code)).toArray()) {
+        const a = names.get(u.code) || []; if (a.length < 5) { a.push(u.name); names.set(u.code, a); }
+      }
+    }
+    return { ok: true, invites: rows.map((r) => this.inviteView(r, names.get(r.code))) };
+  }
+  inviteCreate(b) {
+    const t = now();
+    this.sql.exec("DELETE FROM invite_use WHERE code IN (SELECT code FROM invites WHERE exp<?)", t - 7 * 86400000);   // purge what the list no longer shows
+    this.sql.exec("DELETE FROM invites WHERE exp<?", t - 7 * 86400000);
+    const active = this.sql.exec("SELECT COUNT(*) AS c FROM invites WHERE revoked=0 AND exp>? AND used<uses", t).toArray()[0].c;
+    if (active >= this.cap("INVITE_ACTIVE", 50)) return { ...this.inviteList(), ok: false, reason: "invite-cap" };
+    const uses = Math.min(num(b.uses, 1), 20), hours = Math.min(num(b.hours, 168), 720);
+    const note = cleanStr(b.note, 40);
+    let code = null;
+    for (let i = 0; i < 5 && !code; i++) {
+      const c = this.invCode();
+      if (this.sql.exec("INSERT OR IGNORE INTO invites (code, note, uses, used, exp, created, revoked) VALUES (?, ?, ?, 0, ?, ?, 0)", c, note, uses, t + hours * this.hourMs(), t).rowsWritten > 0) code = c;
+    }
+    if (!code) return { ...this.inviteList(), ok: false, reason: "busy" };
+    const made = this.sql.exec("SELECT * FROM invites WHERE code=?", code).toArray()[0];
+    return { ...this.inviteList(), created: this.inviteView(made) };
+  }
+  inviteRevoke(b) {
+    const c = this.normCode(b.code);
+    const r = c ? this.sql.exec("UPDATE invites SET revoked=1 WHERE code=? AND revoked=0", c).rowsWritten : 0;
+    return { ...this.inviteList(), ...(r ? {} : { ok: false, reason: "not-found" }) };
+  }
+
+  /* A waiting account redeems a code (its hub vouches for the uid after the account proved its secret). Failures are counted per
+   * account and for the whole registry; counters live in memory, so a restart only forgives. */
+  failedRecently(key, t) {
+    const win = num(this.env.REG_INVITE_WIN_MS, 3600000);
+    const per = this.cap("INVITE_FAIL", 5), glob = this.cap("INVITE_GLOBAL", 200);
+    const u = this.fails.get(key);
+    const un = u && t - u.start < win ? u.n : 0;
+    const gn = t - this.gfail.start < win ? this.gfail.n : 0;
+    return un >= per || gn >= glob;
+  }
+  noteFail(key, t) {
+    const win = num(this.env.REG_INVITE_WIN_MS, 3600000);
+    let u = this.fails.get(key);
+    if (!u || t - u.start >= win) {
+      if (this.fails.size > 5000) for (const [k, v] of this.fails) if (t - v.start >= win) this.fails.delete(k);
+      u = { start: t, n: 0 }; this.fails.set(key, u);
+    }
+    u.n++;
+    if (t - this.gfail.start >= win) this.gfail = { start: t, n: 0 };
+    this.gfail.n++;
+  }
+  async redeem(b) {
+    const uid = String(b.uid || "");
+    if (!UID_RE.test(uid) || uid === this.env.ADMIN_UID) return { ok: false, reason: "invalid" };
+    const t = now();
+    const row = this.row(uid);
+    if (row && row.status === "ok") return { ok: true, already: true };
+    if (this.failedRecently(uid, t)) return { ok: false, reason: "rate-limited" };
+    const bad = (reason) => { this.noteFail(uid, t); return { ok: false, reason }; };
+    if (row && blocked(row.status)) return bad("invalid");
+    const c = this.normCode(b.code);
+    const inv = c ? this.sql.exec("SELECT * FROM invites WHERE code=?", c).toArray()[0] : null;
+    if (!inv || inv.revoked) return bad("invalid");
+    if (inv.exp <= t) return bad("expired");
+    if (inv.used >= inv.uses) return bad("used-up");
+    if (!row && this.tracked() >= this.cap("ACCT", ACCT_CAP)) return { ok: false, reason: "busy" };
+    const name = row ? row.name : cleanStr(b.name, 24) || "player";
+    // No await between the check and the writes: the Durable Object is single-threaded here.
+    this.sql.exec("UPDATE invites SET used=used+1 WHERE code=?", c);
+    this.sql.exec("INSERT INTO invite_use (code, uid, name, at) VALUES (?, ?, ?, ?)", c, uid, name, t);
+    if (row) {
+      this.sql.exec("UPDATE acct SET status='ok', by=?, st_at=?, pushed=1, tries=0, unreach=0 WHERE uid=?", "invite:" + c, t, uid);   // the caller's hub applies the verdict itself (pushed=1)
+      this.bump(row.status, row.test === 1, -1); this.bump("ok", row.test === 1, 1);
+    } else {
+      this.sql.exec("INSERT INTO acct (uid, name, created, first_seen, last_seen, hub, status, by, st_at) VALUES (?, ?, ?, ?, ?, 1, 'ok', ?, ?)", uid, name, num(b.created, 0), t, t, "invite:" + c, t);
+      this.bump("ok", false, 1);
+    }
+    await this.notifyAdmin({ code: c, name, uid });
+    return { ok: true };
+  }
+
+  /* Owner approves the waiting account whose friend code (RH-XXXX-XXXX = the first 8 letters of its uid) was read off its screen. */
+  async approveCode(b) {
+    const c = String(b.code ?? "").toUpperCase().replace(/[^A-Z2-7]/g, "").replace(/^RH(?=[A-Z2-7]{8}$)/, "");
+    if (!/^[A-Z2-7]{8}$/.test(c)) return { ok: false, reason: "not-found" };
+    const p = c.toLowerCase();
+    const rows = this.sql.exec("SELECT uid, status FROM acct WHERE uid>=? AND uid<? LIMIT 5", p, p + "~").toArray();
+    if (!rows.length) return { ok: false, reason: "not-found" };
+    const hit = rows.find((r) => r.status === "pending");
+    if (!hit) return { ok: false, reason: "not-pending", uid: rows[0].uid };
+    return this.setStatus({ uid: hit.uid, status: "ok" });
   }
 
   // ---- admin-only ----

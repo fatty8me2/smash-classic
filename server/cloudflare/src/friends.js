@@ -91,7 +91,8 @@ const STATUS_LIST = ["ok", "pending", "banned", "denied"];
 const blockedStatus = (s) => s === "banned" || s === "denied";
 // Internal routes a banned / waiting account's hub still answers (everything else answers "none": the account looks gone).
 const GATE_OPEN = new Set(["gate", "link_auth", "saves_auth", "admin_peek", "admin_note"]);
-const ADMIN_MSG_RE = /^admin_[a-z]+$/;
+const ADMIN_MSG_RE = /^admin_[a-z_]+$/;
+const INVITE_FAIL_REASONS = ["invalid", "expired", "used-up", "rate-limited", "busy"];
 
 const now = () => Date.now();
 const codeOf = (uid) => {
@@ -1023,6 +1024,16 @@ export class UserHub extends DurableObject {
         send({ type: "admin_result", op: msg.type.slice(6), uid, ok: !!r.ok, status: r.status || null, applied: r.applied ?? null, reason: r.reason || null });
         break;
       }
+      case "admin_invite_create": case "admin_invite_list": case "admin_invite_revoke": {
+        const r = await REG(msg.type.slice(6), { uses: msg.uses, hours: msg.hours, note: typeof msg.note === "string" ? msg.note : "", code: typeof msg.code === "string" ? msg.code.slice(0, 40) : "" });
+        send({ type: "admin_invites", ...r });
+        break;
+      }
+      case "admin_approve_code": {
+        const r = await REG("approve_code", { code: typeof msg.code === "string" ? msg.code.slice(0, 40) : "" });
+        send({ type: "admin_result", op: "approve", uid: (r.row && r.row.uid) || r.uid || null, ok: !!r.ok, status: r.status || null, applied: r.applied ?? null, reason: r.reason || null });
+        break;
+      }
       case "admin_settings": {
         const r = await REG("settings", { set: msg.set });
         if (r.settings) noteApproval(r.settings.approval, r.settings.cutoff);
@@ -1078,7 +1089,12 @@ export class UserHub extends DurableObject {
       }
       case "admin_note": {   // registry -> the admin's hub: a new account is waiting for approval
         if (!this.isAdminUid(p.uid)) return { r: "none" };
-        this.push({ type: "admin_pending", pending: Number(b.pending) || 0 });
+        const lu = b.latest && typeof b.latest === "object" && UID_RE.test(b.latest.uid || "") ? b.latest.uid : null;
+        this.push({ type: "admin_pending", pending: Number(b.pending) || 0,
+                    latest: lu ? { uid: lu, name: cleanName(b.latest.name), code: codeOf(lu), created: Number(b.latest.created) || 0 } : null });
+        if (b.used && typeof b.used === "object" && UID_RE.test(b.used.uid || "")) {
+          this.push({ type: "admin_invite_used", code: String(b.used.code || "").slice(0, 9), name: cleanName(b.used.name), uid: b.used.uid });
+        }
         return { r: "ok" };
       }
       case "admin_peek": {   // the admin's hub asks for the facts the owner may see about this account (names only, no addresses)
@@ -1378,12 +1394,38 @@ export class UserHub extends DurableObject {
     if (used > PREAUTH_MAX_FRAMES) return drop("hello-required");
     let msg;
     try { msg = JSON.parse(message); } catch { return drop("hello-required"); }
-    if (!msg || typeof msg !== "object" || msg.type !== "hello") return drop("hello-required");
+    if (!msg || typeof msg !== "object" || (msg.type !== "hello" && msg.type !== "redeem_invite")) return drop("hello-required");
     ws.serializeAttachment({ ...att, pf: used });
+    if (msg.type === "redeem_invite") {
+      // Only a waiting account whose hello was just answered "pending-approval" (queued behind that hello, which may still be in flight).
+      this.helloChain = this.helloChain.then(() => this.redeemInvite(ws, msg)).catch(() => {
+        try { ws.close(4002, "bad-hello"); } catch { /* closed */ }
+      });
+      await this.helloChain;
+      return;
+    }
     this.helloChain = this.helloChain.then(() => this.hello(ws, msg)).catch(() => {
       try { ws.close(4002, "bad-hello"); } catch { /* closed */ }
     });
     await this.helloChain;
+  }
+
+  /* A waiting account redeems an invite code from its own (unauthenticated) socket. The registry decides and records it; on success the
+   * answer goes out first, then the verdict is applied here exactly like an owner approval (4011 close, the client reconnects and gets its welcome). */
+  async redeemInvite(ws, msg) {
+    const att = ws.deserializeAttachment();
+    if (!att || att.authed || !att.pend) { try { ws.close(4002, "hello-required"); } catch { /* closed */ } return; }
+    const send = (o) => { try { ws.send(JSON.stringify(o)); } catch { /* closing */ } };
+    const p = this.profile();
+    if (!p || !this.env.ADMIN_REG) return send({ type: "invite_result", ok: false, reason: "busy" });
+    let r;
+    try {
+      r = await this.regCall("redeem", { uid: p.uid, name: p.name, created: p.created, code: typeof msg.code === "string" ? msg.code.slice(0, 40) : "" });
+    } catch { return send({ type: "invite_result", ok: false, reason: "busy" }); }
+    if (!r || !r.ok) return send({ type: "invite_result", ok: false, reason: INVITE_FAIL_REASONS.includes(r && r.reason) ? r.reason : "invalid" });
+    send({ type: "invite_result", ok: true });
+    if (this.gateLocal() === "ok") this.closeUnauthed(4011, "approved");
+    else await this.applyGate("ok");
   }
 
   helloDeadlineMs() {   // the var is for local tests only
@@ -1467,7 +1509,12 @@ export class UserHub extends DurableObject {
     const isTestAcct = this.wantsTest(msg, name) || !!this.one("SELECT 1 FROM kv WHERE k='is_test'");
     // Account gate: banned / denied / waiting-for-approval accounts get a message and nothing else (no welcome, no username claim).
     const gate = await this.acctGate(p, isTestAcct);
-    if (gate.status !== "ok") { this.refuseGate(ws, gate.status); return; }
+    if (gate.status !== "ok") {
+      // A waiting account proved its secret: its socket may now send redeem_invite (and only that). Banned / denied / busy ones may not.
+      if (gate.status === "pending") { try { ws.serializeAttachment({ ...ws.deserializeAttachment(), pend: true }); } catch { /* closed */ } }
+      this.refuseGate(ws, gate.status);
+      return;
+    }
     const un = await this.helloUsername(msg, name, isTestAcct);
     const shownName = un.username || name;   // a claimed username always wins over whatever name a device sends
     let renamed = false;
