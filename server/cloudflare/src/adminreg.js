@@ -16,8 +16,8 @@
 // Settings (kv): approval (DEFAULT ON while the kv is unset; the owner can switch it off in the Admin page), cutoff (when approval was
 //   switched on), dcut (the DEFAULT cutoff, see below), vouch (default OFF), autofriend (default ON), strict_rooms (default OFF).
 //
-// Default-on approval and grandfathering. While the approval kv has never been written, approval is ON and the cutoff is `dcut`: the
-//   moment this registry first ran with this code (written once; env REG_DEFAULT_CUTOFF pins it). An account is decided from its hub's
+// Default-on approval and grandfathering. While the approval kv has never been written, approval is ON and the cutoff is the fixed
+//   constant DEFAULT_CUTOFF below (env REG_DEFAULT_CUTOFF overrides it; `dcut` is a test-only override). An account is decided from its hub's
 //   own creation time (UserHub profile.created, set when the account registered, present since the first release): created <= cutoff, or
 //   no creation time at all (0) => grandfathered "ok"; created after the cutoff => "pending". So every account that existed before
 //   the deploy stays ok whenever the registry first sees it (hello, seed, or the owner's list), and only accounts created afterwards
@@ -37,6 +37,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { meter, meteredSql } from "./reqbudget.js";
 
+// Grandfathering cutoff used while approval was never switched on by hand: 2026-11-03, set at edit time. Every account created before it
+// stays ok. BUMP IT to the deploy moment (Date.now()) right before deploying so accounts registered in between are grandfathered too.
+export const DEFAULT_CUTOFF = 1793724460515;
 const UID_RE = /^[a-z2-7]{26}$/;
 export const ACCT_CAP = 20000;      // ok + pending rows (test accounts included); past it new ok accounts are simply not tracked (never refused)
 export const PENDING_CAP = 500;     // rows waiting for approval; past it a new account is still refused but not queued
@@ -122,16 +125,13 @@ export class AdminRegistry extends DurableObject {
     }
     return this.cfg;
   }
-  /* The grandfathering cutoff while the owner never switched approval on by hand: env pin, else the stored first-run time. */
+  /* The grandfathering cutoff while the owner never switched approval on by hand: a stored `dcut` (tests only), else the env pin
+   * REG_DEFAULT_CUTOFF, else the fixed constant below. Nothing is written on a first run, so there is no "first account after deploy" edge. */
   defaultCutoff(o) {
+    const d = Number(o.dcut);
+    if (d > 0) return d;
     const pin = Number(this.env.REG_DEFAULT_CUTOFF);
-    if (pin > 0) return pin;
-    let d = Number(o.dcut);
-    if (!(d > 0)) {
-      d = now();
-      try { this.sql.exec("INSERT OR IGNORE INTO kv (k, v) VALUES ('dcut', ?)", String(d)); } catch { /* read-only: keep the in-memory value */ }
-    }
-    return d;
+    return pin > 0 ? pin : DEFAULT_CUTOFF;
   }
   setKv(k, v) { this.sql.exec("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", k, String(v)); this.cfg = null; }
 

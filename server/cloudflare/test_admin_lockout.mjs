@@ -45,7 +45,8 @@ check(E.outcome === "welcome", "an account that existed at the cutoff connects")
 const adm = await connect(base, ADMIN, ADMIN_SECRET, "Owner");
 check(adm.outcome === "welcome" && adm.welcome.admin === true, "the admin account connects (never gated, even with approval ON)");
 let s = await settings(adm);
-check(s.approval === true && s.cutoff > 0, "approval defaults to ON with a default cutoff (the registry's first run)");
+check(s.approval === true && s.cutoff > 0, "approval defaults to ON with the configured default cutoff (env pin here; a fixed constant in production)");
+check(s.cutoff === 4102444800000, "the cutoff is fixed (no first-run edge): equals the pin");
 check(s.strict_rooms === false, "strict rooms default to OFF");
 await sleep(60);
 
@@ -169,6 +170,7 @@ const gHost = await seat(gRoom, { role: "host", ms: 2400 });
 check(gHost.open && gHost.welcome, "strict: game rooms (-N) are not enforced");
 gHost.close();
 s = await settings(adm, { strict_rooms: false });
+check(s.strict_rooms === false, "admin_settings {set:{strict_rooms:false}} switches strict rooms off again");
 const room2 = rcode();
 const off1 = await seat(room2, { role: "host", ms: 2400 });
 check(off1.open, "strict switched back off: anonymous seats stay");
