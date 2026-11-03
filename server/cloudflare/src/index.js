@@ -639,6 +639,7 @@ export class NetplayRoom extends DurableObject {
   }
 
   async alarm() {
+    meter(this.env, this.ctx, "alarm");   // the strict-ident deadline wake-up counts like any other DO request
     const t = Date.now();
     for (const { ws } of this.members()) {
       const a = ws.deserializeAttachment() || {};

@@ -82,20 +82,25 @@ const isGameRoom = (room) => room.includes("-");
 // send ident). Off by default because shipped clients send ident only while "auto-friend" is on; see adminreg.js.
 const IDENT_WAIT_MS = 15000;
 const identWaitMs = (env) => { const v = Number(env && env.STRICT_IDENT_MS); return Number.isFinite(v) && v > 0 ? v : IDENT_WAIT_MS; };
-const strictCache = { v: false, at: -1e12 };   // per isolate: the flag is asked of the registry at most once a minute (STRICT_CACHE_MS overrides, tests)
+const strictCache = { v: false, at: -1e12, p: null };   // per isolate: the flag is asked of the registry at most once a minute (STRICT_CACHE_MS overrides, tests)
 export async function strictRooms(env) {
   if (!env.ADMIN_REG) return false;
   const ttl = env.STRICT_CACHE_MS !== undefined && env.STRICT_CACHE_MS !== "" && Number(env.STRICT_CACHE_MS) >= 0 ? Number(env.STRICT_CACHE_MS) : 60000;
   const t = Date.now();
+  if (strictCache.p) return strictCache.p;   // a lookup is in flight: every join waits for the same answer (a cold isolate must not wave seats through)
   if (t - strictCache.at < ttl) return strictCache.v;
   strictCache.at = t;   // set first: an unreachable registry is not asked again on every join
-  try {
-    const r = await env.ADMIN_REG.get(env.ADMIN_REG.idFromName("registry")).fetch("https://registry/flags", {
-      method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: "{}",
-    });
-    strictCache.v = r.ok && (await r.json()).strict === true;
-  } catch { strictCache.v = false; }   // never lock anybody out on an error
-  return strictCache.v;
+  strictCache.p = (async () => {
+    try {
+      const r = await env.ADMIN_REG.get(env.ADMIN_REG.idFromName("registry")).fetch("https://registry/flags", {
+        method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" }, body: "{}",
+      });
+      strictCache.v = r.ok && (await r.json()).strict === true;
+    } catch { strictCache.v = false; }   // never lock anybody out on an error
+    finally { strictCache.p = null; }
+    return strictCache.v;
+  })();
+  return strictCache.p;
 }
 
 /* Verifies {uid, secret} against the account's own hub (registered accounts only: a made-up uid never wakes/creates a hub).
