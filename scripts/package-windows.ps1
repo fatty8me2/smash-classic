@@ -380,7 +380,7 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     if ($BuildAllHub) {
         cmake --build $HubBuild --config Release -j $Jobs
     } else {
-        cmake --build $HubBuild --config Release -j $Jobs --target RetroHub n64run retrorun streamrun mgba_link_libretro sameboy_rb_libretro beetle_psx_libretro
+        cmake --build $HubBuild --config Release -j $Jobs --target RetroHub rh-helper n64run retrorun streamrun mgba_link_libretro sameboy_rb_libretro beetle_psx_libretro
     }
     if ($LASTEXITCODE -ne 0) { Fail "RetroHub build failed" }
     }
@@ -394,6 +394,14 @@ if (Test-Path (Join-Path $HubRoot "CMakeLists.txt")) {
     $StreamExe = Join-Path $HubBin "streamrun.exe"
     if (-not (Test-Path $StreamExe)) { Fail "streamrun.exe not built (expected $StreamExe)" }
     Copy-Item $StreamExe $StageDir
+    # rh-helper.exe starts the bundled UI Automation scripts (data\helpers\*.ps1, copied with the rest of data\ below). RetroHub.exe holds
+    # no script text and no script-host command line, so Netplay for GameCube / 3DS breaks without both.
+    $HelperExe = Join-Path $HubBin "rh-helper.exe"
+    if (-not (Test-Path $HelperExe)) { Fail "rh-helper.exe not built (expected $HelperExe)" }
+    Copy-Item $HelperExe $StageDir
+    foreach ($d in "dolphin_netplay_driver.ps1", "n3ds_join.ps1") {
+        if (-not (Test-Path (Join-Path $HubRoot "data\helpers\$d"))) { Fail "missing RetroHub helper script data\helpers\$d" }
+    }
     # Cheat database + curated featured cheats (read from <exe dir>\data at run time).
     $DataDst = Join-Path $StageDir "data"
     New-Item -ItemType Directory -Path $DataDst -Force | Out-Null
