@@ -32,7 +32,9 @@ AppPublisher=fatty8me2
 AppPublisherURL=https://github.com/fatty8me2/smash-classic
 AppSupportURL=https://github.com/fatty8me2/smash-classic/issues
 AppUpdatesURL=https://github.com/fatty8me2/retrohub/releases
-DefaultDirName={autopf}\RetroHub
+; A RetroHub that already ran on this PC (installer or portable zip) records its folder at HKCU\Software\RetroHub\InstallDir:
+; default to it so a reinstall updates that copy in place (its userdata holds the account).
+DefaultDirName={reg:HKCU\Software\RetroHub,InstallDir|{autopf}\RetroHub}
 DefaultGroupName=RetroHub
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
