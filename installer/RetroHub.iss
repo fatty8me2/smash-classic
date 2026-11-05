@@ -48,7 +48,7 @@ Compression={#SetupCompression}
 SolidCompression=yes
 CloseApplications=yes
 RestartApplications=no
-CloseApplicationsFilter=RetroHub.exe,n64run.exe,retrorun.exe,BattleShip.exe
+CloseApplicationsFilter=RetroHub.exe,rh-helper.exe,n64run.exe,retrorun.exe,BattleShip.exe
 WizardStyle=modern
 LicenseFile={#SourceDir}\LICENSE.txt
 
