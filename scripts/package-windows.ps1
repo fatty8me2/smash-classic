@@ -44,10 +44,14 @@ param(
     [switch]$ForceBattleShip,
     # Build every RetroHub target (all tests included) like the old behaviour, instead of only the shipped ones.
     [switch]$BuildAllHub,
-    # Mark this release "hub-only" in SHA256SUMS.txt: Smash Classic's own files are unchanged, so an updater that finds RetroHub-windows.zip
-    # installs just that. Without it every updater still installs the full BattleShip-windows.zip (the safe default). Same as $env:RETROHUB_HUB_ONLY=1.
+    # Mark this release "hub-only" in SHA256SUMS.txt: Smash Classic's own files are unchanged since -SmashSince. An updater installs only
+    # RetroHub-windows.zip when the BattleShip.exe it already has is byte-identical to the one in this package (the marker carries its SHA-256);
+    # everyone else still gets the full BattleShip-windows.zip. Without the switch every updater installs the full zip (the safe default).
+    # Same as $env:RETROHUB_HUB_ONLY=1. Needs -SmashSince (or $env:RETROHUB_SMASH_SINCE): the release whose Smash Classic files are reused. This
+    # package then stamps BattleShip.exe with THAT version instead of the new one, so it is byte-identical to the earlier release's exe.
     [switch]$HubOnlyRelease,
-    # Local dev / QA packages only: skip signing SHA256SUMS.txt. An updater from this wave on refuses an unsigned release, so never publish one.
+    [string]$SmashSince = "",
+    # Local dev / QA packages only: skip signing SHA256SUMS.txt. Updaters that check signatures refuse an unsigned release, so never publish one.
     [switch]$Unsigned
 )
 $ErrorActionPreference = "Stop"
@@ -92,6 +96,11 @@ $Jobs = if ($env:NUMBER_OF_PROCESSORS) { [int]$env:NUMBER_OF_PROCESSORS } else {
 
 # Per-step wall-clock timing: every Write-Step closes the previous step and prints its elapsed time;
 # Show-Timings prints the table (also written to <DistDir>\package-timings.txt) at the end or on failure.
+$HubOnlyRequested = $HubOnlyRelease -or ($env:RETROHUB_HUB_ONLY -eq "1")
+if (-not $SmashSince -and $env:RETROHUB_SMASH_SINCE) { $SmashSince = $env:RETROHUB_SMASH_SINCE }
+if ($HubOnlyRequested -and $SmashSince -notmatch '^v?\d+(\.\d+)*$') {
+    Write-Error "-HubOnlyRelease needs -SmashSince <version> (the release whose Smash Classic files this one reuses, e.g. v1.39.0)"; exit 1
+}
 $script:StepLog = New-Object System.Collections.ArrayList
 $script:StepName = $null
 $script:StepStart = 0.0
@@ -292,7 +301,8 @@ New-Item -ItemType Directory -Path $StageDir | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $StageDir "yamls\$Ver") | Out-Null
 
 Copy-Item $GameExe        (Join-Path $StageDir "$AppName.exe")
-Set-ExeVersion (Join-Path $StageDir "$AppName.exe") ((Get-Content (Join-Path $Root "VERSION") -Raw).Trim())
+# A hub-only release keeps Smash Classic exactly as it was at -SmashSince, so its exe carries THAT version stamp (see -HubOnlyRelease).
+Set-ExeVersion (Join-Path $StageDir "$AppName.exe") $(if ($HubOnlyRequested) { $SmashSince } else { (Get-Content (Join-Path $Root "VERSION") -Raw).Trim() })
 Copy-Item $TorchExe      (Join-Path $StageDir "torch.exe")
 Copy-Item $F3DO2R        (Join-Path $StageDir "f3d.o2r")
 Copy-Item (Join-Path $Root "gamecontrollerdb.txt") $StageDir
@@ -581,11 +591,16 @@ if ($Iscc) {
 # lowercase hex, LF endings, no BOM (sha256sum -c compatible). JP gets its own file name so variants never collide.
 Write-Step "Writing checksums"
 $SumsPath = Join-Path $DistDir $(if ($Ver -eq "jp") { "SHA256SUMS-JP.txt" } else { "SHA256SUMS.txt" })
-# Every release asset is listed here (release.ps1 uploads every file listed). A "# retrohub-only" comment line tells the updater this
-# release changed none of Smash Classic's files (-HubOnlyRelease); sha256sum -c and older updaters ignore the comment.
-$IsHubOnly = $HubZipPath -and ($HubOnlyRelease -or $env:RETROHUB_HUB_ONLY -eq "1")
+# Every release asset is listed here (release.ps1 uploads every file listed). A "# retrohub-only smash-sha256 <hash> smash-since <ver>"
+# comment line (-HubOnlyRelease) names the exact BattleShip.exe this release's RetroHub files assume; an updater uses RetroHub-windows.zip
+# only when its installed BattleShip.exe hashes to that. sha256sum -c and older updaters ignore the comment. The file is signed below.
+$IsHubOnly = $HubZipPath -and $HubOnlyRequested
+if ($HubOnlyRequested -and -not $HubZipPath) { Fail "-HubOnlyRelease needs RetroHub-windows.zip (US package with RetroHub built in)" }
 $SumLines = @()
-if ($IsHubOnly) { $SumLines += "# retrohub-only" }
+if ($IsHubOnly) {
+    $bsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $StageDir "$AppName.exe")).Hash.ToLower()
+    $SumLines += "# retrohub-only smash-sha256 $bsHash smash-since $SmashSince"
+}
 $SumLines += foreach ($f in @($ZipPath, $HubZipPath, $SetupPath)) {
     if ($f -and (Test-Path $f)) {
         $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower()
@@ -597,7 +612,7 @@ Write-Host "Checksums ready: $SumsPath$(if ($IsHubOnly) { ' (marked hub-only)' }
 $SumLines | ForEach-Object { Write-Host "   $_" }
 
 # ── 7b. Sign SHA256SUMS.txt (ECDSA P-256 / SHA-256, DER signature -> SHA256SUMS.txt.sig) ──
-# The in-app updater refuses any release whose SHA256SUMS.txt.sig does not verify against the public key built into RetroHub
+# The in-app updater (from the release that adds signature checking) refuses any release whose SHA256SUMS.txt.sig does not verify against the public key built into RetroHub
 # (src/hub/updater.cpp, kReleasePubKeyHex). The PRIVATE key stays on the release PC: this script only hands its path to openssl.
 # It is never copied, printed or logged.
 $ReleasePubKeyHex = "658c1b016ebdc2a00f89baf7a7b510026baa7da3b1515e14b6e6bf07f17a307ae2a7b0011d070804b8621e2462fa64a0ea806932b6573a13cf7db747f42fdb73"
@@ -607,7 +622,7 @@ if ($Unsigned) {
     Write-Host ""
     Write-Host "################################################################" -ForegroundColor Red
     Write-Host "#  UNSIGNED PACKAGE (-Unsigned): for local dev / QA ONLY.       #" -ForegroundColor Red
-    Write-Host "#  RetroHub updaters REFUSE this release. NEVER publish it.     #" -ForegroundColor Red
+    Write-Host "#  Signature-checking updaters REFUSE it. NEVER publish it.     #" -ForegroundColor Red
     Write-Host "################################################################" -ForegroundColor Red
 } else {
     Write-Step "Signing $(Split-Path -Leaf $SumsPath)"
