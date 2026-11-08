@@ -38,6 +38,7 @@ const SUITE = [
   { file: "test_hostmig.mjs", kind: "ws" },
   { file: "test_hostgrace.mjs", kind: "ws", vars: { HOST_GRACE_MS: "1500" } },
   { file: "test_hub_reasons.mjs", kind: "ws" },
+  { file: "test_hub_gameauth.mjs", kind: "ws", vars: { REG_APPROVAL_DEFAULT: "0", STRICT_IDENT_MS: "1200" } },
   { file: "test_invite.mjs", kind: "http" },
   { file: "test_limits.mjs", kind: "ws" },
   { file: "test_link.mjs", kind: "http", vars: { LINK_TTL_SECONDS: "3", LINK_REDEEM_LIMIT: "5" } },

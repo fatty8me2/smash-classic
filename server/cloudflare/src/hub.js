@@ -43,6 +43,11 @@
 //     launch is replayed as msg{from:0,body:{...body,watch:true,dropin_join:true}}. dropin=1 with role=host/join on a lobby: ignored.
 //   GAME room `&role=join&dropin=1&slot=K`: a normal member join (real slot, not spec) but refused "spectate-busy" when
 //     gate().spectate is false. All other join rules unchanged.
+// Game-room seat authorisation (netcore-M3): an {type:"ident"} proof on a "-N" game room is checked against the roster of the lobby room
+//   with the same code (src/hub_auth.js; one internal DO call per game room, cached 4 s, no storage). A proven account that is not in
+//   that lobby, or sits at another slot, or takes a slot another proven account holds, gets error{not-in-lobby|wrong-slot|slot-not-yours}
+//   and a 4015 close. Lobby seats that never proved an account (older clients) and an unreachable lobby are never refused. &caps=gameauth
+//   (clients that always send their proof) additionally makes the proof mandatory within IDENT_WAIT_MS (ident-required, 4013).
 // Spectators (&role=watch, additive; old clients never send it; any `slot` param is ignored):
 //   Accept rules: host present (else same refusal as join), at most 2 spectator seats ("spectators-full"), daily budget
 //   below 50% (gate().spectate, else "spectate-busy"), game rooms also need a free slot 1..3 ("room-full").
@@ -63,6 +68,7 @@ import {
   FixedWindow, ByteBucket, SocketLimiter, RELAY_BYTES_PER_SEC, RELAY_BURST_BYTES, RELAY_ABUSE_MS, RELAY_NOTICE_MS,
   TEXT_MSGS_PER_SEC, TEXT_BURST, TEXT_ABUSE_MS, IDENT_TRIES_PER_SOCKET, IDENT_PER_ROOM_PER_HOUR, LAUNCH_WRITES_PER_HOUR,
 } from "./limits.js";
+import { gameSeatVerdict } from "./hub_auth.js";
 
 const ROOM_RE = /^[A-HJ-NP-Z2-9]{6}(-[0-9]{1,6})?$/;
 const ENDPOINT_RE = /^(-|[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5})$/;
@@ -72,10 +78,12 @@ const MAX_SPECTATORS = 2;
 const LOBBY_SPEC_SLOTS = [4, 5];
 const LOBBY_DROPIN_SLOTS = [6, 7];   // drop-in seats: their own pool and cap, they never use a spectator seat
 const MAX_NAME = 24;
+const LOBBY_ROSTER_MS = 4000;   // a game room asks its lobby for the roster at most this often
 const MAX_TEXT_BYTES = 4096;
 const MAX_BINARY_BYTES = 1200;
 const SMASH_LINK_TTL_MS = 6 * 3600 * 1000;
 const isGameRoom = (room) => room.includes("-");
+const stripSecrets = (body) => { const { np_3ds, ...rest } = body; return rest; };   // eslint-disable-line no-unused-vars
 
 // Strict rooms (owner switch, default OFF; registry flag strict_rooms): EVERY seat (lobby and "-N" game rooms, spectators too) must prove a registered, approved
 // account with an ident within IDENT_WAIT_MS of its welcome, or it is closed (error ident-required, 4013). Spectators prove it too (they may
@@ -168,6 +176,9 @@ export class HubRoom extends DurableObject {
     this.identTries = new WeakMap();       // socket -> ident attempts
     this.identWin = new FixedWindow(IDENT_PER_ROOM_PER_HOUR, 3600 * 1000);
     this.launchWin = new FixedWindow(LAUNCH_WRITES_PER_HOUR, 3600 * 1000);
+    this.rosterWin = new FixedWindow(LAUNCH_WRITES_PER_HOUR, 3600 * 1000);
+    this.rosterMem = undefined;            // the lobby roster at the host's latest launch {seats, at} (undefined = not loaded yet)
+    this.rosterSig = "";
     this.launchMem = undefined;            // the host's latest launch {body, at} (undefined = not loaded from storage yet)
     this.launchSig = "";                   // JSON of the launch body last written to storage
   }
@@ -193,6 +204,23 @@ export class HubRoom extends DurableObject {
       await this.ctx.storage.put("launch", rec);
       noteRows(1);
     } catch { /* rows exhausted: the replay stays in memory, the launch itself was already broadcast */ }
+  }
+
+  /* The roster at the host's latest launch (netcore-M3): memory first, then storage. Written only when it changed, rate limited like
+   * the launch itself, and never near the daily budget: normally one row per game start. */
+  async getRosterSnap() {
+    if (this.rosterMem === undefined) this.rosterMem = (await this.ctx.storage.get("launchroster")) || null;
+    return this.rosterMem;
+  }
+
+  async snapRoster() {
+    const seats = this.members().map((m) => ({ slot: m.slot, uid: m.pu || m.uid || "", spec: m.spec }));
+    this.rosterMem = { seats, at: Date.now() };
+    const sig = JSON.stringify(seats);
+    if (sig === this.rosterSig) return;
+    if (!gate(this.env, (p) => this.ctx.waitUntil(p)).relayFrames || !this.rosterWin.hit("w")) return;
+    this.rosterSig = sig;
+    try { await this.ctx.storage.put("launchroster", this.rosterMem); noteRows(1); } catch { /* rows exhausted: memory only */ }
   }
 
   /* Tell a socket its relayed frames are not being forwarded (at most every RELAY_NOTICE_MS), then report "dropped". */
@@ -232,7 +260,7 @@ export class HubRoom extends DurableObject {
       if (ws === except) continue;
       const a = ws.deserializeAttachment();
       if (!a || typeof a.slot !== "number" || a.slot < 0) continue;
-      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs, uid: a.uid || null, spec: !!a.spec, dr: !!a.dr, idw: a.idw || 0, idok: !!a.idok });
+      out.push({ ws, slot: a.slot, name: a.name, endpoint: a.endpoint || null, mig: !!a.mig, game: !!a.game, rs: !!a.rs, uid: a.uid || null, spec: !!a.spec, dr: !!a.dr, idw: a.idw || 0, idok: !!a.idok, pu: a.pu || null, di: !!a.di, lob: a.lob || "" });
     }
     return out;
   }
@@ -245,13 +273,32 @@ export class HubRoom extends DurableObject {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
+  /* The lobby roster [{slot, uid, spec}] of a game room's lobby (netcore-M3), or null when it cannot be asked. One internal DO request,
+   * shared and cached for LOBBY_ROSTER_MS per game room: no storage write, no polling (only an ident asks). */
+  lobbySeats(lob) {
+    const t = Date.now();
+    if (this.lobbyAsk && t - this.lobbyAsk.at < LOBBY_ROSTER_MS) return this.lobbyAsk.p;
+    const p = (async () => {
+      try {
+        const r = await this.env.HUB_ROOMS.get(this.env.HUB_ROOMS.idFromName(lob)).fetch("https://hub/roster", { method: "POST", headers: { "x-rh-internal": "1" } });
+        const j = await r.json();
+        return Array.isArray(j.seats) ? j.seats : null;
+      } catch { return null; }
+    })();
+    this.lobbyAsk = { at: t, p };
+    return p;
+  }
+
   // Seats that count as room members: everyone except lobby-room spectators.
   players(except) { return this.members(except).filter((m) => !(m.spec && !m.game)); }
 
   broadcast(obj, except, list) {
     const text = JSON.stringify(obj);
+    let watchText = null;   // a launch's 3DS room password (np_3ds) is for seated players only: watchers get the message without it (onlineflow-M6)
     for (const m of list || this.members(except)) {
-      try { m.ws.send(text); } catch { /* closing */ }
+      let t = text;
+      if (m.spec && obj.type === "msg" && obj.body && obj.body.np_3ds !== undefined) t = watchText ??= JSON.stringify({ ...obj, body: stripSecrets(obj.body) });
+      try { m.ws.send(t); } catch { /* closing */ }
     }
   }
 
@@ -264,7 +311,7 @@ export class HubRoom extends DurableObject {
   }
 
   attach(ws, m) {
-    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs, uid: m.uid || null, spec: !!m.spec, dr: !!m.dr, idw: m.idw || 0, idok: !!m.idok });
+    ws.serializeAttachment({ slot: m.slot, name: m.name, endpoint: m.endpoint || null, mig: !!m.mig, game: !!m.game, rs: !!m.rs, uid: m.uid || null, spec: !!m.spec, dr: !!m.dr, idw: m.idw || 0, idok: !!m.idok, pu: m.pu || null, di: !!m.di, lob: m.lob || "" });
   }
 
   sendPeers() {
@@ -338,6 +385,16 @@ export class HubRoom extends DurableObject {
     if (url.pathname === "/smashlink" && request.method === "POST" && request.headers.get("x-rh-internal") === "1") {
       return this.smashLink(request);
     }
+    if (url.pathname === "/roster" && request.method === "POST" && request.headers.get("x-rh-internal") === "1") {
+      // Game rooms ask their lobby who sits where (netcore-M3). Read-only, memory only: no storage row.
+      // Live seats PLUS the roster the lobby had when its host last launched: a member whose lobby socket blipped is still a member.
+      const seats = this.members().map((m) => ({ slot: m.slot, uid: m.pu || m.uid || "", spec: m.spec }));
+      const snap = await this.getRosterSnap();
+      if (snap && Date.now() - snap.at < SMASH_LINK_TTL_MS) {
+        for (const o of snap.seats) if (!seats.some((x) => x.slot === o.slot && x.uid === o.uid && !!x.spec === !!o.spec)) seats.push(o);
+      }
+      return Response.json({ seats });
+    }
     const room = (url.searchParams.get("room") || "").toUpperCase();
     const role = url.searchParams.get("role");
     const name = cleanName(url.searchParams.get("name"));
@@ -345,6 +402,7 @@ export class HubRoom extends DurableObject {
     const caps = (url.searchParams.get("caps") || "").split(",");
     const mig = caps.includes("hostmig");
     const rs = caps.includes("reasons");
+    const gameauth = caps.includes("gameauth");   // a client that sends its account proof right after the welcome: its game-room seat must prove it (see idw)
 
     // The strict flag is read BEFORE the roster and the slot are chosen: awaiting it in between let two joiners pick the same slot.
     const strict = await strictRooms(this.env);
@@ -392,13 +450,13 @@ export class HubRoom extends DurableObject {
 
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
-    const idw = strict ? Date.now() + identWaitMs(this.env) : 0;   // lobby AND "-N" game rooms: a game-room name is no way around it
-    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs, spec, dr: !!dropRec, idw, idok: false });
+    const idw = strict || (gameauth && isGameRoom(room)) ? Date.now() + identWaitMs(this.env) : 0;   // lobby AND "-N" game rooms: a game-room name is no way around it
+    pair[1].serializeAttachment({ slot, name, endpoint: null, mig, game: isGameRoom(room), rs, spec, dr: !!dropRec, idw, idok: false, pu: null, di: dropin && role === "join" && isGameRoom(room), lob: isGameRoom(room) ? room.split("-")[0] : "" });
     pair[1].send(JSON.stringify(spec ? (dropRec ? { type: "welcome", room, slot, spec: true, dropin: true } : { type: "welcome", room, slot, spec: true }) : { type: "welcome", room, slot }));
     if (spec && !isGameRoom(room)) {
       const l = dropRec || await this.getLaunch();
       if (l && l.body && Date.now() - l.at < SMASH_LINK_TTL_MS) {
-        try { pair[1].send(JSON.stringify({ type: "msg", from: 0, body: dropRec ? { ...l.body, watch: true, dropin_join: true } : { ...l.body, watch: true } })); } catch { /* closing */ }
+        try { pair[1].send(JSON.stringify({ type: "msg", from: 0, body: dropRec ? { ...stripSecrets(l.body), watch: true, dropin_join: true } : { ...stripSecrets(l.body), watch: true } })); } catch { /* closing */ }
       }
     }
     this.sendMembers();
@@ -455,7 +513,7 @@ export class HubRoom extends DurableObject {
         if (msg.body === null || typeof msg.body !== "object") return;
         this.broadcast({ type: "msg", from: me.slot, body: msg.body }, ws);
         // The host's launch is kept for late spectators / drop-ins: storage is written once per changed launch (storeLaunch).
-        if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.storeLaunch(msg.body);
+        if (me.slot === 0 && msg.body.kind === "launch" && !me.game) { await this.storeLaunch(msg.body); await this.snapRoster(); }
         // The host starting a game: everyone present who proved their account becomes friends with each other.
         if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.pairAll(true);
         break;
@@ -476,30 +534,32 @@ export class HubRoom extends DurableObject {
           try { ws.close(gated === "pending" ? 4012 : gated === "held" ? 4014 : 4010, reason); } catch { /* closed */ }
           return;
         }
-        const now = ws.deserializeAttachment();
+        let now = ws.deserializeAttachment();
         if (unreachable && now && typeof now.slot === "number" && now.slot >= 0 && !now.idok) { ws.serializeAttachment({ ...now, idok: true, idw: 0 }); return; }
         if (!ok || !now || typeof now.slot !== "number" || now.slot < 0 || now.uid || now.idok) return;
+        // Game rooms (netcore-M3): the proven account must be a member of the lobby that started the game, with this slot. Anyone else
+        // is refused and loses the seat. A lobby that cannot be asked (gone, error) never locks anybody out.
+        if (now.game && now.lob) {
+          const verdict = gameSeatVerdict({ slot: now.slot, uid: msg.uid, spec: now.spec, dropin: now.di }, await this.lobbySeats(now.lob));
+          if (verdict) {
+            console.log("[hub] game-room seat refused: " + verdict);
+            try { ws.send(JSON.stringify({ type: "error", reason: verdict })); } catch { /* closing */ }
+            try { ws.close(4015, verdict); } catch { /* closed */ }
+            return;
+          }
+          now = ws.deserializeAttachment();   // the await above let other frames in (an endpoint): merge into the CURRENT attachment
+          if (!now || typeof now.slot !== "number" || now.slot < 0 || now.uid || now.idok) return;
+        }
         // Proof only (no pairing) for spectators, game-room seats and {nopair:true} idents (a client whose auto-friend is off still proves its
         // account). A second seat of an account already in the room (a second PC) is proof only too: one pairing per account, any number of seats.
-        if (me.spec || me.game || msg.nopair === true || this.members().some((m) => m.uid === msg.uid)) { ws.serializeAttachment({ ...now, idok: true, idw: 0 }); return; }
-        ws.serializeAttachment({ ...now, uid: msg.uid, idok: true, idw: 0 });
+        if (me.spec || me.game || msg.nopair === true || this.members().some((m) => m.uid === msg.uid)) { ws.serializeAttachment({ ...now, idok: true, idw: 0, pu: msg.uid }); return; }
+        ws.serializeAttachment({ ...now, uid: msg.uid, pu: msg.uid, idok: true, idw: 0 });
         await this.pairAll(false, msg.uid);
         break;
       }
       case "endpoint": {
         const clean = (v) => (typeof v === "string" && v.length <= 64 && ENDPOINT_RE.test(v) ? v : "-");
-        ws.serializeAttachment({
-          slot: me.slot,
-          name: me.name,
-          endpoint: { public: clean(msg.public), local: clean(msg.local) },
-          mig: !!me.mig,
-          game: !!me.game,
-          rs: !!me.rs,
-          uid: me.uid || null,
-          spec: !!me.spec,
-          idw: me.idw || 0,
-          idok: !!me.idok,
-        });
+        ws.serializeAttachment({ ...me, dr: false, endpoint: { public: clean(msg.public), local: clean(msg.local) } });   // keeps every other field (pu, di, lob ...); dr was always dropped here
         this.sendPeers();
         break;
       }
