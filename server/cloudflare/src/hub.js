@@ -175,6 +175,9 @@ export class HubRoom extends DurableObject {
     this.identTries = new WeakMap();       // socket -> ident attempts
     this.identWin = new FixedWindow(IDENT_PER_ROOM_PER_HOUR, 3600 * 1000);
     this.launchWin = new FixedWindow(LAUNCH_WRITES_PER_HOUR, 3600 * 1000);
+    this.rosterWin = new FixedWindow(LAUNCH_WRITES_PER_HOUR, 3600 * 1000);
+    this.rosterMem = undefined;            // the lobby roster at the host's latest launch {seats, at} (undefined = not loaded yet)
+    this.rosterSig = "";
     this.launchMem = undefined;            // the host's latest launch {body, at} (undefined = not loaded from storage yet)
     this.launchSig = "";                   // JSON of the launch body last written to storage
   }
@@ -200,6 +203,23 @@ export class HubRoom extends DurableObject {
       await this.ctx.storage.put("launch", rec);
       noteRows(1);
     } catch { /* rows exhausted: the replay stays in memory, the launch itself was already broadcast */ }
+  }
+
+  /* The roster at the host's latest launch (netcore-M3): memory first, then storage. Written only when it changed, rate limited like
+   * the launch itself, and never near the daily budget: normally one row per game start. */
+  async getRosterSnap() {
+    if (this.rosterMem === undefined) this.rosterMem = (await this.ctx.storage.get("launchroster")) || null;
+    return this.rosterMem;
+  }
+
+  async snapRoster() {
+    const seats = this.members().map((m) => ({ slot: m.slot, uid: m.pu || m.uid || "", spec: m.spec }));
+    this.rosterMem = { seats, at: Date.now() };
+    const sig = JSON.stringify(seats);
+    if (sig === this.rosterSig) return;
+    if (!gate(this.env, (p) => this.ctx.waitUntil(p)).relayFrames || !this.rosterWin.hit("w")) return;
+    this.rosterSig = sig;
+    try { await this.ctx.storage.put("launchroster", this.rosterMem); noteRows(1); } catch { /* rows exhausted: memory only */ }
   }
 
   /* Tell a socket its relayed frames are not being forwarded (at most every RELAY_NOTICE_MS), then report "dropped". */
@@ -363,7 +383,13 @@ export class HubRoom extends DurableObject {
     }
     if (url.pathname === "/roster" && request.method === "POST" && request.headers.get("x-rh-internal") === "1") {
       // Game rooms ask their lobby who sits where (netcore-M3). Read-only, memory only: no storage row.
-      return Response.json({ seats: this.members().map((m) => ({ slot: m.slot, uid: m.pu || m.uid || "", spec: m.spec })) });
+      // Live seats PLUS the roster the lobby had when its host last launched: a member whose lobby socket blipped is still a member.
+      const seats = this.members().map((m) => ({ slot: m.slot, uid: m.pu || m.uid || "", spec: m.spec }));
+      const snap = await this.getRosterSnap();
+      if (snap && Date.now() - snap.at < SMASH_LINK_TTL_MS) {
+        for (const o of snap.seats) if (!seats.some((x) => x.slot === o.slot && x.uid === o.uid && !!x.spec === !!o.spec)) seats.push(o);
+      }
+      return Response.json({ seats });
     }
     const room = (url.searchParams.get("room") || "").toUpperCase();
     const role = url.searchParams.get("role");
@@ -483,7 +509,7 @@ export class HubRoom extends DurableObject {
         if (msg.body === null || typeof msg.body !== "object") return;
         this.broadcast({ type: "msg", from: me.slot, body: msg.body }, ws);
         // The host's launch is kept for late spectators / drop-ins: storage is written once per changed launch (storeLaunch).
-        if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.storeLaunch(msg.body);
+        if (me.slot === 0 && msg.body.kind === "launch" && !me.game) { await this.storeLaunch(msg.body); await this.snapRoster(); }
         // The host starting a game: everyone present who proved their account becomes friends with each other.
         if (me.slot === 0 && msg.body.kind === "launch" && !me.game) await this.pairAll(true);
         break;
@@ -504,7 +530,7 @@ export class HubRoom extends DurableObject {
           try { ws.close(gated === "pending" ? 4012 : gated === "held" ? 4014 : 4010, reason); } catch { /* closed */ }
           return;
         }
-        const now = ws.deserializeAttachment();
+        let now = ws.deserializeAttachment();
         if (unreachable && now && typeof now.slot === "number" && now.slot >= 0 && !now.idok) { ws.serializeAttachment({ ...now, idok: true, idw: 0 }); return; }
         if (!ok || !now || typeof now.slot !== "number" || now.slot < 0 || now.uid || now.idok) return;
         // Game rooms (netcore-M3): the proven account must be a member of the lobby that started the game, with this slot. Anyone else
@@ -517,6 +543,8 @@ export class HubRoom extends DurableObject {
             try { ws.close(4015, verdict); } catch { /* closed */ }
             return;
           }
+          now = ws.deserializeAttachment();   // the await above let other frames in (an endpoint): merge into the CURRENT attachment
+          if (!now || typeof now.slot !== "number" || now.slot < 0 || now.uid || now.idok) return;
         }
         // Proof only (no pairing) for spectators, game-room seats and {nopair:true} idents (a client whose auto-friend is off still proves its
         // account). A second seat of an account already in the room (a second PC) is proof only too: one pairing per account, any number of seats.
@@ -527,7 +555,7 @@ export class HubRoom extends DurableObject {
       }
       case "endpoint": {
         const clean = (v) => (typeof v === "string" && v.length <= 64 && ENDPOINT_RE.test(v) ? v : "-");
-        ws.serializeAttachment({ ...me, endpoint: { public: clean(msg.public), local: clean(msg.local) } });   // keeps every other field (pu, di, lob, dr ...)
+        ws.serializeAttachment({ ...me, dr: false, endpoint: { public: clean(msg.public), local: clean(msg.local) } });   // keeps every other field (pu, di, lob ...); dr was always dropped here
         this.sendPeers();
         break;
       }

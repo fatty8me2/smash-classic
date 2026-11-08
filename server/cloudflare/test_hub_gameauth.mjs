@@ -51,6 +51,8 @@ const ld = seat(L, "join", { who: D, slot: 2 });
 const lo = seat(L, "join", { slot: 3 });
 await Promise.all([lb, ld, lo].map((s) => s.until(() => s.welcomed())));
 await sleep(1200);   // the idents are checked against the account hubs
+lh.ws.send(JSON.stringify({ type: "msg", body: { kind: "launch", game: "x" } }));   // the host starts a game: the lobby remembers who was in it
+await sleep(400);
 
 // a member joins fine
 const G1 = L + "-1";
@@ -104,6 +106,20 @@ await noProof.until(() => noProof.welcomed());
 check(await noProof.until(() => noProof.closed, 6000) && noProof.err() === "ident-required", "gameauth: a seat that never proves its account is closed ident-required");
 check(!gh4.closed, "gameauth: the proven host stays");
 
-[lh, lb, ld, lo, gh, gb, gh2, gd2, gh3, old, f3, gh4].forEach((s) => { try { s.ws.close(); } catch { /* closed */ } });
+// a lobby blip: B's LOBBY socket drops, then B rejoins the game room: still a member; a stranger still is not
+lb.ws.close();
+await sleep(500);
+const G5 = L + "-5";
+const gh5 = seat(G5, "host", { who: A });
+await gh5.until(() => gh5.welcomed());
+const gb5 = seat(G5, "join", { who: B, slot: 1, caps: "reasons,gameauth" });
+await gb5.until(() => gb5.welcomed());
+await sleep(1800);
+check(!gb5.closed && !gb5.err(), "lobby blip: B (lobby socket gone) rejoins the game room and stays");
+const gc5 = seat(G5, "join", { who: C, slot: 2 });
+await gc5.until(() => gc5.welcomed());
+check(await gc5.until(() => gc5.closed) && gc5.err() === "slot-not-yours", "lobby blip: a stranger still cannot take a member's slot");
+
+[lh, lb, ld, lo, gh, gb, gh2, gd2, gh3, old, f3, gh4, gh5, gb5].forEach((s) => { try { s.ws.close(); } catch { /* closed */ } });
 await sleep(200);
 process.exit(st.fails ? 1 : 0);
