@@ -1728,6 +1728,8 @@ export class UserHub extends DurableObject {
         p = this.profile();
       }
     }
+    // A deleted account answers "deleted" (4005) to anybody: that is what every PC of it should show, whatever secret it holds.
+    if (this.retiredTo() === p.uid) { ws.close(4005, "deleted"); return; }
     const cred = await this.credOk(msg.secret);
     if (!cred.ok) {
       ws.close(4003, "bad-secret");

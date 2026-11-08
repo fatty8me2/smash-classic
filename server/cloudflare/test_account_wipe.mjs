@@ -39,7 +39,7 @@ try {
   check((await api.status(acctOf(uid, b32(52)), dev1)).status === 401, "a wrong secret is still refused");
 
   const data = Buffer.from("save-data-" + b32(40));
-  const pushed = await api.push(A1, "gameA", [{ path: "a.sav", data, mtime: 1000 }], { dev: dev1 });
+  const pushed = await api.push(A1, "n64/smash-64", [{ path: "battery/ssb64.sra", data, mtime: 1000 }], { dev: dev1 });
   check(pushed.commit && pushed.commit.status === 200, "a save uploads with the PC's own secret");
 
   // PC 2 enrols from the shared secret, then PC 1 locks it out
@@ -80,7 +80,7 @@ try {
   const oth = new Pc(other.uid, other.secret, "pc-other-0001");
   await oth.connect();
   const od = devId();
-  const op = await api.push(acctOf(other.uid, other.secret), "gameB", [{ path: "b.sav", data: Buffer.from("other-" + b32(30)), mtime: 1000 }], { dev: od });
+  const op = await api.push(acctOf(other.uid, other.secret), "gba/pokemon", [{ path: "battery/b.sav", data: Buffer.from("other-" + b32(30)), mtime: 1000 }], { dev: od });
   check(!op.commit || op.commit.status === 200, "other accounts are unaffected (control)");
 } catch (e) { st.fails++; console.log("ERROR:", e); }
 finally { if (srv) srv.stop(); }
