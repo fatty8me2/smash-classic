@@ -713,7 +713,10 @@ phases.push(["H", async () => {
     const uploadsFlip = await acctDbg(api, S.uid);
     check(ok === 3 && uploadsFlip.acct.sw === 3 && uploadsFlip.acct.a_ops === 2, `3 flips between stored versions allowed and counted (sw ${uploadsFlip.acct.sw}), uploads stay 2`);
     const r6 = await put(Y, base);
-    check(r6.plan && r6.plan.status === 429 && r6.plan.data.error === "account-daily-limit", "the 4th flip of the day is refused at plan time (429 account-daily-limit)");
+    check(r6.plan && r6.plan.status === 200 && r6.plan.data.files[0].action === "skip" && r6.plan.data.files[0].reason === "switch-limit" && !r6.plan.data.ticket, "the 4th flip of the day is refused at plan time (skip, switch-limit), nothing is written");
+    const mixed = await api.push(S, G, [{ path: "battery/f.sav", data: Y, mtime: 1, base }, { path: "battery/new.sav", data: rnd(300), mtime: 1, base: 0 }], { dev });
+    const act = Object.fromEntries(mixed.plan.data.files.map((f) => [f.path, f.action + ":" + (f.reason || "")]));
+    check(mixed.plan.status === 200 && act["battery/f.sav"] === "skip:switch-limit" && act["battery/new.sav"] === "upload:" && mixed.commit && mixed.commit.data.results.some((r) => r.path === "battery/new.sav" && r.cloud === "synced"), "a plan mixing a refused flip and a real new upload: only the flip is refused, the upload goes through");
     const m = await manifestOf(api, S);
     const curV = m.games[G].files["battery/f.sav"].cur;
     const rs = await api.restore(S, G, "battery/f.sav", curV - 1, curV);

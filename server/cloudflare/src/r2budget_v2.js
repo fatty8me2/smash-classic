@@ -364,7 +364,7 @@ function opPlan(d, q, now) {
     (SELECT COUNT(*) FROM games g WHERE g.uid=? AND ${LIVE_GAME}) g,
     (SELECT COUNT(*) FROM games g WHERE g.uid=? AND g.gkey=? AND ${LIVE_GAME}) hg`, uid, uid, uid, nowS, uid, P.game, nowS)[0];
   const outs = P.files.map((f) => ({ path: f.path, f, cls: classifyPath(f.path, f.size) }));
-  let newPaths = 0;
+  let newPaths = 0, flipsPlanned = 0;
   const results = [], accepted = [], uploads = new Set();
   const evictable = largeItems(d, uid).filter((i) => i.game !== P.game).reduce((s, i) => s + i.stored, 0);
   let evictLeft = evictable, runUsed = a.vused, runProt = a.vprot, runLarge = a.vused - a.vprot;
@@ -393,6 +393,10 @@ function opPlan(d, q, now) {
     const refd = exists && liveRef(d, uid, rkey);
     const stored = exists ? row.size : f.stored;
     const added = refd || uploads.has(rkey) ? 0 : stored;   // bytes this file adds to the account
+    // A switch back to an already-stored version (no upload) uses the daily switch allowance. Only THOSE entries are refused when it
+    // is used up ("switch-limit"); real uploads in the same plan go through. The commit does not re-check the cap (the plan did), so
+    // two plans racing from one account can overshoot by a few; that is accepted, the cap is a runaway guard, not an exact meter.
+    if ((exists || uploads.has(rkey)) && cur && a.sw + flipsPlanned >= c.daySwitches) { Object.assign(res, { action: "skip", reason: "switch-limit" }); other++; continue; }
     if (prot) {
       let need = runUsed + added - c.accountCap;
       if (runProt + added > c.protCap || need > evictLeft) {
@@ -408,6 +412,7 @@ function opPlan(d, q, now) {
     runUsed += added; if (prot) runProt += added; else runLarge += added;
     const act = exists || uploads.has(rkey) ? "have" : "upload";
     if (act === "upload") uploads.add(rkey);
+    if (act === "have" && cur) flipsPlanned++;
     Object.assign(res, { action: act, sha: f.sha, stored, enc: rkey.endsWith(".z") ? "deflate" : "none" });
     accepted.push({ path: f.path, sha: f.sha, size: f.size, stored, enc: res.enc, mtime: f.mtime, cls: o.cls, base: f.base, rkey, st: act, flip: act === "have" && !!cur });
   }
@@ -415,8 +420,6 @@ function opPlan(d, q, now) {
   if (protSkips && !other && !accepted.length) return E(507, "too-big-protected", { files: results });
   if (!counts.hg && counts.g >= c.maxGames && accepted.length) return E(507, "too-many-files", { max: c.maxGames });
   if (counts.v + accepted.length > c.maxVers) return E(507, "too-many-files", { max: c.maxVers });
-  const flipN = accepted.filter((x) => x.flip).length;
-  if (flipN && a.sw + flipN > c.daySwitches) return E(429, "account-daily-limit", { retryAfter: secondsToUtcMidnight(now) });
   // global + per-account guards for the blobs that still have to travel
   const upN = uploads.size;
   if (upN) {
