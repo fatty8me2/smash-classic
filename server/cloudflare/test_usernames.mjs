@@ -75,10 +75,10 @@ class Client {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(`${WS}/friends?uid=${this.acct.uid}`);
       this.ws = ws;
-      ws.onopen = () => ws.send(JSON.stringify({ type: "hello", secret: this.acct.secret, name: this.acct.name, version: "t", ...helloExtra }));
+      ws.onopen = () => ws.send(JSON.stringify({ type: "hello", secret: this.acct.secret, name: this.acct.name, version: "t", dev: 1, pc: "pc-" + this.acct.uid.slice(0, 14), ...helloExtra }));
       ws.onmessage = (ev) => {
         const m = JSON.parse(ev.data);
-        if (m.type === "welcome") { this.welcome = m; resolve(m); }
+        if (m.type === "welcome") { if (m.device) this.acct.secret = m.device.secret; this.welcome = m; resolve(m); }
         this.msgs.push(m);
         this.waiters = this.waiters.filter((w) => { if (w.pred(m)) { w.res(m); return false; } return true; });
       };
