@@ -220,6 +220,20 @@ export async function linkFetch(request, env) {
     return json({ ok: true });
   }
 
+  if (url.pathname === "/link/recovery") {
+    // A fresh secret for a new account code (sealed into the code by the client, never stored in the clear): the code keeps working
+    // when any single PC is signed out. At most two are alive, so a code that could not be saved never kills the working one.
+    if (typeof body.uid !== "string" || !UID_RE.test(body.uid) || typeof body.secret !== "string") return json({ error: "auth" }, 403);
+    const res = await env.USER_HUBS.get(env.USER_HUBS.idFromName(body.uid)).fetch("https://userhub/i/recovery_mint", {
+      method: "POST", headers: { "x-rh-internal": "1", "content-type": "application/json" },
+      body: JSON.stringify({ uid: body.uid, secret: body.secret }),
+    });
+    const r = await res.json();
+    if (r.r === "rate") return json({ error: "rate-limited" }, 429);
+    if (r.r !== "ok") return authFail(r);
+    return json({ secret: r.secret });
+  }
+
   if (url.pathname === "/link/put") {
     const af = await authFull(env, body.uid, body.secret, false);
     if ((af.r || "none") !== "ok") return authFail(af);

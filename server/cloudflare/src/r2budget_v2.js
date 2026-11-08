@@ -26,6 +26,7 @@ export const MAX_BLOB = 16 * 1024 * 1024;
 const TICKET_SECS = 600;
 const B64_RE = /^[A-Za-z0-9+/]{1,4096}={0,2}$/;
 
+import { acctWipe } from "./acctwipe.js";
 const num = (v, d) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : d; };
 let curD = null;   // the DO instance serving the current (synchronous) op, so ok replies can carry its pending R2 deletes
 const J = (o) => {
@@ -806,6 +807,7 @@ function v2Switch(d, q, now) {
     case "v2_game": return opGame(d, q, now);
     case "v2_lease": return opLease(d, q, now);
     case "v2_del_done": return opDelDone(d, q, now);
+    case "v2_acct_wipe": return J(acctWipe(d, q, sec(now), markDead));   // account deletion (src/acctwipe.js): only the account's own UserHub sends it
     // test hooks (BUDGET_TEST=1 only; the Worker never forwards them otherwise)
     case "test_v2_active": d.q(`UPDATE accts SET active=? WHERE uid=?`, Number(q.active) || 0, q.uid); return J({ r: "ok" });
     case "test_v2_sweep": { const dels = []; idleSweep(d, cfg(d), sec(now), dels, true); return J({ r: "ok", dels }); }

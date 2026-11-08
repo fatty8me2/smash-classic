@@ -45,8 +45,23 @@ const INBOX_TTL = 30 * 24 * 3600 * 1000;
 const MAX_HISTORY = 200;
 // Rows-written estimate for the schema of a new account's hub (about 16 CREATE TABLE / INDEX statements): the SQL API reports 0
 // for them, the bill may not. Added once per registration to the REQ_BUDGET rows axis.
-const NEW_ACCOUNT_SCHEMA_ROWS = 20;
+const NEW_ACCOUNT_SCHEMA_ROWS = 22;
 const INVITE_TTL = 30 * 60 * 1000;
+// Per-PC credentials (docs/ACCOUNTS.md "Devices"). A device secret is just another valid account secret: every place that checks "the
+// secret" goes through UserHub.credOk(). At most MAX_DEVICES PCs per account (matches the "8 PCs" limit); a PC unseen this long may be
+// replaced by a new one when the account is full. `seen` is written at most every DEVICE_SEEN_MS per device (no per-message writes).
+export const MAX_DEVICES = 8;
+export const DEVICE_EVICT_MS = 30 * 24 * 3600 * 1000;
+export const DEVICE_SEEN_MS = 6 * 3600 * 1000;
+const MAX_RECOVERY = 2;          // the current account-code secret and the one before it (a failed re-code never kills the working code)
+const ROOT_SEEN_GAP_MS = 120 * 1000;
+const PC_RE = /^[A-Za-z0-9_-]{4,48}$/;
+const B32A = "abcdefghijklmnopqrstuvwxyz234567";
+function randomB32(n) {
+  const b = new Uint8Array(n);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => B32A[x & 31]).join("");
+}
 export const ONLINE_LEASE_MS = PRESENCE_LEASE_MS;   // 10 min (was 3): the refresh alarm fires every lease/3 (see reqbudget_core.js)
 // Friends' play time: per game key, coarse minutes, top PT_MAX_GAMES per user. Friends pull it (cached PT_STALE_MS per friend).
 export const PT_MAX_GAMES = 30;
@@ -462,6 +477,9 @@ export class UserHub extends DurableObject {
     q("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
     q("CREATE TABLE IF NOT EXISTS playtime (gkey TEXT PRIMARY KEY, title TEXT NOT NULL, mins INTEGER NOT NULL)");
     for (const col of ["pt TEXT", "pt_at INTEGER"]) { try { q("ALTER TABLE friends ADD COLUMN " + col); } catch { /* already there */ } }
+    // kind: 'd' = a PC's own credential, 'r' = an account-code (recovery) secret. Only the hash is stored.
+    q("CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, hash TEXT NOT NULL, kind TEXT NOT NULL, pc TEXT NOT NULL DEFAULT '', cdev TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, seen INTEGER NOT NULL)");
+    q("CREATE INDEX IF NOT EXISTS devices_hash ON devices (hash)");
     initGlib(this.sql);
   }
 
@@ -525,6 +543,102 @@ export class UserHub extends DurableObject {
       if (a && a.authed) out.push(ws);
     }
     return out;
+  }
+
+  // ---- per-PC credentials ---------------------------------------------------
+
+  rootGap() { return testsAllowed(this.env) && this.env.ROOT_GAP_MS !== undefined ? Number(this.env.ROOT_GAP_MS) : ROOT_SEEN_GAP_MS; }   // env: tests only
+  rootDead() { return this.kvGet("root_dead") === "1"; }
+
+  /* Is `secret` a valid credential for this account? -> {ok, kind: "root" | "d" | "r", dev, hash}. The legacy root secret (profile.secret_hash,
+   * kept so every PC that has not updated keeps working) is valid until the owner kills it with "sign out all other PCs". */
+  async credOk(secret) {
+    if (typeof secret !== "string" || secret.length < 16 || secret.length > 128) return { ok: false };
+    const p = this.profile();
+    if (!p) return { ok: false };
+    const hash = await sha256hex(secret);
+    if (p.secret_hash === hash && !this.rootDead()) return { ok: true, kind: "root", hash };
+    const d = this.one("SELECT id, kind FROM devices WHERE hash=?", hash);
+    if (d) return { ok: true, kind: d.kind, dev: d.id, hash };
+    return { ok: false };
+  }
+
+  /* Every key a cloud-save signature may have been made with (HMAC key = sha256hex of the secret). */
+  saveKeys() {
+    const p = this.profile();
+    const keys = this.all("SELECT hash FROM devices").map((r) => r.hash);
+    if (!this.rootDead()) keys.unshift(p.secret_hash);
+    return keys;
+  }
+
+  /* After the root secret was used: remember it (at most every 6 h, but always the first use after an enrolment) so a replace on one
+   * PC can tell whether a PC that has not updated is still on the account (retire_begin "shared"). */
+  noteRootUse() {
+    const t = now();
+    const last = Number(this.kvGet("root_last") || 0), mark = Number(this.kvGet("root_mark") || 0);
+    if (last <= mark + this.rootGap() || t - last > DEVICE_SEEN_MS) this.kvSet("root_last", String(t));
+  }
+
+  /* Is anybody besides the caller (credential `c`) still using this account? Conservative: when unsure, say yes (nothing is retired). */
+  sharedWithOthers(c) {
+    if (this.count("devices", "kind='d' AND id<>?", c.dev || "") > 0) return true;
+    if (c.kind === "d" && !this.rootDead()) {
+      const last = Number(this.kvGet("root_last") || 0), mark = Number(this.kvGet("root_mark") || 0);
+      return last > mark + this.rootGap();   // a PC that has not updated used the shared secret after this PC was enrolled
+    }
+    return false;
+  }
+
+  /* Give this PC its own credential. -> {secret, id} | {full: true}. A PC that already has a row (same pc id) gets a fresh secret in the
+   * same row, so a lost reply never leaves two rows for one PC. */
+  async enrollDevice(msg) {
+    const pc = typeof msg.pc === "string" && PC_RE.test(msg.pc) ? msg.pc : "";
+    const cdev = typeof msg.cdev === "string" && PC_RE.test(msg.cdev) ? msg.cdev : "";
+    const name = cleanName(msg.pc_name || "").slice(0, MAX_NAME);
+    const secret = randomB32(52);
+    const hash = await sha256hex(secret);
+    const t = now();
+    const mine = pc ? this.one("SELECT id FROM devices WHERE kind='d' AND pc=?", pc) : null;
+    if (mine) {
+      this.run("UPDATE devices SET hash=?, cdev=?, name=?, created=?, seen=? WHERE id=?", hash, cdev, name, t, t, mine.id);
+      this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('root_mark', ?)", String(t));
+      return { secret, id: mine.id };
+    }
+    if (this.count("devices", "kind='d'") >= MAX_DEVICES) {
+      const old = this.one("SELECT id FROM devices WHERE kind='d' AND seen < ? ORDER BY seen LIMIT 1", t - DEVICE_EVICT_MS);
+      if (!old) return { full: true };
+      this.run("DELETE FROM devices WHERE id=?", old.id);
+      this.closeDevice(old.id);
+    }
+    const id = randomB32(10);
+    this.run("INSERT INTO devices (id, hash, kind, pc, cdev, name, created, seen) VALUES (?, ?, 'd', ?, ?, ?, ?, ?)", id, hash, pc, cdev, name, t, t);
+    this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('root_mark', ?)", String(t));
+    return { secret, id };
+  }
+
+  /* Close every open socket that authenticated with device `id` (4003: the same close a wrong secret gets, so the PC shows "sign in again"). */
+  closeDevice(id, code = 4003, why = "revoked") {
+    for (const ws of this.ctx.getWebSockets()) {
+      let a = null;
+      try { a = ws.deserializeAttachment(); } catch { /* closed */ }
+      if (a && a.dev === id) {
+        try { ws.serializeAttachment({ ...a, authed: false }); } catch { /* closed */ }
+        try { ws.close(code, why); } catch { /* closed */ }
+      }
+    }
+  }
+
+  /* A recovery (account-code) secret for /link/keep. Two are kept so a code that could not be saved never kills the working one. */
+  async mintRecovery() {
+    const secret = randomB32(52);
+    const hash = await sha256hex(secret);
+    const t = now();
+    const id = "r" + randomB32(9);
+    this.run("INSERT INTO devices (id, hash, kind, pc, cdev, name, created, seen) VALUES (?, ?, 'r', '', '', '', ?, ?)", id, hash, t, t);
+    for (const r of this.all("SELECT id FROM devices WHERE kind='r' ORDER BY created DESC, rowid DESC LIMIT -1 OFFSET ?", MAX_RECOVERY)) {
+      this.run("DELETE FROM devices WHERE id=?", r.id);
+    }
+    return secret;
   }
 
   push(obj, except) {
@@ -718,6 +832,7 @@ export class UserHub extends DurableObject {
 
   async alarm() {
     meter(this.env, this.ctx, "alarm");
+    if (this.kvGet("deleting")) { await this.deleteStep(); return; }
     if (blockedStatus(this.gateLocal())) { await this.banSweepStep(); return; }   // a banned account has no presence to refresh
     if (this.reapStale()) {
       if (this.authedSockets().length === 0) { await this.setOnline(false); await this.broadcastPresence(false); return; }
@@ -986,6 +1101,46 @@ export class UserHub extends DurableObject {
     return false;
   }
 
+  /* One slice of a deleted account's clean-up: friend links (banSweepStep), then cloud saves through the budget DO. Re-arms itself. */
+  async deleteStep() {
+    try {
+      if (await this.banSweepStep()) return;
+      if (!(await this.wipeSavesStep())) {
+        this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('del_tries', ?)", String(Number(this.kvGet("del_tries") || 0) + 1));
+        if (Number(this.kvGet("del_tries")) < 40) { await this.ctx.storage.setAlarm(now() + 3000); noteRows(1); return; }
+      } else if (this.kvGet("del_more") === "1") {
+        this.run("DELETE FROM kv WHERE k='del_more'");
+        return;   // wipeSavesStep armed the next slice
+      }
+    } catch {
+      try { await this.ctx.storage.setAlarm(now() + 10000); noteRows(1); } catch { /* storage alarm unavailable */ }
+      return;
+    }
+    this.run("DELETE FROM kv WHERE k='deleting' OR k='del_tries'");
+    this.kvSet("deleted", "1");
+  }
+
+  /* Cloud saves of this uid: the budget DO marks the account's objects dead and hands back their keys; they are deleted with the
+   * ordinary R2 delete and confirmed with v2_del_done (the existing free delete path). 100 keys per slice. true = finished or
+   * more to do (del_more set); false = the budget DO could not be reached (retried a few times). */
+  async wipeSavesStep() {
+    if (!this.env.R2_BUDGET || !this.env.SAVES) return true;
+    const uid = this.profile().uid;
+    const r = await budget(this.env, { op: "v2_acct_wipe", uid, max: 100 });
+    if (r.r !== "ok") return false;
+    const dels = Array.isArray(r.dels) ? r.dels : [];
+    if (dels.length) {
+      await this.env.SAVES.delete(dels);
+      await budget(this.env, { op: "v2_del_done", rkeys: dels });
+    }
+    if (!r.done || dels.length) {
+      await this.ctx.storage.setAlarm(now() + 500); noteRows(1);
+      this.kvSet("del_more", "1");
+    }
+    return true;
+  }
+
+
   fsrcReady() {
     if (this._fsrc) return;
     this.run("CREATE TABLE IF NOT EXISTS fsrc (uid TEXT PRIMARY KEY, src TEXT NOT NULL, at INTEGER NOT NULL)");
@@ -1148,10 +1303,17 @@ export class UserHub extends DurableObject {
       case "retire_begin": {
         // Called by the successor identity's hub with this (old) account's secret: hand over everything
         // and become inert. Idempotent for the same successor.
-        if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
+        const cr = await this.credOk(b.secret);
+        if (!cr.ok) return { r: "bad-secret" };
         const to = this.retiredTo();
         if (to && to !== from) return { r: "gone" };
         if (from === p.uid) return { r: "none" };
+        // Another PC may still be on this account (an updated one with its own credential, or one that has not updated): do NOT
+        // retire it. The calling PC just leaves (its own credential is dropped); everybody else keeps working.
+        if (!to && this.sharedWithOthers(cr)) {
+          if (cr.kind === "d") { this.run("DELETE FROM devices WHERE id=?", cr.dev); this.closeDevice(cr.dev); }
+          return { r: "shared" };
+        }
         // Non-destructive: the snapshot stays in this account until the successor confirms (retire_done),
         // so a failure mid fan-out can simply be retried and resumes from the same snapshot.
         const friends = this.all("SELECT uid, name, status FROM friends").map((f) => ({ uid: f.uid, name: f.name, status: JSON.parse(f.status) }));
@@ -1171,7 +1333,7 @@ export class UserHub extends DurableObject {
       case "retire_done": {
         // The successor finished moving everything: only now is the snapshot dropped.
         if (this.retiredTo() !== from) return { r: "none" };
-        if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
+        if (!(await this.credOk(b.secret)).ok) return { r: "bad-secret" };
         this.run("DELETE FROM friends");
         this.run("DELETE FROM requests");
         this.run("DELETE FROM blocked");
@@ -1222,14 +1384,21 @@ export class UserHub extends DurableObject {
       }
       case "link_auth": {
         // Secret check for /link/* (see link.js). Optionally rate-limits link-code creation.
-        if (p.secret_hash !== (await sha256hex(String(b.secret ?? "")))) return { r: "bad-secret" };
+        if (!(await this.credOk(b.secret)).ok) return { r: "bad-secret" };
         if (gl !== "ok") return { r: "none", gate: gl };   // banned / waiting: links, saves and room identification are refused
         if (b.count && !this.hit(`link:${from}`, 5, 60 * 60 * 1000)) return { r: "rate" };
         // username: shown on the new PC ("Linking as NAME"); prev: the still-open code of this account, revoked when a new one is made.
         return { r: "ok", username: this.kvGet("username"), prev: b.count ? this.kvGet("last_link") : undefined, keep: this.kvGet("last_keep") || undefined };
       }
+      case "recovery_mint": {
+        // /link/recovery: a secret for a new account code. Needs any valid credential; limited like link codes.
+        if (!(await this.credOk(b.secret)).ok) return { r: "bad-secret" };
+        if (gl !== "ok") return { r: "none", gate: gl };
+        if (!this.hit("recov", 8, 60 * 60 * 1000)) return { r: "rate" };
+        return { r: "ok", secret: await this.mintRecovery() };
+      }
       case "link_set": {
-        if (b.secret && p.secret_hash !== (await sha256hex(String(b.secret)))) return { r: "bad-secret" };
+        if (b.secret && !(await this.credOk(b.secret)).ok) return { r: "bad-secret" };
         this.kvSet(b.kind === "keep" ? "last_keep" : "last_link", String(b.box || "").slice(0, 80));
         return { r: "ok" };
       }
@@ -1245,8 +1414,9 @@ export class UserHub extends DurableObject {
         // (forged / unsigned requests) can never use up a real player's per-minute allowance. The key never leaves this object.
         if (from !== p.uid) return { r: "none" };
         if (typeof b.msg !== "string" || typeof b.sig !== "string") return { r: "none" };
-        const want = await hmacHexKey(p.secret_hash, b.msg);
-        if (!safeEqStr(want, b.sig)) return { r: "badsig" };
+        let sigOk = false;
+        for (const k of this.saveKeys()) { if (safeEqStr(await hmacHexKey(k, b.msg), b.sig)) { sigOk = true; break; } }   // root + at most 8 devices + 2 account-code secrets
+        if (!sigOk) return { r: "badsig" };
         if (gl !== "ok") return { r: "gated", gate: gl };   // valid signature, but the account is banned / waiting: the Worker tells it why
         const w = !!b.write;
         const V2 = { pc: 30, put: 120, get: 300, meta: 60, att: 10 };   // v2 per-account per-minute limits (docs/CLOUD_SAVES_V2.md 3.6)
@@ -1549,7 +1719,8 @@ export class UserHub extends DurableObject {
         p = this.profile();
       }
     }
-    if (p.secret_hash !== hash) {
+    const cred = await this.credOk(msg.secret);
+    if (!cred.ok) {
       ws.close(4003, "bad-secret");
       return;
     }
@@ -1575,7 +1746,23 @@ export class UserHub extends DurableObject {
       renamed = true;
     }
     const wasOnline = this.authedSockets().length > 0;
-    ws.serializeAttachment({ uid, authed: true, status: { state: "online", updated: now() } });
+    // Per-PC credentials. A client that says dev:1 and is not on its own device secret gets one now (returned once in the welcome).
+    // The shared root secret keeps working for every PC that has not updated.
+    let device = null, devId = cred.kind === "d" ? cred.dev : undefined;
+    const pcOk = typeof msg.pc === "string" && PC_RE.test(msg.pc) ? msg.pc : "";
+    if (cred.kind === "root") this.noteRootUse();
+    if (msg.dev === 1) {
+      const row = cred.kind === "d" ? this.one("SELECT pc, cdev, seen FROM devices WHERE id=?", cred.dev) : null;
+      const otherPc = !!(row && pcOk && row.pc && row.pc !== pcOk);   // someone else's device secret (shared vault copy): this PC gets its own
+      if (cred.kind !== "d" || otherPc) {
+        device = await this.enrollDevice(msg);
+        if (device.id) devId = device.id;
+      } else if (row) {
+        const t = now(), cdev = typeof msg.cdev === "string" && PC_RE.test(msg.cdev) ? msg.cdev : row.cdev;
+        if (t - row.seen > DEVICE_SEEN_MS || cdev !== row.cdev) this.run("UPDATE devices SET seen=?, cdev=? WHERE id=?", t, cdev, cred.dev);
+      }
+    }
+    ws.serializeAttachment({ uid, authed: true, dc: msg.dev === 1 ? 1 : 0, ...(devId ? { dev: devId } : {}), status: { state: "online", updated: now() } });
     if (this.wantsTest(msg, name)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('is_test', '1')");
     if (typeof msg.auto_friend === "boolean") this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('auto_friend', ?)", msg.auto_friend ? "1" : "0");
     await this.autoLinkAdmin(p, gate.autofriend);
@@ -1597,6 +1784,8 @@ export class UserHub extends DurableObject {
     ws.send(JSON.stringify({
       type: "welcome",
       code: p.code,
+      ...(device && device.secret ? { device: { secret: device.secret } } : {}),
+      ...(device && device.full ? { device_full: true } : {}),
       ...(this.isAdminUid(p.uid) ? { admin: true } : {}),
       username: un.username || null,
       username_status: un.status,
@@ -1768,6 +1957,7 @@ export class UserHub extends DurableObject {
       }
       case "release_username": {
         // Give the name up (held for you 7 days so nobody can snipe it); you keep your display name until you pick a new one.
+        if (!this.hit("urel", 3, 24 * 3600 * 1000)) return this.err(ws, "rate-limited", type);
         const r = await this.dirU("release", { uid: p.uid, holdMs: this.env.UNAME_HOLD_MS });
         this.setUsernameLocal(null, "none");
         this.kvSet("uname_legacy_done", "1");
@@ -1775,20 +1965,71 @@ export class UserHub extends DurableObject {
         break;
       }
       case "delete_account": {
-        // Account deletion: the username is freed at once, friendships are removed and the uid can never connect again.
+        // Account deletion (irreversible). The client makes the person type their username / friend code; the server checks it too.
+        // Done in slices: this message does the cheap part at once (username freed, uid closed for good, devices gone, DMs erased)
+        // and an alarm removes friend links and cloud saves 25 / 100 at a time (the Free plan allows 50 subrequests per invocation).
         if (msg.confirm !== true) return this.err(ws, "bad-request", type, "confirm-required");
+        const typed = String(msg.typed ?? "").trim().toLowerCase();
+        const un = (this.kvGet("username") || "").toLowerCase();
+        if (!typed || (typed !== p.code.toLowerCase() && typed !== un)) return this.err(ws, "bad-request", type, "confirm-mismatch");
+        if (!this.hit("delacct", 5, 3600 * 1000)) return this.err(ws, "rate-limited", type);
         await this.dirU("release", { uid: p.uid, hold: false });
-        for (const f of this.all("SELECT uid FROM friends")) {
-          this.run("DELETE FROM friends WHERE uid=?", f.uid);
-          try { await this.call(f.uid, "friend_removed", { uid: p.uid }); } catch { /* peer unreachable */ }
-        }
-        this.run("DELETE FROM requests");
+        this.run("DELETE FROM history");
+        this.run("DELETE FROM inbox");
+        this.run("DELETE FROM blocked");
+        this.run("DELETE FROM playtime");
+        this.run("DELETE FROM devices");
         clearAllLib(this);
         this.setUsernameLocal(null, "none");
+        this.kvSet("root_dead", "1");
         this.kvSet("retired", p.uid);
+        this.kvSet("deleting", "1");
+        this.kvSet("ban_sweep", "1");   // friend links and requests are removed by the same sliced sweep a ban uses
         try { await this.setOnline(false); } catch { /* lease expires */ }
         this.push({ type: "account_deleted" });
         for (const s of this.ctx.getWebSockets()) { try { s.close(4005, "deleted"); } catch { /* closed */ } }
+        try { await this.ctx.storage.setAlarm(now() + 300); noteRows(1); } catch { /* storage alarm unavailable */ }
+        break;
+      }
+      case "devices": {   // the PCs signed in to this account (Settings > Account)
+        const rows = this.all("SELECT id, pc, cdev, name, created, seen FROM devices WHERE kind='d' ORDER BY created");
+        const last = Number(this.kvGet("root_last") || 0), mark = Number(this.kvGet("root_mark") || 0);
+        ws.send(JSON.stringify({
+          type: "devices", cap: MAX_DEVICES, current: att.dev || null,
+          devices: rows.map((r) => ({ id: r.id, pc: r.pc, cdev: r.cdev, name: r.name, created: r.created, seen: r.seen })),
+          legacy: !this.rootDead() && (last > mark + this.rootGap() || rows.length === 0),   // a PC that has not updated may still use the shared secret
+        }));
+        break;
+      }
+      case "revoke_device": {   // lock one PC out: its credential is deleted, its next connect is refused
+        if (!this.hit("revdev", 20, 3600 * 1000)) return this.err(ws, "rate-limited", type);
+        const id = typeof msg.id === "string" ? msg.id : "", cdev = typeof msg.cdev === "string" && PC_RE.test(msg.cdev) ? msg.cdev : "";
+        const row = id ? this.one("SELECT id FROM devices WHERE kind='d' AND id=?", id) : (cdev ? this.one("SELECT id FROM devices WHERE kind='d' AND cdev=?", cdev) : null);
+        if (!row) { ws.send(JSON.stringify({ type: "device_revoked", ok: false, reason: "not-found", cdev })); break; }
+        if (row.id === att.dev) { ws.send(JSON.stringify({ type: "device_revoked", ok: false, reason: "self", cdev })); break; }
+        this.run("DELETE FROM devices WHERE id=?", row.id);
+        this.closeDevice(row.id);
+        ws.send(JSON.stringify({ type: "device_revoked", ok: true, id: row.id, cdev }));
+        break;
+      }
+      case "revoke_others": {   // lock out every other PC and kill the shared secret and all old account codes (this PC must have its own credential)
+        if (!this.hit("revall", 5, 3600 * 1000)) return this.err(ws, "rate-limited", type);
+        if (!att.dev) { ws.send(JSON.stringify({ type: "others_revoked", ok: false, reason: "needs-device" })); break; }
+        const others = this.all("SELECT id FROM devices WHERE kind='d' AND id<>?", att.dev).map((r) => r.id);
+        this.run("DELETE FROM devices WHERE id<>?", att.dev);
+        this.kvSet("root_dead", "1");
+        for (const s of this.ctx.getWebSockets()) {
+          let a = null; try { a = s.deserializeAttachment(); } catch { /* closed */ }
+          if (!a || s === ws || a.dev === att.dev) continue;
+          try { s.serializeAttachment({ ...a, authed: false }); s.close(4003, "revoked"); } catch { /* closed */ }
+        }
+        ws.send(JSON.stringify({ type: "others_revoked", ok: true, count: others.length }));
+        break;
+      }
+      case "sign_out_device": {   // this PC leaves the account: its credential is deleted so a leftover copy of identity.json is dead
+        if (att.dev) this.run("DELETE FROM devices WHERE id=?", att.dev);
+        ws.send(JSON.stringify({ type: "signed_out", ok: true }));
+        if (att.dev) this.closeDevice(att.dev, 1000, "signed-out");
         break;
       }
       case "rename": {
@@ -1814,6 +2055,12 @@ export class UserHub extends DurableObject {
         const r = await this.call(old, "retire_begin", { uid: p.uid, secret: msg.secret });
         if (r.r === "gone") {
           // Another account already took over this identity: tell this one it is NOT the successor.
+          return this.err(ws, "bad-request", type, "retired-elsewhere");
+        }
+        if (r.r === "shared") {
+          // Other PCs still use that account: it stays as it is. Updated clients drop the pending retire; older ones get the
+          // existing terminal answer (so they stop resending), which says nothing is moved.
+          if (att.dc) { ws.send(JSON.stringify({ type: "retire_skipped", uid: old })); return; }
           return this.err(ws, "bad-request", type, "retired-elsewhere");
         }
         if (r.r === "bad-secret" || r.r === "none") {
