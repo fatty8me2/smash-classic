@@ -1,5 +1,5 @@
 // Node test: per-account per-DAY caps on direct messages, reactions and invites (server-F8). Caps are lowered with test-only vars.
-//   npx wrangler dev --ip 127.0.0.1 --port 8741 --var ALLOW_TEST_FLAG:1 --var DAYCAP_DAYMS:12000 --var DAYCAP_MSG:5 --var DAYCAP_REACT:3 --var DAYCAP_INVITE:2      (fresh --persist-to dir)
+//   npx wrangler dev --ip 127.0.0.1 --port 8741 --var ALLOW_TEST_FLAG:1 --var REG_APPROVAL_DEFAULT:0 --var TEST_REG:1 --var BUDGET_TEST:1 --var DAYCAP_DAYMS:12000 --var DAYCAP_MSG:5 --var DAYCAP_REACT:3 --var DAYCAP_INVITE:2      (fresh --persist-to dir)
 //   node test_friends_daycap.mjs [http://127.0.0.1:8741]
 // Throwaway accounts only; refuses anything but a 127.0.0.1/localhost server.
 import { randomBytes } from "node:crypto";
@@ -43,18 +43,18 @@ await befriend(A, B);
 await sleep(12000 - (Date.now() % 12000) + 50);
 
 // DMs: cap 5 per day. Spaced out of nothing: the per-minute limit (60) is far above, so only the day cap can answer here.
-for (let i = 0; i < 5; i++) A.send({ type: "msg", to: B.uid, text: "hi " + i });
+for (let i = 0; i < 5; i++) A.send({ type: "message", to: B.uid, text: "hi " + i });
 await sleep(600);
 check(limitedCount(A) === 0, "5 DMs (the day cap) all go through");
 check(B.msgs.filter((m) => m.type === "msg" && m.msg && m.msg.kind === "text").length === 5, "B received all 5");
-A.send({ type: "msg", to: B.uid, text: "one too many" });
+A.send({ type: "message", to: B.uid, text: "one too many" });
 check(await A.wait(() => limitedCount(A) === 1), "6th DM of the day -> the existing rate-limited error");
 const e = A.msgs.find((m) => m.type === "error" && m.reason === "rate-limited");
-check(!!e && e.type === "error" && e.reason === "rate-limited" && (e.ref === "msg" && e.detail === B.uid), "error uses the normal error shape (type error, reason rate-limited)");
+check(!!e && e.type === "error" && e.reason === "rate-limited" && (e.ref === "message" && e.detail === B.uid), "error uses the normal error shape (type error, reason rate-limited)");
 await sleep(300);
 check(B.msgs.filter((m) => m.type === "msg" && m.msg && m.msg.kind === "text").length === 5, "the 6th was not delivered");
 // the cap is per account: B can still talk
-B.send({ type: "msg", to: A.uid, text: "reply" });
+B.send({ type: "message", to: A.uid, text: "reply" });
 check(await A.wait(() => A.find("msg", (m) => m.msg && m.msg.text === "reply")), "the other account has its own day count");
 
 // Reactions: cap 3
@@ -82,10 +82,10 @@ check(limitedCount(A) >= 1, "...with the normal rate-limited error too");
 // Day rollover: the test "day" is 12 s long; after it ends the counters start again
 await sleep(12500);
 A.msgs.length = 0;
-for (let i = 0; i < 5; i++) A.send({ type: "msg", to: B.uid, text: "new day " + i });
+for (let i = 0; i < 5; i++) A.send({ type: "message", to: B.uid, text: "new day " + i });
 await sleep(600);
 check(limitedCount(A) === 0, "after the day rolls over, A can send again (5 more DMs)");
-A.send({ type: "msg", to: B.uid, text: "cap again" });
+A.send({ type: "message", to: B.uid, text: "cap again" });
 check(await A.wait(() => limitedCount(A) === 1), "...and the new day has its own cap");
 
 for (const c of [A, B]) c.ws.close();

@@ -1,4 +1,5 @@
 // Node test: invite_result per-target outcomes, accept of a vanished request (error + request_update), welcome presence lease.
+// Local vars (run_all_tests.mjs sets the same by default): --var REG_APPROVAL_DEFAULT:0 --var ALLOW_TEST_FLAG:1 --var TEST_REG:1 --var BUDGET_TEST:1
 // Run: npx wrangler dev --port 8731   (in BattleShip\server\cloudflare, local only), then:
 //   node test_friends_fixes.mjs [http://127.0.0.1:8731]
 // Throwaway accounts only; refuses anything but a 127.0.0.1/localhost server.

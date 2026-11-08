@@ -1,4 +1,5 @@
 // Junk frames before auth (SV-F2): a stranger who knows a uid (friends see it, the admin's is public) can open a socket for it.
+// Local vars (run_all_tests.mjs sets the same by default): --var REG_APPROVAL_DEFAULT:0 --var ALLOW_TEST_FLAG:1 --var TEST_REG:1 --var BUDGET_TEST:1
 // Unauthenticated frames must never spend the real owner's per-account message budget (300 a minute), parked sockets are
 // bounded, and a socket must say hello within a deadline. Needs a server started with --var HELLO_DEADLINE_MS:2000
 // (run_all_tests.mjs does this): node test_friends_preauth.mjs [ws://127.0.0.1:8773]
