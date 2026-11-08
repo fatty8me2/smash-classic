@@ -17,7 +17,11 @@ import {
   globalEvictions, leaseHeld, secondsToUtcMidnight, cleanKey, cleanGame, cleanDeviceName,
 } from "./saves_pool.js";
 
-export const SCHEMA = 2;
+// Version switches (a commit/restore that makes an already-stored blob current again, no upload) are not paid for by the PUT cap but
+// each one writes several rows, so they get their own generous per-account daily cap. The count lives in accts.sw and is added in the
+// accts UPDATE every commit/restore already does (no extra statement, no extra rows written); rollDay resets it.
+const DAY_SWITCHES = 600;
+export const SCHEMA = 3;   // 3: accts.sw (version switches today)
 export const MAX_BLOB = 16 * 1024 * 1024;
 const TICKET_SECS = 600;
 const B64_RE = /^[A-Za-z0-9+/]{1,4096}={0,2}$/;
@@ -51,7 +55,7 @@ export function initV2(d) {
   if (!cur || Number(cur.v) < SCHEMA) {      // migration tag: one-time column adds on the pre-v2 tables
     const add = (t, def) => { try { s.exec(`ALTER TABLE ${t} ADD COLUMN ${def}`); } catch { /* already there */ } };
     for (const c of ["vused INTEGER NOT NULL DEFAULT 0", "vprot INTEGER NOT NULL DEFAULT 0", "rev INTEGER NOT NULL DEFAULT 0", "day TEXT NOT NULL DEFAULT ''",
-      "a_ops INTEGER NOT NULL DEFAULT 0", "b_ops INTEGER NOT NULL DEFAULT 0", "v2 INTEGER NOT NULL DEFAULT 0", "active INTEGER NOT NULL DEFAULT 0"]) add("accts", c);
+      "a_ops INTEGER NOT NULL DEFAULT 0", "b_ops INTEGER NOT NULL DEFAULT 0", "sw INTEGER NOT NULL DEFAULT 0", "v2 INTEGER NOT NULL DEFAULT 0", "active INTEGER NOT NULL DEFAULT 0"]) add("accts", c);
     add("files", "dead INTEGER");
     s.exec(`INSERT INTO meta(k,v) VALUES('schema',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, String(SCHEMA));
   }
@@ -61,7 +65,7 @@ export function initV2(d) {
 export const cfg = (d) => ({
   accountCap: num(d.env.ACCOUNT_CAP, ACCOUNT_CAP), protCap: num(d.env.PROT_CAP, PROT_CAP),
   tight: num(d.env.POOL_TIGHT, POOL_TIGHT), full: num(d.env.POOL_FULL, POOL_FULL),
-  dayPuts: num(d.env.DAY_PUT_MAX, DAY_PUTS), dayGets: num(d.env.DAY_GET_MAX, DAY_GETS),
+  daySwitches: num(d.env.DAY_SWITCH_MAX, DAY_SWITCHES), dayPuts: num(d.env.DAY_PUT_MAX, DAY_PUTS), dayGets: num(d.env.DAY_GET_MAX, DAY_GETS),
   maxVers: num(d.env.MAX_VERS, 4000), maxPaths: num(d.env.MAX_PATHS, 600), maxGames: num(d.env.MAX_GAMES, 300),
 });
 const poolOf = (d, c) => {
@@ -77,7 +81,7 @@ export function getAcct(d, uid) {
   return a;
 }
 export function rollDay(d, a) {
-  if (a.day !== d.st.day) { d.q(`UPDATE accts SET day=?, a_ops=0, b_ops=0 WHERE uid=?`, d.st.day, a.uid); a.day = d.st.day; a.a_ops = 0; a.b_ops = 0; }
+  if (a.day !== d.st.day) { d.q(`UPDATE accts SET day=?, a_ops=0, b_ops=0, sw=0 WHERE uid=?`, d.st.day, a.uid); a.day = d.st.day; a.a_ops = 0; a.b_ops = 0; a.sw = 0; }
 }
 function liveRef(d, uid, rkey) { return d.q(`SELECT 1 FROM vers WHERE uid=? AND rkey=? AND state<>'evicted' LIMIT 1`, uid, rkey).length > 0; }
 function blobSize(d, rkey) { const r = d.q(`SELECT size FROM files WHERE rkey=?`, rkey)[0]; return r ? r.size : 0; }
@@ -405,12 +409,14 @@ function opPlan(d, q, now) {
     const act = exists || uploads.has(rkey) ? "have" : "upload";
     if (act === "upload") uploads.add(rkey);
     Object.assign(res, { action: act, sha: f.sha, stored, enc: rkey.endsWith(".z") ? "deflate" : "none" });
-    accepted.push({ path: f.path, sha: f.sha, size: f.size, stored, enc: res.enc, mtime: f.mtime, cls: o.cls, base: f.base, rkey, st: act });
+    accepted.push({ path: f.path, sha: f.sha, size: f.size, stored, enc: res.enc, mtime: f.mtime, cls: o.cls, base: f.base, rkey, st: act, flip: act === "have" && !!cur });
   }
   results.push(...P.files.map((f) => resMap.get(f.path)));
   if (protSkips && !other && !accepted.length) return E(507, "too-big-protected", { files: results });
   if (!counts.hg && counts.g >= c.maxGames && accepted.length) return E(507, "too-many-files", { max: c.maxGames });
   if (counts.v + accepted.length > c.maxVers) return E(507, "too-many-files", { max: c.maxVers });
+  const flipN = accepted.filter((x) => x.flip).length;
+  if (flipN && a.sw + flipN > c.daySwitches) return E(429, "account-daily-limit", { retryAfter: secondsToUtcMidnight(now) });
   // global + per-account guards for the blobs that still have to travel
   const upN = uploads.size;
   if (upN) {
@@ -466,7 +472,7 @@ function applyItem(d, uid, gkey, it, dev, nowS, keep, dels) {
   const rows = d.q(`SELECT ver,rkey,state FROM vers WHERE uid=? AND gkey=? AND path=? ORDER BY ver DESC`, uid, gkey, it.path);
   const ver = (rows[0] ? rows[0].ver : 0) + 1;
   const before = liveRef(d, uid, it.rkey);
-  d.q(`DELETE FROM vers WHERE uid=? AND gkey=? AND path=? AND state='evicted'`, uid, gkey, it.path);
+  if (rows.some((r) => r.state === "evicted")) d.q(`DELETE FROM vers WHERE uid=? AND gkey=? AND path=? AND state='evicted'`, uid, gkey, it.path);
   d.q(`UPDATE vers SET state='prev' WHERE uid=? AND gkey=? AND path=? AND state='cur'`, uid, gkey, it.path);
   d.q(`INSERT INTO vers(uid,gkey,path,ver,sha,size,stored,enc,mtime,dev,ts,class,rkey,state,prot) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'cur',?)`,
     uid, gkey, it.path, ver, it.sha, it.size, it.stored, it.enc, it.mtime, dev, nowS, it.cls, it.rkey, prot);
@@ -492,6 +498,7 @@ function opCommit(d, q, now) {
   if (body.done) return J({ r: "ok", ...body.done, replay: true });
   const gkey = body.game;
   let a = getAcct(d, uid);
+  rollDay(d, a);
   const names = devNames(d, uid);
   const dels = [], evicted = [], results = [];
   const items = [...body.items].sort((x, y) => {
@@ -499,7 +506,7 @@ function opCommit(d, q, now) {
     return px - py || y.mtime - x.mtime;
   });
   const rev = a.rev + 1;
-  let applied = 0;
+  let applied = 0, flips = 0;
   for (const it of items) {
     const cur = curRow(d, uid, gkey, it.path);
     if (cur && cur.state !== "evicted" && cur.sha === it.sha) { results.push({ path: it.path, ver: cur.ver, cloud: "synced", unchanged: true }); continue; }
@@ -533,7 +540,7 @@ function opCommit(d, q, now) {
         break;
       }
     }
-    if (done) { dels.push(...done.mine); applied++; results.push({ path: it.path, ver: done.ver, cloud: "synced" }); }
+    if (done) { dels.push(...done.mine); applied++; if (it.flip) flips++; results.push({ path: it.path, ver: done.ver, cloud: "synced" }); }
   }
   // enforcement: shrink this account's large pool to the pool state's cap, then global pressure
   a = getAcct(d, uid);
@@ -543,7 +550,7 @@ function opCommit(d, q, now) {
   if (pool.state === "full") globalPressure(d, c, uid, gkey, nowS, dels, rev);
   recomputeUsage(d, uid);
   touchGame(d, uid, gkey, rev, { played_at: Math.min(body.played, nowS + 86400), device: q.dev || "" });
-  if (applied || evicted.length) d.q(`UPDATE accts SET rev=?, active=? WHERE uid=?`, rev, nowS, uid);
+  if (applied || evicted.length) d.q(`UPDATE accts SET rev=?, active=?, sw=sw+? WHERE uid=?`, rev, nowS, flips, uid);
   else d.q(`UPDATE accts SET active=? WHERE uid=?`, nowS, uid);
   seen(d, uid, q.dev, nowS);
   gcOrphans(d, uid, nowS, dels);
@@ -660,12 +667,15 @@ function opRestore(d, q, now) {
   if ((cur ? cur.ver : 0) !== (b.base ?? 0)) return E(412, "conflict", { current: curEntry(cur, names) });
   const src = d.q(`SELECT * FROM vers WHERE uid=? AND gkey=? AND path=? AND ver=?`, uid, g, path, b.ver)[0];
   if (!src || src.state === "evicted" || !src.rkey) return E(404, "not-found");
+  if (cur && cur.ver === src.ver) return J({ r: "ok", rev: a.rev, ver: cur.ver, dels: [], unchanged: true });   // already the current version: nothing to write
+  rollDay(d, a);
+  if (a.sw + 1 > e.c.daySwitches) return E(429, "account-daily-limit", { retryAfter: secondsToUtcMidnight(now) });
   const dels = [];
   const rev = a.rev + 1;
   const it = { path, sha: src.sha, size: src.size, stored: src.stored, enc: src.enc, mtime: src.mtime, cls: src.class, rkey: src.rkey };
   d.ctx.storage.transactionSync(() => { applyItem(d, uid, g, it, q.dev || "", nowS, null, dels); });
   recomputeUsage(d, uid);
-  d.q(`UPDATE accts SET rev=? WHERE uid=?`, rev, uid);
+  d.q(`UPDATE accts SET rev=?, sw=sw+1 WHERE uid=?`, rev, uid);
   touchGame(d, uid, g, rev);
   const nv = curRow(d, uid, g, path);
   return J({ r: "ok", rev, ver: nv.ver, dels: outDels(d, uid, nowS, dels) });

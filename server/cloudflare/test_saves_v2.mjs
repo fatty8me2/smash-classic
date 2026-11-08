@@ -700,6 +700,29 @@ phases.push(["H", async () => {
     check(dbg.vers.length <= 4 + 2, `total vers rows stay bounded (live ${live} + tombstones ${tombs} = ${dbg.vers.length} <= 6)`);
     await blobsConsistent(api, S.uid, "after tombstone pruning");
   });
+  await withServer(BASE_PORT + 15, { DAY_SWITCH_MAX: "3" }, async (srv, api) => {
+    console.log("--- phase H4: version switches (flips with no upload) have a daily cap ---");
+    const S = await account(srv.BASE), dev = devId();
+    await api.device(S, dev, "PC-H4");
+    const X = rnd(400), Y = rnd(400), G = "n64/flip";
+    const put = (data, base) => api.push(S, G, [{ path: "battery/f.sav", data, mtime: 1, base }], { dev });
+    const r1 = await put(X, 0), r2 = await put(Y, 1);
+    check(r1.commit.status === 200 && r2.commit.status === 200, "two real uploads (X then Y) are not switches");
+    let base = 2, ok = 0;
+    for (const data of [X, Y, X]) { const r = await put(data, base); if (r.commit && r.commit.status === 200 && r.commit.data.results[0].cloud === "synced") { ok++; base++; } }
+    const uploadsFlip = await acctDbg(api, S.uid);
+    check(ok === 3 && uploadsFlip.acct.sw === 3 && uploadsFlip.acct.a_ops === 2, `3 flips between stored versions allowed and counted (sw ${uploadsFlip.acct.sw}), uploads stay 2`);
+    const r6 = await put(Y, base);
+    check(r6.plan && r6.plan.status === 429 && r6.plan.data.error === "account-daily-limit", "the 4th flip of the day is refused at plan time (429 account-daily-limit)");
+    const m = await manifestOf(api, S);
+    const curV = m.games[G].files["battery/f.sav"].cur;
+    const rs = await api.restore(S, G, "battery/f.sav", curV - 1, curV);
+    check(rs.status === 429, "a restore (also a switch) is refused too once the cap is used");
+    const same = await api.restore(S, G, "battery/f.sav", curV, curV);
+    check(same.status === 200 && same.data.unchanged === true, "restoring the version that is already current is a no-op (no writes, not counted)");
+    const other = await account(srv.BASE);
+    check((await api.push(other, G, [{ path: "battery/f.sav", data: X, mtime: 1, base: 0 }], {})).commit.status === 200, "another account is unaffected");
+  });
   await withServer(BASE_PORT + 13, { SAVES_RATE_META: "5", SAVES_BADAUTH_MAX: "30" }, async (srv, api) => {
     console.log("--- phase H2: forged requests vs the real account ---");
     const A = await account(srv.BASE);
