@@ -174,12 +174,26 @@ function largeItems(d, uid) {
   return d.q(`SELECT v.gkey game, v.path, v.class cls, v.mtime, v.stored, COALESCE(g.played_at,0) playedAt, COALESCE(g.pin,0) pin
     FROM vers v LEFT JOIN games g ON g.uid=v.uid AND g.gkey=v.gkey WHERE v.uid=? AND v.state='cur' AND v.prot=0 AND v.rkey IS NOT NULL`, uid);
 }
+// Tombstones are not counted by the path / version caps (they hold no data), so they get their own hard ceiling: when an eviction
+// pushes an account past MAX_TOMBS the OLDEST tombstones are deleted right then (amortised inside the eviction that made them, no
+// timer, no extra request). Total vers rows per account therefore stay <= maxVers + MAX_TOMBS.
+export const MAX_TOMBS = 400;
+function pruneTombstones(d, uid) {
+  const max = num(d.env.MAX_TOMBS, MAX_TOMBS);
+  const n = d.q(`SELECT COUNT(*) n FROM vers WHERE uid=? AND state='evicted'`, uid)[0].n;
+  if (n > max) {
+    d.q(`DELETE FROM vers WHERE rowid IN (SELECT rowid FROM vers WHERE uid=? AND state='evicted' ORDER BY ts ASC, rowid ASC LIMIT ?)`, uid, n - max);
+    // a game left with no versions at all, no pin and no running lease is dead weight too
+    d.q(`DELETE FROM games WHERE uid=? AND pin=0 AND lease_until<? AND NOT EXISTS (SELECT 1 FROM vers v WHERE v.uid=games.uid AND v.gkey=games.gkey)`, uid, Math.floor(Date.now() / 1000));
+  }
+}
 // Turn the newest row of a path into a tombstone ("evicted": bytes gone, row kept so the client knows why).
 function evictPath(d, uid, gkey, path, nowS, dels) {
   const rows = d.q(`SELECT ver,rkey FROM vers WHERE uid=? AND gkey=? AND path=? ORDER BY ver DESC`, uid, gkey, path);
   if (!rows.length) return 0;
   d.q(`DELETE FROM vers WHERE uid=? AND gkey=? AND path=? AND ver<>?`, uid, gkey, path, rows[0].ver);
   d.q(`UPDATE vers SET state='evicted', rkey=NULL WHERE uid=? AND gkey=? AND path=? AND ver=?`, uid, gkey, path, rows[0].ver);
+  pruneTombstones(d, uid);
   let freed = 0;
   for (const rk of new Set(rows.map((r) => r.rkey).filter(Boolean))) freed += freeIfUnref(d, uid, rk, nowS, dels);
   return freed;
@@ -324,6 +338,8 @@ function parsePlan(b) {
   return { game, played, files };
 }
 
+const LIVE_GAME = `(g.pin=1 OR g.lease_until>? OR EXISTS (SELECT 1 FROM vers v WHERE v.uid=g.uid AND v.gkey=g.gkey AND v.state<>'evicted'))`;
+
 function curRow(d, uid, gkey, path) {
   return d.q(`SELECT * FROM vers WHERE uid=? AND gkey=? AND path=? ORDER BY ver DESC LIMIT 1`, uid, gkey, path)[0] || null;
 }
@@ -337,8 +353,12 @@ function opPlan(d, q, now) {
   const names = devNames(d, uid);
   const pool = poolOf(d, c);
   const lcap = largeCap(pool.state, a.vprot, c.accountCap, pool.frac);
-  const counts = d.q(`SELECT (SELECT COUNT(*) FROM vers WHERE uid=?) v, (SELECT COUNT(DISTINCT gkey||'/'||path) FROM vers WHERE uid=?) p, (SELECT COUNT(*) FROM games WHERE uid=?) g,
-    (SELECT COUNT(*) FROM games WHERE uid=? AND gkey=?) hg`, uid, uid, uid, uid, P.game)[0];
+  // Caps count LIVE data only: an evicted path keeps a tombstone row (so the client can tell why it is gone) and its game keeps
+  // a games row, but neither may keep blocking new saves. A game counts while it has a live version, a pin or a running lease.
+  const counts = d.q(`SELECT (SELECT COUNT(*) FROM vers WHERE uid=? AND state<>'evicted') v,
+    (SELECT COUNT(DISTINCT gkey||'/'||path) FROM vers WHERE uid=? AND state<>'evicted') p,
+    (SELECT COUNT(*) FROM games g WHERE g.uid=? AND ${LIVE_GAME}) g,
+    (SELECT COUNT(*) FROM games g WHERE g.uid=? AND g.gkey=? AND ${LIVE_GAME}) hg`, uid, uid, uid, nowS, uid, P.game, nowS)[0];
   const outs = P.files.map((f) => ({ path: f.path, f, cls: classifyPath(f.path, f.size) }));
   let newPaths = 0;
   const results = [], accepted = [], uploads = new Set();
@@ -359,7 +379,7 @@ function opPlan(d, q, now) {
     if (cur && cur.state !== "evicted" && cur.sha === f.sha) { Object.assign(res, { action: "same", ver: cur.ver }); other++; continue; }
     if ((cur ? cur.ver : 0) !== f.base) { Object.assign(res, { action: "conflict", current: curEntry(cur, names) }); other++; continue; }
     if (f.stored > MAX_BLOB) { Object.assign(res, { action: "skip", reason: "too-large" }); other++; continue; }
-    if (!cur) {
+    if (!cur || cur.state === "evicted") {   // a tombstone is not a live path
       if (counts.p + newPaths >= c.maxPaths) { Object.assign(res, { action: "skip", reason: "too-many-files" }); other++; continue; }
       newPaths++;
     }
@@ -698,7 +718,9 @@ function opLease(d, q, now) {
     return J({ r: "ok", until: nowS + LEASE_SECS });
   }
   if (row && leaseHeld(row, q.dev, nowS) && !b.take) return E(423, "lease-held", { held: held(row) });
-  if (!row && d.q(`SELECT COUNT(*) n FROM games WHERE uid=?`, uid)[0].n >= c.maxGames) return E(507, "too-many-files", { max: c.maxGames });
+  // live games only (see opPlan); the raw row count has a hard ceiling so expired leases cannot pile up rows without end
+  if (!row && (d.q(`SELECT COUNT(*) n FROM games g WHERE g.uid=? AND ${LIVE_GAME}`, uid, nowS)[0].n >= c.maxGames
+    || d.q(`SELECT COUNT(*) n FROM games WHERE uid=?`, uid)[0].n >= c.maxGames * 4)) return E(507, "too-many-files", { max: c.maxGames });
   const rev = bumpRev(d, uid);
   d.q(`INSERT INTO games(uid,gkey,played_at,device,lease_dev,lease_since,lease_until,rev) VALUES(?,?,?,?,?,?,?,?)
     ON CONFLICT(uid,gkey) DO UPDATE SET lease_dev=excluded.lease_dev, lease_since=excluded.lease_since, lease_until=excluded.lease_until, played_at=MAX(played_at,excluded.played_at), device=excluded.device, rev=excluded.rev`,

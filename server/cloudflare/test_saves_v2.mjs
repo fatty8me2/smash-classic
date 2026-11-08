@@ -10,7 +10,7 @@ const { st, check } = makeChecker();
 const rnd = (n) => randomBytes(n);
 const nowS = () => Math.floor(Date.now() / 1000);
 const BASE_PORT = Number(process.env.SAVES_V2_PORT) || 10021;
-const want = process.argv.slice(2).filter((a) => /^[A-G]$/.test(a));
+const want = process.argv.slice(2).filter((a) => /^[A-H]$/.test(a));
 const phases = [];
 
 async function withServer(port, vars, fn, opts = {}) {
@@ -661,6 +661,61 @@ phases.push(["G", async () => withServer(BASE_PORT + 11, { DAILY_REQ_CAP: "10", 
   for (let i = 0; i < 4; i++) last = (await api.call(A, "GET", "/saves/v2/devices", { dev: d })).status;
   check(last === 429, "devices: over the saves cap of the daily budget -> 429 (not exempt like status)");
 })]);
+
+// H: caps count LIVE data (evicted tombstones / dead games no longer block new saves, saves-F16) + forged requests never rate-limit
+// the real account (server-F5)
+phases.push(["H", async () => {
+  await withServer(BASE_PORT + 12, { ACCOUNT_CAP: "100000", PROT_CAP: "30000", MAX_PATHS: "4", MAX_GAMES: "4" }, async (srv, api) => {
+    console.log("--- phase H1: path / game caps count live data only ---");
+    const S = await account(srv.BASE), dev = devId();
+    await api.device(S, dev, "PC-H");
+    const push = (game, path, size, played) => api.push(S, game, [{ path, data: rnd(size), mtime: played, base: 0 }], { dev, played });
+    for (let i = 1; i <= 3; i++) await push(`n64/h${i}`, "states/a.state", 30000, i * 100);
+    await push("n64/h4", "battery/b.sav", 500, 400);
+    const full = await push("n64/h5", "battery/c.sav", 500, 500);
+    check(full.plan.status === 507 || (full.plan.data.files && full.plan.data.files[0].reason === "too-many-files"), "at the caps (4 live paths, 4 games) a new game is still refused");
+    // update h3's state with new content: needs 30000 more -> evicts the least recently played h1 state (tombstone row stays)
+    const up = await api.push(S, "n64/h3", [{ path: "states/a.state", data: rnd(30000), mtime: 600, base: 1 }], { dev, played: 600 });
+    check(up.commit && up.commit.data.evicted.length === 1 && up.commit.data.evicted[0].game === "n64/h1", "an update evicts game h1's state (tombstone kept)");
+    const ok = await push("n64/h5", "battery/c.sav", 500, 700);
+    check(ok.commit && ok.commit.status === 200 && ok.commit.data.results[0].cloud === "synced", "after the eviction the dead path and dead game no longer count: new save accepted");
+    const m = await manifestOf(api, S);
+    check(files(m, "n64/h1")["states/a.state"].cloud === "evicted" && files(m, "n64/h5")["battery/c.sav"].cloud === "synced", "the tombstone is still reported, the new save is live");
+  });
+  await withServer(BASE_PORT + 14, { ACCOUNT_CAP: "100000", PROT_CAP: "30000", MAX_PATHS: "4", MAX_TOMBS: "2" }, async (srv, api) => {
+    console.log("--- phase H3: evicted versions past the old cap; tombstones stay bounded ---");
+    const S = await account(srv.BASE), dev = devId();
+    await api.device(S, dev, "PC-H3");
+    let accepted = 0;
+    for (let i = 1; i <= 9; i++) {   // each push past the third evicts an older state: 9 pushes, 6 evictions, far past the 4-path cap if tombstones counted
+      const r = await api.push(S, `n64/s${i}`, [{ path: "states/a.state", data: rnd(30000), mtime: i, base: 0 }], { dev, played: 100 * i });
+      if (r.commit && r.commit.status === 200 && r.commit.data.results[0].cloud === "synced") accepted++;
+    }
+    check(accepted === 9, `all 9 saves accepted although 6 paths were evicted (cap 4 live paths) (${accepted}/9)`);
+    const fin = await api.push(S, "n64/last", [{ path: "battery/b.sav", data: rnd(500), mtime: 1, base: 0 }], { dev, played: 5000 });
+    check(fin.commit && fin.commit.data.results[0].cloud === "synced", "a new battery save is still accepted");
+    const dbg = await acctDbg(api, S.uid);
+    const tombs = dbg.vers.filter((v) => v.state === "evicted").length, live = dbg.vers.filter((v) => v.state !== "evicted").length;
+    check(tombs <= 2, `tombstones pruned to the ceiling (MAX_TOMBS 2): ${tombs}`);
+    check(dbg.vers.length <= 4 + 2, `total vers rows stay bounded (live ${live} + tombstones ${tombs} = ${dbg.vers.length} <= 6)`);
+    await blobsConsistent(api, S.uid, "after tombstone pruning");
+  });
+  await withServer(BASE_PORT + 13, { SAVES_RATE_META: "5", SAVES_BADAUTH_MAX: "30" }, async (srv, api) => {
+    console.log("--- phase H2: forged requests vs the real account ---");
+    const A = await account(srv.BASE);
+    const ipX = { "CF-Connecting-IP": "203.0.113.7" }, ipY = { "CF-Connecting-IP": "198.51.100.9" };
+    for (let i = 0; i < 20; i++) await api.call(A, "GET", "/saves/v2/manifest", { badSig: true, headers: ipX });
+    const r = await api.call(A, "GET", "/saves/v2/manifest", { headers: ipY });
+    check(r.status === 200, "after a flood of forged requests for A (from IP X), A's own request from IP Y still succeeds");
+    let limited = false;
+    for (let i = 0; i < 40 && !limited; i++) { const x = await api.call(A, "GET", "/saves/v2/manifest", { badSig: true, headers: ipX }); if (x.status === 429) limited = true; }
+    check(limited, "failed-auth requests from IP X are limited per IP (429 once past the bad-auth cap)");
+    let ok = 0;
+    for (let i = 0; i < 4; i++) if ((await api.call(A, "GET", "/saves/v2/manifest", { headers: ipY })).status === 200) ok++;
+    check(ok === 4, "A's per-account limiter was untouched by the flood: 5 valid requests from IP Y in all (limit 5/min) succeed");
+    check((await api.call(A, "GET", "/saves/v2/manifest", { headers: ipY })).status === 429, "...and the 6th valid one hits A's own limit (so the limiter really is per account)");
+  });
+}]);
 
 for (const [name, fn] of phases) if (!want.length || want.includes(name)) await fn();
 console.log(st.fails ? `${st.fails} FAILED` : "ALL PASSED");
