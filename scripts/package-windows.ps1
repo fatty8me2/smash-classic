@@ -51,6 +51,8 @@ param(
     # package then stamps BattleShip.exe with THAT version instead of the new one, so it is byte-identical to the earlier release's exe.
     [switch]$HubOnlyRelease,
     [string]$SmashSince = "",
+    # Local copy of that earlier release's BattleShip-windows.zip to compare against (default: downloaded read-only with `gh release download`).
+    [string]$SmashSinceZip = "",
     # Local dev / QA packages only: skip signing SHA256SUMS.txt. Updaters that check signatures refuse an unsigned release, so never publish one.
     [switch]$Unsigned
 )
@@ -98,9 +100,11 @@ $Jobs = if ($env:NUMBER_OF_PROCESSORS) { [int]$env:NUMBER_OF_PROCESSORS } else {
 # Show-Timings prints the table (also written to <DistDir>\package-timings.txt) at the end or on failure.
 $HubOnlyRequested = $HubOnlyRelease -or ($env:RETROHUB_HUB_ONLY -eq "1")
 if (-not $SmashSince -and $env:RETROHUB_SMASH_SINCE) { $SmashSince = $env:RETROHUB_SMASH_SINCE }
-if ($HubOnlyRequested -and $SmashSince -notmatch '^v?\d+(\.\d+)*$') {
+if ($HubOnlyRequested -and $SmashSince -notmatch '^[vV]?\d+(\.\d+)*$') {
     Write-Error "-HubOnlyRelease needs -SmashSince <version> (the release whose Smash Classic files this one reuses, e.g. v1.39.0)"; exit 1
 }
+# The real exes carry the "v"-prefixed tag ("v1.39.0"), so stamp and compare in that form whatever was typed.
+if ($HubOnlyRequested) { $SmashSince = "v" + $SmashSince.TrimStart('v', 'V') }
 $script:StepLog = New-Object System.Collections.ArrayList
 $script:StepName = $null
 $script:StepStart = 0.0
@@ -303,6 +307,38 @@ New-Item -ItemType Directory -Path (Join-Path $StageDir "yamls\$Ver") | Out-Null
 Copy-Item $GameExe        (Join-Path $StageDir "$AppName.exe")
 # A hub-only release keeps Smash Classic exactly as it was at -SmashSince, so its exe carries THAT version stamp (see -HubOnlyRelease).
 Set-ExeVersion (Join-Path $StageDir "$AppName.exe") $(if ($HubOnlyRequested) { $SmashSince } else { (Get-Content (Join-Path $Root "VERSION") -Raw).Trim() })
+if ($HubOnlyRequested) {
+    # Prove the stamped exe is byte-identical to the BattleShip.exe in $SmashSince's published BattleShip-windows.zip. If it is not, no
+    # installed copy would ever match this release's marker and the hub-only update could silently never fire: stop instead. (Read-only: nothing is published.)
+    Write-Step "Checking BattleShip.exe against $SmashSince"
+    $RefZip = $SmashSinceZip
+    $RefTmp = $null
+    if (-not $RefZip) {
+        $RefTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("smash-since-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $RefTmp | Out-Null
+        & gh release download $SmashSince -R fatty8me2/retrohub -p "BattleShip-windows.zip" -D $RefTmp
+        if ($LASTEXITCODE -ne 0) { Remove-Item -Recurse -Force $RefTmp -ErrorAction SilentlyContinue; Fail "could not download $SmashSince's BattleShip-windows.zip with gh (pass -SmashSinceZip <local copy> instead)" }
+        $RefZip = Join-Path $RefTmp "BattleShip-windows.zip"
+    }
+    if (-not (Test-Path -LiteralPath $RefZip)) { Fail "-SmashSinceZip $RefZip not found" }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $RefHash = $null
+    $RefArchive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $RefZip).Path)
+    try {
+        $RefEntry = $RefArchive.GetEntry("$AppName.exe")
+        if ($RefEntry) {
+            $RefStream = $RefEntry.Open()
+            try { $RefHash = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($RefStream)) -replace '-', '').ToLower() } finally { $RefStream.Dispose() }
+        }
+    } finally { $RefArchive.Dispose() }
+    if ($RefTmp) { Remove-Item -Recurse -Force $RefTmp -ErrorAction SilentlyContinue }
+    if (-not $RefHash) { Fail "$AppName.exe not found inside the $SmashSince zip" }
+    $NewHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $StageDir "$AppName.exe")).Hash.ToLower()
+    if ($NewHash -ne $RefHash) {
+        Fail "this package's $AppName.exe ($NewHash) is not byte-identical to $SmashSince's ($RefHash). A hub-only release would never match any installed copy. Smash Classic's build inputs changed since ${SmashSince}: ship a full release (no -HubOnlyRelease), or use the right -SmashSince."
+    }
+    Write-Host "BattleShip.exe matches $SmashSince byte for byte ($NewHash)" -ForegroundColor Green
+}
 Copy-Item $TorchExe      (Join-Path $StageDir "torch.exe")
 Copy-Item $F3DO2R        (Join-Path $StageDir "f3d.o2r")
 Copy-Item (Join-Path $Root "gamecontrollerdb.txt") $StageDir
