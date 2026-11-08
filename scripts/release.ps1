@@ -1,27 +1,32 @@
-# One command for a whole Smash Classic / RetroHub release.
+# One command for a whole RetroHub release.
 #
-#   .\scripts\release.ps1 -Version 1.27.3                 # bump, package (fast path), commit, push, publish both GitHub releases
-#   .\scripts\release.ps1 -Version 1.27.3 -DryRun         # everything except commit/push/release/deploy (scratch output dir)
-#   .\scripts\release.ps1 -Version 1.27.3 -DeployWorker   # also `wrangler deploy` the netplay Worker before the releases
+#   .\scripts\release.ps1 -Version 1.27.3                 # bump, build+test, package, DRAFT release, verify, push, publish
+#   .\scripts\release.ps1 -Version 1.27.3 -DryRun         # everything except push/release/deploy (scratch output dir, simulated GitHub)
+#   .\scripts\release.ps1 -Version 1.27.3 -DeployWorker   # also `wrangler deploy` the netplay Worker (just before publishing)
 #   .\scripts\release.ps1 -Version 1.27.3 -Notes notes.md # custom release notes (file path or literal text)
+#   .\scripts\release.ps1 -Version 1.27.3 -AlsoSmashClassic  # RARE: also publish to fatty8me2/smash-classic (Smash Classic's own releases)
 #
-# Steps:
-#   1. Preflight: version format, changelog entry exists, gh authenticated, repos on the expected branches
-#      and clean (apart from VERSION), local branches fast-forward of their remotes.
+# Releases go to fatty8me2/retrohub ONLY (the updater reads that repo since v1.27.3). smash-classic only gets
+# Smash Classic's own releases, via -AlsoSmashClassic.
+#
+# Order (nothing public changes until the last step; every failure prints the exact state and the undo commands):
+#   1. Preflight: version format, changelog entry, gh auth, branches clean and fast-forward, no existing release/draft.
 #   2. Bump BattleShip\VERSION and RetroHub\VERSION to vX.Y.Z.
-#   3. scripts\package-windows.ps1 (fast path: unchanged BattleShip is not rebuilt, only shipped RetroHub
-#      targets are built, fast zip/installer compression) -> BattleShip-windows.zip, RetroHub-Setup.exe, SHA256SUMS.txt.
-#   4. Commit VERSION in both repos ("vX.Y.Z").
-#   5. Push: decomp  fatty HEAD:smash-classic ; BattleShip  fatty rollback-synctest:main ; RetroHub  origin main.
-#   6. (-DeployWorker) deploy the Cloudflare Worker.
-#   7. gh release create vX.Y.Z on fatty8me2/smash-classic and fatty8me2/retrohub (--latest) with the same three
-#      assets and the notes from RetroHub\scripts\release_notes.ps1 (newest data\changelog.json entry for that version).
+#   3. TEST GATE: build RetroHub, then `ctest -LE online` with RETROHUB_QA=1. Failure stops here (nothing packaged).
+#   4. scripts\package-windows.ps1 -> assets + SHA256SUMS.txt. SHA256SUMS must be non-empty, well formed, list the required
+#      assets, and match the files. Every file it names (plus SHA256SUMS.txt and its REQUIRED .sig, verified with openssl against the release public key) is uploaded.
+#   5. Commit VERSION in both repos, tag the RetroHub commit locally.
+#   6. Create the GitHub release as a DRAFT with all assets, then download every asset back and verify its SHA-256.
+#   7. Push RetroHub main + the tag, then decomp, then the BattleShip VERSION commit.
+#   8. (-DeployWorker) deploy the Worker.
+#   9. Publish the draft (retrohub as --latest).
 #
-# -DryRun never commits, pushes, deploys or creates releases; it restores both VERSION files afterwards and writes the
-# assets to a scratch directory so the real dist\ folder is left alone.
+# -DryRun never commits, pushes, deploys or touches GitHub: those calls are simulated against a scratch folder (so the
+# download-back verification still runs). It restores both VERSION files afterwards.
+# Test hooks: -CmakeBin <dir with cmake/ctest>, env RELEASE_DRYRUN_FAULT = "corrupt:<asset>" | "drop:<asset>" (dry run only).
 [CmdletBinding()]
 param(
-    [switch]$AlsoSmashClassic,       # also publish to fatty8me2/smash-classic (only for Smash Classic releases; RetroHub updates come from retrohub since v1.27.3)
+    [switch]$AlsoSmashClassic,       # RARE: also publish to fatty8me2/smash-classic (only for Smash Classic's own releases)
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$Notes = "",                 # release notes: path to a .md file, or literal Markdown. Default: changelog.json entry.
     [switch]$DryRun,
@@ -30,9 +35,14 @@ param(
     [string]$RetroHubDir = "",           # default: sibling ..\RetroHub
     [string]$BattleShipBranch = "rollback-synctest",
     [string]$RetroHubBranch = "main",    # branch pushed to RetroHub origin
-    [switch]$AllowDirty,                 # permit uncommitted changes other than VERSION (they are packaged but NOT committed)
-    [switch]$ForceBattleShip,            # passed to package-windows.ps1
-    [switch]$SkipPackage                 # reuse assets already in OutDir (e.g. after a failed push); still bumps/commits/pushes
+    [string]$CmakeBin = "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin",
+    [string]$OpenSsl = "C:\Program Files\Git\usr\bin\openssl.exe",
+    [string]$SigPubKey = "C:\Users\fatty\.retrohub-release\release-signing-pub.pem",   # PUBLIC key only; this script never touches the private key
+    [switch]$AllowDirty,              # permit uncommitted changes other than VERSION (they are packaged but NOT committed)
+    [switch]$HubOnlyRelease,             # passed to package-windows.ps1: Smash Classic's files are unchanged since -SmashSince
+    [string]$SmashSince = "",            # passed to package-windows.ps1 (required with -HubOnlyRelease), e.g. v1.39.0
+    [switch]$ForceBattleShip,          # passed to package-windows.ps1
+    [switch]$SkipPackage                 # reuse assets already in OutDir; the test gate still runs
 )
 $ErrorActionPreference = "Continue"   # native tools write progress to stderr; every call checks $LASTEXITCODE explicitly
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -44,15 +54,146 @@ $Tag = "v" + $Version.TrimStart('v', 'V')
 $Bare = $Tag.Substring(1)
 $BsRepo = "fatty8me2/smash-classic"
 $HubRepo = "fatty8me2/retrohub"
+$RequiredAssets = @("RetroHub-Setup.exe", "BattleShip-windows.zip", "SHA256SUMS.txt", "SHA256SUMS.txt.sig")
+
+$script:bumped = $false
+$script:committed = $false
+$script:done = New-Object System.Collections.ArrayList     # human-readable list of completed steps
+$script:undo = New-Object System.Collections.ArrayList      # commands that undo them (in the order to run)
+$script:remote = ""                                         # dry-run simulated GitHub store
 
 function Step($m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
-function Die($m) { Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
+$script:origVersion = @{}   # path -> original bytes (or $null if the file did not exist), saved before the bump
+function Restore-Versions {   # writes the saved bytes back, so an uncommitted VERSION edit survives
+    foreach ($p in @($script:origVersion.Keys)) {
+        if ($null -eq $script:origVersion[$p]) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+        else { [System.IO.File]::WriteAllBytes($p, [byte[]]$script:origVersion[$p]) }
+    }
+}
+function Die($m) {
+    Write-Host "ERROR: $m" -ForegroundColor Red
+    if ($script:bumped -and -not $script:committed) { Restore-Versions; Write-Host "(VERSION files restored; nothing was committed)" -ForegroundColor Yellow }
+    if ($script:done.Count -gt 0) {
+        Write-Host "`nState at failure (completed steps):" -ForegroundColor Yellow
+        $script:done | ForEach-Object { Write-Host "   - $_" }
+        Write-Host "Nothing is published as Latest unless the last line above says 'published'." -ForegroundColor Yellow
+    }
+    if ($script:undo.Count -gt 0) {
+        Write-Host "`nTo undo (run in this order), or fix the problem and finish by hand:" -ForegroundColor Yellow
+        $script:undo | ForEach-Object { Write-Host "   $_" }
+    }
+    exit 1
+}
 function Run([string]$what, [scriptblock]$b) {
     if ($DryRun) { Write-Host "[dry-run] would: $what" -ForegroundColor Yellow } else { Write-Host "> $what"; & $b; if ($LASTEXITCODE -ne 0) { Die "$what failed (exit $LASTEXITCODE)" } }
 }
 function GitC($repo) { $a = @($args); $ErrorActionPreference = "Continue"; $o = & git -C $repo @a 2>&1; if ($LASTEXITCODE -ne 0) { Die "git -C $repo $($a -join ' ') failed: $o" }; return ($o | Out-String).Trim() }
+function Sha($p) { return (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLower() }
+
+# ── SHA256SUMS: strict parse + verify. Returns ordered name->hash for every file to upload. ──
+function Get-ExpectedAssets([string]$dist) {
+    $f = Join-Path $dist "SHA256SUMS.txt"
+    if (-not (Test-Path -LiteralPath $f)) { throw "SHA256SUMS.txt is missing from $dist" }
+    $map = [ordered]@{}
+    foreach ($line in (Get-Content -LiteralPath $f)) {
+        if (-not $line.Trim()) { continue }
+        if ($line.TrimStart().StartsWith('#')) { continue }   # signed marker comment (e.g. "# retrohub-only smash-sha256 <hash> smash-since vX.Y.Z"); covered by the .sig
+        if ($line -notmatch '^([0-9a-fA-F]{64}) [ *](.+?)\s*$') { throw "SHA256SUMS.txt has a malformed line: '$line'" }
+        $n = $Matches[2]
+        if ($n -match '[\\/]' -or $n -like "SHA256SUMS.txt*") { throw "SHA256SUMS.txt names an unexpected file: '$n'" }
+        $map[$n] = $Matches[1].ToLower()
+    }
+    if ($map.Count -eq 0) { throw "SHA256SUMS.txt is empty" }
+    foreach ($req in $RequiredAssets) { if ($req -ne "SHA256SUMS.txt" -and $req -ne "SHA256SUMS.txt.sig" -and -not $map.Contains($req)) { throw "SHA256SUMS.txt does not list required asset $req" } }
+    foreach ($n in @($map.Keys)) {
+        $p = Join-Path $dist $n
+        if (-not (Test-Path -LiteralPath $p)) { throw "SHA256SUMS.txt lists $n but the file is missing from $dist" }
+        if ((Sha $p) -ne $map[$n]) { throw "SHA256SUMS mismatch for $n" }
+    }
+    # Signed releases: updated clients refuse unsigned updates, so the .sig is REQUIRED and must verify.
+    $sig = Join-Path $dist "SHA256SUMS.txt.sig"
+    if (-not (Test-Path -LiteralPath $sig)) { throw "SHA256SUMS.txt.sig is missing (releases must be signed; run package-windows.ps1 with the signing key available)" }
+    if ((Get-Item -LiteralPath $sig).Length -eq 0) { throw "SHA256SUMS.txt.sig is empty" }
+    if (-not (Test-Path -LiteralPath $OpenSsl)) { throw "openssl not found at $OpenSsl (needed to verify the signature)" }
+    if (-not (Test-Path -LiteralPath $SigPubKey)) { throw "release signing public key not found at $SigPubKey" }
+    $vo = & $OpenSsl dgst -sha256 -verify $SigPubKey -signature $sig $f 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $vo -notmatch 'Verified OK') { throw "SHA256SUMS.txt.sig does NOT verify against $SigPubKey : $($vo.Trim())" }
+    Write-Host "SHA256SUMS.txt.sig verified OK"
+    $map["SHA256SUMS.txt"] = Sha $f
+    $map["SHA256SUMS.txt.sig"] = Sha $sig
+    return $map
+}
+
+# ── GitHub helpers. Reads are real even in a dry run; every mutation is simulated there. ──
+function Find-Release([string]$repo) {   # returns release id (drafts included) or $null
+    # No double quotes inside --jq (Windows PowerShell 5.1 strips them from native args): filter by tag here instead.
+    $o = & gh api "repos/$repo/releases?per_page=100" --paginate --jq '.[] | [.id, .tag_name] | @tsv' 2>&1
+    if ($LASTEXITCODE -ne 0) { Die "could not list releases of $repo : $o" }
+    foreach ($l in @($o)) { $p = "$l" -split "`t"; if ($p.Count -ge 2 -and $p[1] -eq $Tag) { return $p[0] } }
+    return $null
+}
+function New-DraftRelease([string]$repo, [string[]]$files) {
+    if ($DryRun) {
+        $d = Join-Path $script:remote ($repo -replace '/', '_'); New-Item -ItemType Directory -Force $d | Out-Null
+        $fault = [string]$env:RELEASE_DRYRUN_FAULT
+        foreach ($f in $files) {
+            $n = Split-Path $f -Leaf
+            if ($fault -eq "drop:$n") { Write-Host "[dry-run] FAULT: dropping $n" -ForegroundColor Yellow; continue }
+            Copy-Item -LiteralPath $f -Destination (Join-Path $d $n) -Force
+            if ($fault -eq "corrupt:$n") { Add-Content -LiteralPath (Join-Path $d $n) -Value ([byte[]]@(120)) -Encoding Byte; Write-Host "[dry-run] FAULT: corrupting $n" -ForegroundColor Yellow }
+        }
+        Write-Host "[dry-run] would: gh release create $Tag -R $repo --draft --target main --title $Tag -F $NotesFile <$($files.Count) assets>" -ForegroundColor Yellow
+        return "DRY-$($repo -replace '/', '_')"
+    }
+    & gh release create $Tag @files -R $repo --draft --target main --title $Tag -F $NotesFile
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return (Find-Release $repo)
+}
+function Get-RemoteAssets([string]$repo, [string]$id) {   # -> @{ name = @{id=..; size=..} }
+    $m = @{}
+    if ($DryRun) {
+        $d = Join-Path $script:remote ($repo -replace '/', '_')
+        Get-ChildItem -LiteralPath $d -File | ForEach-Object { $m[$_.Name] = @{ id = $_.Name; size = $_.Length } }
+        return $m
+    }
+    $o = & gh api "repos/$repo/releases/$id" --jq '.assets[] | [.id, .name, .size] | @tsv' 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "could not list assets of the draft on $repo : $o" }
+    foreach ($l in @($o)) { $p = "$l" -split "`t"; if ($p.Count -ge 3) { $m[$p[1]] = @{ id = $p[0]; size = [int64]$p[2] } } }
+    return $m
+}
+function Save-RemoteAsset([string]$repo, $asset, [string]$name, [string]$dest) {
+    if ($DryRun) { Copy-Item -LiteralPath (Join-Path (Join-Path $script:remote ($repo -replace '/', '_')) $name) -Destination $dest -Force; return }
+    $cmd = "gh api -H `"Accept: application/octet-stream`" repos/$repo/releases/assets/$($asset.id) > `"$dest`""
+    & cmd /c $cmd
+    if ($LASTEXITCODE -ne 0) { throw "download of $name from $repo failed" }
+}
+function Confirm-Remote([string]$repo, [string]$id, $expected) {
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("release-verify-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force $tmp | Out-Null
+    try {
+        $have = Get-RemoteAssets $repo $id
+        foreach ($n in $expected.Keys) {
+            if (-not $have.ContainsKey($n)) { throw "asset $n is missing from the draft on $repo" }
+            $dest = Join-Path $tmp $n
+            Save-RemoteAsset $repo $have[$n] $n $dest
+            $h = Sha $dest
+            if ($h -ne $expected[$n]) { throw "asset $n on $repo does not match: uploaded $h, expected $($expected[$n])" }
+            Write-Host ("   verified {0}  {1}" -f $expected[$n].Substring(0, 12), $n)
+        }
+    } finally { Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction SilentlyContinue }
+}
+function Publish-Release([string]$repo, [string]$id, [bool]$latest) {
+    $l = if ($latest) { "true" } else { "false" }
+    if ($DryRun) { Write-Host "[dry-run] would: publish draft on $repo (draft=false, make_latest=$l)" -ForegroundColor Yellow; return }
+    & gh api -X PATCH "repos/$repo/releases/$id" -F draft=false -f make_latest=$l | Out-Null
+    if ($LASTEXITCODE -ne 0) { Die "publishing the draft on $repo failed" }
+}
 
 if ($Bare -notmatch '^\d+\.\d+\.\d+$') { Die "-Version must look like 1.27.3 (got '$Version')" }
+if (-not $SmashSince -and $env:RETROHUB_SMASH_SINCE) { $SmashSince = $env:RETROHUB_SMASH_SINCE }
+$hubOnly = $HubOnlyRelease -or ($env:RETROHUB_HUB_ONLY -eq "1")
+if ($hubOnly -and $SmashSince -notmatch '^v?\d+(\.\d+)*$') { Die "-HubOnlyRelease needs -SmashSince <version> (the release whose Smash Classic files this one reuses, e.g. v1.39.0)" }
+if ($SmashSince -and -not $hubOnly) { Die "-SmashSince only makes sense with -HubOnlyRelease" }
 if (-not (Test-Path (Join-Path $Hub "CMakeLists.txt"))) { Die "RetroHub checkout not found at $Hub" }
 
 # ── 1. Preflight ──
@@ -89,94 +230,136 @@ GitC $Hub fetch origin main | Out-Null
 if ($LASTEXITCODE -ne 0) { if ($DryRun) { Write-Host "WARNING: fatty/main has commits that $BattleShipBranch lacks (a real run would stop here)" -ForegroundColor Yellow } else { Die "fatty/main has commits that $BattleShipBranch lacks (merge/rebase first)" } }
 & git -C $Hub merge-base --is-ancestor origin/main HEAD
 if ($LASTEXITCODE -ne 0) { if ($DryRun) { Write-Host "WARNING: origin/main has commits that RetroHub $RetroHubBranch lacks (a real run would stop here)" -ForegroundColor Yellow } else { Die "origin/main has commits that RetroHub $RetroHubBranch lacks (pull first)" } }
-foreach ($pair in @(@($BsRepo, "BattleShip"), @($HubRepo, "RetroHub"))) {
-    & gh release view $Tag -R $pair[0] *> $null
-    if ($LASTEXITCODE -eq 0) { Die "release $Tag already exists on $($pair[0])" }
+$targets = @(@{ repo = $HubRepo; latest = $true })
+if ($AlsoSmashClassic) { $targets += @{ repo = $BsRepo; latest = $false } }
+foreach ($t in $targets) {
+    if (Find-Release $t.repo) { Die "release (or draft) $Tag already exists on $($t.repo)" }
+}
+if (-not $DryRun) {
+    & git -C $Hub rev-parse -q --verify "refs/tags/$Tag" *> $null
+    if ($LASTEXITCODE -eq 0) { Die "tag $Tag already exists in $Hub" }
 }
 
 # ── 2. Bump VERSION in both repos ──
 Step "Bumping VERSION to $Tag"
 $verFiles = @((Join-Path $Root "VERSION"), (Join-Path $Hub "VERSION"))
 foreach ($f in $verFiles) {
-    $old = if (Test-Path $f) { [System.IO.File]::ReadAllText($f) } else { "" }
+    $script:origVersion[$f] = if (Test-Path -LiteralPath $f) { [System.IO.File]::ReadAllBytes($f) } else { $null }
+    $old =if (Test-Path $f) { [System.IO.File]::ReadAllText($f) } else { "" }
     $nl = if ($old.EndsWith("`n")) { "`n" } else { "" }
     [System.IO.File]::WriteAllText($f, $Tag + $nl, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "$f -> $Tag"
 }
-function Restore-Versions { foreach ($pair in @(@($Root, "VERSION"), @($Hub, "VERSION"))) { & git -C $pair[0] checkout -- $pair[1] 2>$null } }
+$script:bumped = $true
 
-# ── 3. Package (fast path) ──
-$Dist = if ($OutDir) { $OutDir } elseif ($DryRun) { Join-Path ([System.IO.Path]::GetTempPath()) "release-dryrun-$Tag" } else { Join-Path $Root "dist" }
-$assets = @("BattleShip-windows.zip", "RetroHub-Setup.exe", "SHA256SUMS.txt") | ForEach-Object { Join-Path $Dist $_ }
-try {
-    if (-not $SkipPackage) {
-        Step "Packaging into $Dist"
-        $pkgArgs = @{ OutDir = $Dist; RetroHubDir = $Hub }
-        if ($ForceBattleShip) { $pkgArgs.ForceBattleShip = $true }
-        & (Join-Path $PSScriptRoot "package-windows.ps1") @pkgArgs
-        if ($LASTEXITCODE -ne 0) { throw "package-windows.ps1 failed (exit $LASTEXITCODE)" }
-    }
-    foreach ($a in $assets) { if (-not (Test-Path $a)) { throw "missing release asset $a" } }
-    # Verify the checksums file against the files we are about to upload.
-    foreach ($line in (Get-Content (Join-Path $Dist "SHA256SUMS.txt"))) {
-        if ($line -match '^([0-9a-f]{64})  (.+)$') {
-            $h = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Dist $Matches[2])).Hash.ToLower()
-            if ($h -ne $Matches[1]) { throw "SHA256SUMS mismatch for $($Matches[2])" }
-        }
-    }
-} catch {
-    Restore-Versions
-    Die "$_ (VERSION files restored)"
+# ── 3. Test gate: build, then the offline tests. A failure stops everything before packaging. ──
+Step "Test gate: build + ctest -LE online (RETROHUB_QA=1)"
+$cmakeExe = Join-Path $CmakeBin "cmake.exe"; $ctestExe = Join-Path $CmakeBin "ctest.exe"
+if (-not (Test-Path -LiteralPath $cmakeExe)) { $cmakeExe = "cmake" }
+if (-not (Test-Path -LiteralPath $ctestExe)) { $ctestExe = "ctest" }
+$env:PATH = "$CmakeBin;C:\msys64\mingw64\bin;$env:PATH"
+$env:RETROHUB_QA = "1"; $env:SSB64_MUTE = "1"; $env:RETRORUN_MUTE = "1"; $env:N64RUN_MUTE = "1"
+$HubBuild = Join-Path $Hub "build"
+if (-not (Test-Path (Join-Path $HubBuild "CMakeCache.txt"))) {
+    & $cmakeExe -S $Hub -B $HubBuild
+    if ($LASTEXITCODE -ne 0) { Die "TEST GATE: cmake configure failed (exit $LASTEXITCODE); nothing was packaged or published" }
 }
+& $cmakeExe --build $HubBuild --config Release --parallel 4
+if ($LASTEXITCODE -ne 0) { Die "TEST GATE: build failed (exit $LASTEXITCODE); nothing was packaged or published" }
+& $ctestExe --test-dir $HubBuild -C Release -LE online --output-on-failure
+if ($LASTEXITCODE -ne 0) { Die "TEST GATE: ctest failed (exit $LASTEXITCODE); nothing was packaged or published" }
+[void]$script:done.Add("test gate passed")
 
+# ── 4. Package (fast path) and validate SHA256SUMS ──
+$Dist = if ($OutDir) { $OutDir } elseif ($DryRun) { Join-Path ([System.IO.Path]::GetTempPath()) "release-dryrun-$Tag" } else { Join-Path $Root "dist" }
+if (-not $SkipPackage) {
+    Step "Packaging into $Dist"
+    $pkgArgs = @{ OutDir = $Dist; RetroHubDir = $Hub }
+    if ($ForceBattleShip) { $pkgArgs.ForceBattleShip = $true }
+    if ($hubOnly) { $pkgArgs.HubOnlyRelease = $true; $pkgArgs.SmashSince = $SmashSince }
+    & (Join-Path $PSScriptRoot "package-windows.ps1") @pkgArgs
+    if ($LASTEXITCODE -ne 0) { Die "package-windows.ps1 failed (exit $LASTEXITCODE)" }
+}
+foreach ($req in $RequiredAssets) { if (-not (Test-Path -LiteralPath (Join-Path $Dist $req))) { Die "missing required release asset $req in $Dist" } }
+try { $expected = Get-ExpectedAssets $Dist } catch { Die "$_" }
+$assets = @($expected.Keys | ForEach-Object { Join-Path $Dist $_ })
+Write-Host "Assets to upload ($($assets.Count)): $($expected.Keys -join ', ')"
+[void]$script:done.Add("packaged $($assets.Count) assets in $Dist (SHA256SUMS verified)")
+
+if ($DryRun) { $script:remote = Join-Path ([System.IO.Path]::GetTempPath()) ("release-dryrun-remote-" + [guid]::NewGuid().ToString("N")) }
+
+# ── 5. Commit VERSION in both repos (only VERSION, whatever else is staged), tag RetroHub ──
+Step "Committing VERSION and tagging"
 if ($DryRun) {
-    Step "Dry run: nothing is committed, pushed, deployed or published"
-    $shaBs = GitC $Root rev-parse --short HEAD
-    $shaHub = GitC $Hub rev-parse --short HEAD
     Run "git -C $Root commit VERSION -m $Tag" {}
     Run "git -C $Hub commit VERSION -m $Tag" {}
-    Run "git -C $Decomp push fatty HEAD:smash-classic" {}
-    Run "git -C $Root push fatty ${BattleShipBranch}:main" {}
-    Run "git -C $Hub push origin ${RetroHubBranch}:main" {}
-    if ($DeployWorker) {
-        Push-Location (Join-Path $Root "server\cloudflare"); try { & npx wrangler deploy --dry-run; if ($LASTEXITCODE -ne 0) { Write-Host "wrangler dry-run failed" -ForegroundColor Yellow } } finally { Pop-Location }
+    Run "git -C $Hub tag $Tag" {}
+} else {
+    $pre = @{}
+    foreach ($r in @($Root, $Hub)) { $pre[$r] = GitC $r rev-parse HEAD }
+    foreach ($r in @($Root, $Hub)) {
+        GitC $r add VERSION | Out-Null
+        GitC $r commit -m $Tag -- VERSION | Out-Null
+        $script:committed = $true
+        Write-Host "$r -> $(GitC $r rev-parse --short HEAD)"
     }
-    Run "gh release create $Tag -R $BsRepo --target main --title $Tag -F $NotesFile <3 assets>" {}
-    Run "gh release create $Tag -R $HubRepo --target main --title $Tag --latest -F $NotesFile <3 assets>" {}
-    Restore-Versions
-    Write-Host "VERSION files restored. Assets for inspection: $Dist" -ForegroundColor Green
-    Write-Host ("Dry run complete in {0:N0}s" -f $sw.Elapsed.TotalSeconds) -ForegroundColor Green
-    exit 0
+    GitC $Hub tag $Tag | Out-Null
+    [void]$script:done.Add("committed VERSION in BattleShip and RetroHub, tagged RetroHub $Tag (all local)")
+    [void]$script:undo.Add("git -C `"$Hub`" tag -d $Tag")
+    [void]$script:undo.Add("git -C `"$Hub`" reset --soft $($pre[$Hub])      # local VERSION commit")
+    [void]$script:undo.Add("git -C `"$Root`" reset --soft $($pre[$Root])    # local VERSION commit")
 }
 
-# ── 4. Commit VERSION in both repos (only VERSION, whatever else is staged) ──
-Step "Committing VERSION"
-foreach ($r in @($Root, $Hub)) {
-    GitC $r add VERSION | Out-Null
-    GitC $r commit -m $Tag -- VERSION | Out-Null
-    Write-Host "$r -> $(GitC $r rev-parse --short HEAD)"
+# ── 6. Draft release(s) with all assets, then download every asset back and verify ──
+Step "Creating DRAFT release(s) and verifying the uploaded assets"
+$drafts = @()
+foreach ($t in $targets) {
+    $repo = $t.repo
+    [void]$script:undo.Insert(0, "gh release delete $Tag -R $repo --yes     # removes the draft (or run: gh api -X DELETE repos/$repo/releases/<id>)")
+    $id = New-DraftRelease $repo $assets
+    if (-not $id) { Die "creating the draft release on $repo failed (a partial draft may exist; see the undo list)" }
+    [void]$script:done.Add("draft release $Tag created on $repo with $($assets.Count) assets (id $id)")
+    try { Confirm-Remote $repo $id $expected } catch { Die "verification of the uploaded assets failed: $_ . The draft on $repo is NOT published." }
+    [void]$script:done.Add("downloaded every asset back from $repo and verified its SHA-256")
+    $drafts += @{ repo = $repo; id = $id; latest = $t.latest }
 }
 
-# ── 5. Push ──
+# ── 7. Push (fast-forward only, never force) ──
 Step "Pushing"
+Run "git -C $Hub push origin ${RetroHubBranch}:main" { & git -C $Hub push origin "${RetroHubBranch}:main" }
+Run "git -C $Hub push origin $Tag" { & git -C $Hub push origin $Tag }
+if (-not $DryRun) {
+    [void]$script:done.Add("pushed RetroHub $RetroHubBranch and tag $Tag to origin")
+    [void]$script:undo.Insert(0, "git -C `"$Hub`" push origin :refs/tags/$Tag     # remove the pushed tag; main stays (revert the VERSION commit with git revert if you must)")
+}
 Run "git -C $Decomp push fatty HEAD:smash-classic" { & git -C $Decomp push fatty HEAD:smash-classic }
 Run "git -C $Root push fatty ${BattleShipBranch}:main" { & git -C $Root push fatty "${BattleShipBranch}:main" }
-Run "git -C $Hub push origin ${RetroHubBranch}:main" { & git -C $Hub push origin "${RetroHubBranch}:main" }
+if (-not $DryRun) { [void]$script:done.Add("pushed decomp and BattleShip $BattleShipBranch to fatty main") }
 
-# ── 6. Worker ──
+# ── 8. Worker ──
 if ($DeployWorker) {
     Step "Deploying the Cloudflare Worker"
     Push-Location (Join-Path $Root "server\cloudflare")
-    try { & npx wrangler deploy; if ($LASTEXITCODE -ne 0) { Die "wrangler deploy failed (commits are already pushed; assets are in $Dist)" } } finally { Pop-Location }
+    try {
+        if ($DryRun) { & npx wrangler deploy --dry-run; if ($LASTEXITCODE -ne 0) { Write-Host "wrangler dry-run failed" -ForegroundColor Yellow } }
+        else { & npx wrangler deploy; if ($LASTEXITCODE -ne 0) { Die "wrangler deploy failed (the release is still a DRAFT; fix and publish with: gh api -X PATCH repos/$HubRepo/releases/<id> -F draft=false -f make_latest=true)" } }
+    } finally { Pop-Location }
 }
 
-# ── 7. GitHub releases (retrohub; smash-classic too with -AlsoSmashClassic) ──
-Step "Creating GitHub releases"
-$title = $Tag
-if ($AlsoSmashClassic) { & gh release create $Tag @assets -R $BsRepo --target main --title $title -F $NotesFile }
-if ($AlsoSmashClassic -and $LASTEXITCODE -ne 0) { Die "gh release create failed for $BsRepo (retry with: gh release create $Tag <assets> -R $BsRepo)" }
-& gh release create $Tag @assets -R $HubRepo --target main --title $title --latest -F $NotesFile
-if ($LASTEXITCODE -ne 0) { Die "gh release create failed for $HubRepo (retry with: gh release create $Tag <assets> -R $HubRepo --latest)" }
+# ── 9. Publish the drafts (this is the only step that makes anything public) ──
+Step "Publishing"
+foreach ($d in $drafts) {
+    Publish-Release $d.repo $d.id $d.latest
+    if (-not $DryRun) { [void]$script:done.Add("published $Tag on $($d.repo)"); $script:undo.Clear() }
+}
+
+if ($DryRun) {
+    Restore-Versions
+    if ($script:remote -and (Test-Path $script:remote)) { Remove-Item -Recurse -Force $script:remote -ErrorAction SilentlyContinue }
+    Write-Host "`nDry run OK: nothing committed, pushed, deployed or published. VERSION files restored. Assets for inspection: $Dist" -ForegroundColor Green
+    Write-Host ("Dry run complete in {0:N0}s" -f $sw.Elapsed.TotalSeconds) -ForegroundColor Green
+    exit 0
+}
 
 Write-Host ("`nReleased $Tag on {0} in {1:N0}s" -f $(if ($AlsoSmashClassic) { "both repos" } else { $HubRepo }), $sw.Elapsed.TotalSeconds) -ForegroundColor Green
 if ($AlsoSmashClassic) { Write-Host "   https://github.com/$BsRepo/releases/tag/$Tag" }
