@@ -1115,7 +1115,12 @@ export class UserHub extends DurableObject {
       if (await this.banSweepStep()) return;
       if (!(await this.wipeSavesStep())) {
         this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('del_tries', ?)", String(Number(this.kvGet("del_tries") || 0) + 1));
-        if (Number(this.kvGet("del_tries")) < 40) { await this.ctx.storage.setAlarm(now() + 3000); noteRows(1); return; }
+        const tries = Number(this.kvGet("del_tries"));
+        // The cloud-saves index could not be reached: keep trying (3 s apart at first, then every 10 min, about a day in all), so a delete
+        // the person confirmed is driven to the end by the server itself, with no further message from the PC.
+        if (tries < 40) { await this.ctx.storage.setAlarm(now() + 3000); noteRows(1); return; }
+        if (tries < 180) { await this.ctx.storage.setAlarm(now() + 10 * 60 * 1000); noteRows(1); return; }
+        this.kvSet("delete_incomplete", "1");   // gave up: visible to the owner in the object, never silently reported as finished
       } else if (this.kvGet("del_more") === "1") {
         this.run("DELETE FROM kv WHERE k='del_more'");
         return;   // wipeSavesStep armed the next slice
