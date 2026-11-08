@@ -665,7 +665,7 @@ phases.push(["G", async () => withServer(BASE_PORT + 11, { DAILY_REQ_CAP: "10", 
 // H: caps count LIVE data (evicted tombstones / dead games no longer block new saves, saves-F16) + forged requests never rate-limit
 // the real account (server-F5)
 phases.push(["H", async () => {
-  await withServer(BASE_PORT + 12, { ACCOUNT_CAP: "100000", PROT_CAP: "30000", MAX_PATHS: "4", MAX_GAMES: "4" }, async (srv, api) => {
+  await withServer(BASE_PORT + 12, { ACCOUNT_CAP: "100000", PROT_CAP: "30000", MAX_PATHS: "5", MAX_GAMES: "4" }, async (srv, api) => {
     console.log("--- phase H1: path / game caps count live data only ---");
     const S = await account(srv.BASE), dev = devId();
     await api.device(S, dev, "PC-H");
@@ -673,12 +673,12 @@ phases.push(["H", async () => {
     for (let i = 1; i <= 3; i++) await push(`n64/h${i}`, "states/a.state", 30000, i * 100);
     await push("n64/h4", "battery/b.sav", 500, 400);
     const full = await push("n64/h5", "battery/c.sav", 500, 500);
-    check(full.plan.status === 507 || (full.plan.data.files && full.plan.data.files[0].reason === "too-many-files"), "at the caps (4 live paths, 4 games) a new game is still refused");
-    // update h3's state with new content: needs 30000 more -> evicts the least recently played h1 state (tombstone row stays)
-    const up = await api.push(S, "n64/h3", [{ path: "states/a.state", data: rnd(30000), mtime: 600, base: 1 }], { dev, played: 600 });
-    check(up.commit && up.commit.data.evicted.length === 1 && up.commit.data.evicted[0].game === "n64/h1", "an update evicts game h1's state (tombstone kept)");
+    check(full.plan.status === 507 || (full.plan.data.files && full.plan.data.files[0].reason === "too-many-files"), "at the game cap (4 games) a new game is refused");
+    // h4 adds a large state (5th path): the account is over its size cap, so the least recently played game's state (h1) is evicted (tombstone stays)
+    const up = await push("n64/h4", "states/a.state", 30000, 600);
+    check(up.commit && up.commit.data.evicted.length === 1 && up.commit.data.evicted[0].game === "n64/h1", "h4's new state evicts game h1's state (tombstone kept)");
     const ok = await push("n64/h5", "battery/c.sav", 500, 700);
-    check(ok.commit && ok.commit.status === 200 && ok.commit.data.results[0].cloud === "synced", "after the eviction the dead path and dead game no longer count: new save accepted");
+    check(ok.commit && ok.commit.status === 200 && ok.commit.data.results[0].cloud === "synced", "after the eviction the dead game (h1) no longer counts: a new game is accepted (old code: refused)");
     const m = await manifestOf(api, S);
     check(files(m, "n64/h1")["states/a.state"].cloud === "evicted" && files(m, "n64/h5")["battery/c.sav"].cloud === "synced", "the tombstone is still reported, the new save is live");
   });
@@ -713,7 +713,10 @@ phases.push(["H", async () => {
     const uploadsFlip = await acctDbg(api, S.uid);
     check(ok === 3 && uploadsFlip.acct.sw === 3 && uploadsFlip.acct.a_ops === 2, `3 flips between stored versions allowed and counted (sw ${uploadsFlip.acct.sw}), uploads stay 2`);
     const r6 = await put(Y, base);
-    check(r6.plan && r6.plan.status === 429 && r6.plan.data.error === "account-daily-limit", "the 4th flip of the day is refused at plan time (429 account-daily-limit)");
+    check(r6.plan && r6.plan.status === 200 && r6.plan.data.files[0].action === "skip" && r6.plan.data.files[0].reason === "switch-limit" && !r6.plan.data.ticket, "the 4th flip of the day is refused at plan time (skip, switch-limit), nothing is written");
+    const mixed = await api.push(S, G, [{ path: "battery/f.sav", data: Y, mtime: 1, base }, { path: "battery/new.sav", data: rnd(300), mtime: 1, base: 0 }], { dev });
+    const act = Object.fromEntries(mixed.plan.data.files.map((f) => [f.path, f.action + ":" + (f.reason || "")]));
+    check(mixed.plan.status === 200 && act["battery/f.sav"] === "skip:switch-limit" && act["battery/new.sav"] === "upload:" && mixed.commit && mixed.commit.data.results.some((r) => r.path === "battery/new.sav" && r.cloud === "synced"), "a plan mixing a refused flip and a real new upload: only the flip is refused, the upload goes through");
     const m = await manifestOf(api, S);
     const curV = m.games[G].files["battery/f.sav"].cur;
     const rs = await api.restore(S, G, "battery/f.sav", curV - 1, curV);
