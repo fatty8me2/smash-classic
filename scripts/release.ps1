@@ -39,7 +39,9 @@ param(
     [string]$OpenSsl = "C:\Program Files\Git\usr\bin\openssl.exe",
     [string]$SigPubKey = "C:\Users\fatty\.retrohub-release\release-signing-pub.pem",   # PUBLIC key only; this script never touches the private key
     [switch]$AllowDirty,              # permit uncommitted changes other than VERSION (they are packaged but NOT committed)
-    [switch]$ForceBattleShip,            # passed to package-windows.ps1
+    [switch]$HubOnlyRelease,             # passed to package-windows.ps1: Smash Classic's files are unchanged since -SmashSince
+    [string]$SmashSince = "",            # passed to package-windows.ps1 (required with -HubOnlyRelease), e.g. v1.39.0
+    [switch]$ForceBattleShip,          # passed to package-windows.ps1
     [switch]$SkipPackage                 # reuse assets already in OutDir; the test gate still runs
 )
 $ErrorActionPreference = "Continue"   # native tools write progress to stderr; every call checks $LASTEXITCODE explicitly
@@ -188,6 +190,10 @@ function Publish-Release([string]$repo, [string]$id, [bool]$latest) {
 }
 
 if ($Bare -notmatch '^\d+\.\d+\.\d+$') { Die "-Version must look like 1.27.3 (got '$Version')" }
+if (-not $SmashSince -and $env:RETROHUB_SMASH_SINCE) { $SmashSince = $env:RETROHUB_SMASH_SINCE }
+$hubOnly = $HubOnlyRelease -or ($env:RETROHUB_HUB_ONLY -eq "1")
+if ($hubOnly -and $SmashSince -notmatch '^v?\d+(\.\d+)*$') { Die "-HubOnlyRelease needs -SmashSince <version> (the release whose Smash Classic files this one reuses, e.g. v1.39.0)" }
+if ($SmashSince -and -not $hubOnly) { Die "-SmashSince only makes sense with -HubOnlyRelease" }
 if (-not (Test-Path (Join-Path $Hub "CMakeLists.txt"))) { Die "RetroHub checkout not found at $Hub" }
 
 # ── 1. Preflight ──
@@ -270,6 +276,7 @@ if (-not $SkipPackage) {
     Step "Packaging into $Dist"
     $pkgArgs = @{ OutDir = $Dist; RetroHubDir = $Hub }
     if ($ForceBattleShip) { $pkgArgs.ForceBattleShip = $true }
+    if ($hubOnly) { $pkgArgs.HubOnlyRelease = $true; $pkgArgs.SmashSince = $SmashSince }
     & (Join-Path $PSScriptRoot "package-windows.ps1") @pkgArgs
     if ($LASTEXITCODE -ne 0) { Die "package-windows.ps1 failed (exit $LASTEXITCODE)" }
 }
