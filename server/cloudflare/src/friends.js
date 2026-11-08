@@ -54,7 +54,6 @@ export const MAX_DEVICES = 8;
 export const DEVICE_EVICT_MS = 30 * 24 * 3600 * 1000;
 export const DEVICE_SEEN_MS = 6 * 3600 * 1000;
 const MAX_RECOVERY = 2;          // the current account-code secret and the one before it (a failed re-code never kills the working code)
-const ROOT_SEEN_GAP_MS = 120 * 1000;
 const PC_RE = /^[A-Za-z0-9_-]{4,48}$/;
 const B32A = "abcdefghijklmnopqrstuvwxyz234567";
 function randomB32(n) {
@@ -547,7 +546,6 @@ export class UserHub extends DurableObject {
 
   // ---- per-PC credentials ---------------------------------------------------
 
-  rootGap() { return testsAllowed(this.env) && this.env.ROOT_GAP_MS !== undefined ? Number(this.env.ROOT_GAP_MS) : ROOT_SEEN_GAP_MS; }   // env: tests only
   rootDead() { return this.kvGet("root_dead") === "1"; }
 
   /* Is `secret` a valid credential for this account? -> {ok, kind: "root" | "d" | "r", dev, hash}. The legacy root secret (profile.secret_hash,
@@ -571,28 +569,40 @@ export class UserHub extends DurableObject {
     return keys;
   }
 
-  /* After the root secret was used: remember it (at most every 6 h, but always the first use after an enrolment) so a replace on one
-   * PC can tell whether a PC that has not updated is still on the account (retire_begin "shared"). */
-  noteRootUse() {
-    const t = now();
-    const last = Number(this.kvGet("root_last") || 0), mark = Number(this.kvGet("root_mark") || 0);
-    if (last <= mark + this.rootGap() || t - last > DEVICE_SEEN_MS) this.kvSet("root_last", String(t));
+  /* Could a PC that has not updated still be using the shared (root) secret? Only accounts born with an up-to-date client (born_modern)
+   * that never saw a root hello without dev:1 (legacy_seen) can say no. Every older account, and anything unsure, says yes. */
+  legacyPossible() {
+    if (this.rootDead()) return false;
+    return !(this.kvGet("born_modern") === "1" && this.kvGet("legacy_seen") !== "1");
   }
 
-  /* Is anybody besides the caller (credential `c`) still using this account? Conservative: when unsure, say yes (nothing is retired). */
+  /* Is anybody besides the caller (credential `c`) possibly still on this account? When unsure: YES (then nothing is retired and nobody
+   * is locked out). A caller on the shared secret / an account code counts as shared while the shared secret is alive. */
   sharedWithOthers(c) {
     if (this.count("devices", "kind='d' AND id<>?", c.dev || "") > 0) return true;
-    if (c.kind === "d" && !this.rootDead()) {
-      const last = Number(this.kvGet("root_last") || 0), mark = Number(this.kvGet("root_mark") || 0);
-      return last > mark + this.rootGap();   // a PC that has not updated used the shared secret after this PC was enrolled
+    return this.legacyPossible();
+  }
+
+  /* Kill the shared secret and every account-code secret: a PC that still holds the old shared secret (a locked-out PC, or one that has
+   * not updated) is refused from now on and must enter the NEW account code. Enrolled PCs keep working on their own secrets. */
+  killLegacy() {
+    this.kvSet("root_dead", "1");
+    this.run("DELETE FROM devices WHERE kind='r'");
+    for (const ws of this.ctx.getWebSockets()) {
+      let a = null;
+      try { a = ws.deserializeAttachment(); } catch { /* closed */ }
+      if (a && a.authed && a.ck !== "d") {
+        try { ws.serializeAttachment({ ...a, authed: false }); } catch { /* closed */ }
+        try { ws.close(4003, "revoked"); } catch { /* closed */ }
+      }
     }
-    return false;
   }
 
   /* Give this PC its own credential. -> {secret, id} | {full: true}. A PC that already has a row (same pc id) gets a fresh secret in the
    * same row, so a lost reply never leaves two rows for one PC. */
   async enrollDevice(msg) {
     const pc = typeof msg.pc === "string" && PC_RE.test(msg.pc) ? msg.pc : "";
+    if (!pc) return { refused: true };   // no valid PC label: no row (a label-less client would add one on every hello)
     const cdev = typeof msg.cdev === "string" && PC_RE.test(msg.cdev) ? msg.cdev : "";
     const name = cleanName(msg.pc_name || "").slice(0, MAX_NAME);
     const secret = randomB32(52);
@@ -601,7 +611,6 @@ export class UserHub extends DurableObject {
     const mine = pc ? this.one("SELECT id FROM devices WHERE kind='d' AND pc=?", pc) : null;
     if (mine) {
       this.run("UPDATE devices SET hash=?, cdev=?, name=?, created=?, seen=? WHERE id=?", hash, cdev, name, t, t, mine.id);
-      this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('root_mark', ?)", String(t));
       return { secret, id: mine.id };
     }
     if (this.count("devices", "kind='d'") >= MAX_DEVICES) {
@@ -612,7 +621,6 @@ export class UserHub extends DurableObject {
     }
     const id = randomB32(10);
     this.run("INSERT INTO devices (id, hash, kind, pc, cdev, name, created, seen) VALUES (?, ?, 'd', ?, ?, ?, ?, ?)", id, hash, pc, cdev, name, t, t);
-    this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('root_mark', ?)", String(t));
     return { secret, id };
   }
 
@@ -1695,6 +1703,7 @@ export class UserHub extends DurableObject {
     const hash = await sha256hex(msg.secret);
     const name = cleanName(msg.name) || "player";
     let p = this.profile();
+    const newAccount = !p;
     if (!p) {
       // A brand-new account. The Directory counts it against the caller's address (hashed: raw addresses are not stored) and
       // the service-wide daily limit; a local wrangler (loopback) has no address key and is never limited.
@@ -1750,19 +1759,20 @@ export class UserHub extends DurableObject {
     // The shared root secret keeps working for every PC that has not updated.
     let device = null, devId = cred.kind === "d" ? cred.dev : undefined;
     const pcOk = typeof msg.pc === "string" && PC_RE.test(msg.pc) ? msg.pc : "";
-    if (cred.kind === "root") this.noteRootUse();
-    if (msg.dev === 1) {
+    if (cred.kind === "root" && msg.dev !== 1 && this.kvGet("legacy_seen") !== "1") this.kvSet("legacy_seen", "1");   // a PC that has not updated is on the shared secret
+    if (msg.dev === 1 && pcOk) {
       const row = cred.kind === "d" ? this.one("SELECT pc, cdev, seen FROM devices WHERE id=?", cred.dev) : null;
       const otherPc = !!(row && pcOk && row.pc && row.pc !== pcOk);   // someone else's device secret (shared vault copy): this PC gets its own
       if (cred.kind !== "d" || otherPc) {
         device = await this.enrollDevice(msg);
         if (device.id) devId = device.id;
+        if (newAccount && device.id) this.kvSet("born_modern", "1");   // created by an up-to-date client: no PC can be on the shared secret unless it shows up without dev:1
       } else if (row) {
         const t = now(), cdev = typeof msg.cdev === "string" && PC_RE.test(msg.cdev) ? msg.cdev : row.cdev;
         if (t - row.seen > DEVICE_SEEN_MS || cdev !== row.cdev) this.run("UPDATE devices SET seen=?, cdev=? WHERE id=?", t, cdev, cred.dev);
       }
     }
-    ws.serializeAttachment({ uid, authed: true, dc: msg.dev === 1 ? 1 : 0, ...(devId ? { dev: devId } : {}), status: { state: "online", updated: now() } });
+    ws.serializeAttachment({ uid, authed: true, dc: msg.dev === 1 ? 1 : 0, ck: cred.kind, ...(devId ? { dev: devId } : {}), status: { state: "online", updated: now() } });
     if (this.wantsTest(msg, name)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('is_test', '1')");
     if (typeof msg.auto_friend === "boolean") this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('auto_friend', ?)", msg.auto_friend ? "1" : "0");
     await this.autoLinkAdmin(p, gate.autofriend);
@@ -1784,6 +1794,7 @@ export class UserHub extends DurableObject {
     ws.send(JSON.stringify({
       type: "welcome",
       code: p.code,
+      devcap: 1,
       ...(device && device.secret ? { device: { secret: device.secret } } : {}),
       ...(device && device.full ? { device_full: true } : {}),
       ...(this.isAdminUid(p.uid) ? { admin: true } : {}),
@@ -1962,6 +1973,7 @@ export class UserHub extends DurableObject {
         this.setUsernameLocal(null, "none");
         this.kvSet("uname_legacy_done", "1");
         this.push({ type: "username", username: null, status: "none", previous: r.released || null });
+        ws.send(JSON.stringify({ type: "username_released", ok: true }));
         break;
       }
       case "delete_account": {
@@ -1993,15 +2005,14 @@ export class UserHub extends DurableObject {
       }
       case "devices": {   // the PCs signed in to this account (Settings > Account)
         const rows = this.all("SELECT id, pc, cdev, name, created, seen FROM devices WHERE kind='d' ORDER BY created");
-        const last = Number(this.kvGet("root_last") || 0), mark = Number(this.kvGet("root_mark") || 0);
         ws.send(JSON.stringify({
           type: "devices", cap: MAX_DEVICES, current: att.dev || null,
           devices: rows.map((r) => ({ id: r.id, pc: r.pc, cdev: r.cdev, name: r.name, created: r.created, seen: r.seen })),
-          legacy: !this.rootDead() && (last > mark + this.rootGap() || rows.length === 0),   // a PC that has not updated may still use the shared secret
+          legacy: this.legacyPossible(),   // a PC that has not updated may still use the shared secret
         }));
         break;
       }
-      case "revoke_device": {   // lock one PC out: its credential is deleted, its next connect is refused
+      case "revoke_device": {   // lock one PC out: its credential is deleted AND the shared secret + old account codes die, so it cannot sign itself back in
         if (!this.hit("revdev", 20, 3600 * 1000)) return this.err(ws, "rate-limited", type);
         const id = typeof msg.id === "string" ? msg.id : "", cdev = typeof msg.cdev === "string" && PC_RE.test(msg.cdev) ? msg.cdev : "";
         const row = id ? this.one("SELECT id FROM devices WHERE kind='d' AND id=?", id) : (cdev ? this.one("SELECT id FROM devices WHERE kind='d' AND cdev=?", cdev) : null);
@@ -2009,6 +2020,7 @@ export class UserHub extends DurableObject {
         if (row.id === att.dev) { ws.send(JSON.stringify({ type: "device_revoked", ok: false, reason: "self", cdev })); break; }
         this.run("DELETE FROM devices WHERE id=?", row.id);
         this.closeDevice(row.id);
+        this.killLegacy();
         ws.send(JSON.stringify({ type: "device_revoked", ok: true, id: row.id, cdev }));
         break;
       }
@@ -2016,13 +2028,9 @@ export class UserHub extends DurableObject {
         if (!this.hit("revall", 5, 3600 * 1000)) return this.err(ws, "rate-limited", type);
         if (!att.dev) { ws.send(JSON.stringify({ type: "others_revoked", ok: false, reason: "needs-device" })); break; }
         const others = this.all("SELECT id FROM devices WHERE kind='d' AND id<>?", att.dev).map((r) => r.id);
-        this.run("DELETE FROM devices WHERE id<>?", att.dev);
-        this.kvSet("root_dead", "1");
-        for (const s of this.ctx.getWebSockets()) {
-          let a = null; try { a = s.deserializeAttachment(); } catch { /* closed */ }
-          if (!a || s === ws || a.dev === att.dev) continue;
-          try { s.serializeAttachment({ ...a, authed: false }); s.close(4003, "revoked"); } catch { /* closed */ }
-        }
+        this.run("DELETE FROM devices WHERE kind='d' AND id<>?", att.dev);
+        for (const o of others) this.closeDevice(o);
+        this.killLegacy();
         ws.send(JSON.stringify({ type: "others_revoked", ok: true, count: others.length }));
         break;
       }

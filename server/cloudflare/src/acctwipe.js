@@ -2,9 +2,9 @@
 // checked the typed confirmation). No bucket-wide operation: it works ONLY on the rows of one uid in the index.
 //
 //   slice:  every live object of the uid is marked dead (the same markDead the version eviction uses) and its key is handed back, at most
-//           `max` per call. The caller deletes those keys in R2 (the ordinary free delete) and confirms them with "v2_del_done", which
+//           `max` per call. Uploads still in flight are aborted first (bytes released) and their keys are deleted as well. The caller deletes those keys in R2 (the ordinary free delete) and confirms them with "v2_del_done", which
 //           removes the index rows and the account's byte counters. Keys already dead but not yet confirmed are offered again.
-//   done:   no object rows are left (pending uploads are ignored: the weekly reconcile and the pending TTL own those). The uid's
+//   done:   no object rows are left (in-flight uploads are aborted and their objects deleted too). The uid's
 //           version / game / device / ticket / attachment rows and its account row are then deleted.
 //
 // `markDead(d, rkey, nowS, dels)` is passed in by r2budget_v2.js so this file has no imports.
@@ -13,6 +13,8 @@ export function acctWipe(d, q, nowS, markDead) {
   if (!/^[a-z2-7]{26}$/.test(uid)) return { r: "err", status: 400, code: "bad-uid" };
   const max = Math.max(1, Math.min(Number(q.max) || 100, 400));
   const dels = [];
+  // Uploads still in flight: release their reserved bytes (d.abort) and delete whatever object they may already have written.
+  for (const r of d.q(`SELECT * FROM files WHERE uid=? AND pend IS NOT NULL LIMIT ?`, uid, max)) { d.abort(r); dels.push(r.rkey); }
   for (const r of d.q(`SELECT rkey FROM files WHERE uid=? AND dead IS NULL AND pend IS NULL LIMIT ?`, uid, max)) markDead(d, r.rkey, nowS, dels);
   if (dels.length < max) {
     for (const r of d.q(`SELECT rkey FROM files WHERE uid=? AND dead IS NOT NULL AND pend IS NULL LIMIT ?`, uid, max - dels.length)) {

@@ -55,12 +55,11 @@ try {
   check(await p1.wait(() => p1.events.some((e) => e.type === "device_revoked" && e.ok)), "PC 2 locked out");
   check((await api.status(A2, devId())).status === 401, "the locked-out PC's cloud-save requests are refused (401)");
   check((await api.status(A1, dev1)).status === 200, "the other PC still syncs");
-  check((await api.status(AR, dev1)).status === 200, "the shared secret still works until the owner kills it");
+  check((await api.status(AR, dev1)).status === 401, "locking a PC out also kills the shared secret for cloud saves");
 
   // sign out all others: the shared secret stops signing
   p1.send({ type: "revoke_others" });
   check(await p1.wait(() => p1.events.some((e) => e.type === "others_revoked" && e.ok)), "revoke_others ok");
-  check((await api.status(AR, dev1)).status === 401, "the shared secret no longer signs cloud-save requests");
   check((await api.status(A1, dev1)).status === 200, "the PC that asked still syncs");
 
   // delete account: cloud saves are wiped
