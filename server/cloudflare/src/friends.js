@@ -87,6 +87,8 @@ const testsAllowed = (env) => !!env && env.ALLOW_TEST_FLAG === "1";
 const approvalHint = { on: false, at: 0, cutoff: 0 };
 const noteApproval = (on, cutoff) => { approvalHint.on = on === true; approvalHint.at = Date.now(); if (Number(cutoff) > 0) approvalHint.cutoff = Number(cutoff); };
 const ADMIN_CALLS_PER_MIN = 60;
+const DAYCAP_SAVE_EVERY = 50;
+const DAY_CAPS = { msg: 2000, react: 2000, invite: 300 };   // per account per UTC day (UserHub.dayHit)
 const STATUS_LIST = ["ok", "pending", "banned", "denied"];
 const blockedStatus = (s) => s === "banned" || s === "denied";
 // Internal routes a banned / waiting account's hub still answers (everything else answers "none": the account looks gone).
@@ -422,6 +424,18 @@ export class Directory extends DurableObject {
 
 // ---------------------------------------------------------------------------
 
+async function hmacHexKey(keyStr, msg) {
+  const enc = new TextEncoder();
+  const k = await crypto.subtle.importKey("raw", enc.encode(keyStr), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const buf = await crypto.subtle.sign("HMAC", k, enc.encode(msg));
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function safeEqStr(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
 async function sha256hex(s) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -461,6 +475,35 @@ export class UserHub extends DurableObject {
   isFriend(uid) { return !!this.one("SELECT 1 FROM friends WHERE uid=?", uid); }
   isBlocked(uid) { return !!this.one("SELECT 1 FROM blocked WHERE uid=?", uid); }
   count(table, where = "1", ...p) { return this.one(`SELECT COUNT(*) AS c FROM ${table} WHERE ${where}`, ...p).c; }
+
+  // Per-day caps for DMs / reactions / invites (the per-minute limits alone allow ~86k a day), at UTC-day granularity.
+  // Free-tier rule: NO storage write per message. The counter lives in memory and is saved to the kv table only every
+  // DAYCAP_SAVE_EVERY counted messages, when a cap is reached, and at the day rollover; the first use after the object wakes
+  // (hibernation / eviction) reloads it. Trade-off: a wake can lose up to DAYCAP_SAVE_EVERY-1 uncounted messages, so the cap is
+  // "N plus a few dozen a day", which is all it is for. The limits are far above what real friends send.
+  // env DAYCAP_<KIND> lowers them for tests; it is honoured only when ALLOW_TEST_FLAG=1 (production never sets that).
+  dayHit(kind) {
+    const dayMs = testsAllowed(this.env) && Number(this.env.DAYCAP_DAYMS) > 0 ? Number(this.env.DAYCAP_DAYMS) : 86400000;   // tests shorten the "day" to test the rollover
+    const day = Math.floor(now() / dayMs);
+    if (!this.dayCnt) {
+      let d = null;
+      try { d = JSON.parse(this.kvGet("daycnt") || "null"); } catch { /* unreadable: start the day over */ }
+      this.dayCnt = d && d.day === day && d.n && typeof d.n === "object" ? { day, n: { ...d.n }, dirty: 0 } : { day, n: {}, dirty: 0 };
+    } else if (this.dayCnt.day !== day) {
+      this.dayCnt = { day, n: {}, dirty: 0 };
+      this.kvSet("daycnt", JSON.stringify({ day, n: {} }));   // day rollover: one write, so a wake after midnight never reloads yesterday
+    }
+    const ov = testsAllowed(this.env) ? Number(this.env["DAYCAP_" + kind.toUpperCase()]) : 0;
+    const limit = ov > 0 ? ov : DAY_CAPS[kind];
+    const n = this.dayCnt.n[kind] || 0;
+    if (n >= limit) return false;
+    this.dayCnt.n[kind] = n + 1;
+    if (++this.dayCnt.dirty >= DAYCAP_SAVE_EVERY || n + 1 >= limit) {
+      this.dayCnt.dirty = 0;
+      this.kvSet("daycnt", JSON.stringify({ day, n: this.dayCnt.n }));
+    }
+    return true;
+  }
 
   hit(key, limit, windowMs) {
     const t = now();
@@ -1197,17 +1240,22 @@ export class UserHub extends DurableObject {
         return { r: "ok" };
       }
       case "saves_auth": {
-        // Cloud saves: hand the Worker the HMAC key (sha256hex of the secret) after rate limiting this account.
+        // Cloud saves: the Worker sends the request's signing string + signature. We check the signature with this account's
+        // key FIRST and only then count the request against the account's rate limit, so a stranger who only knows a uid
+        // (forged / unsigned requests) can never use up a real player's per-minute allowance. The key never leaves this object.
         if (from !== p.uid) return { r: "none" };
-        if (gl !== "ok") return { r: "gated", gate: gl, key: p.secret_hash };   // the Worker checks the signature first, then refuses with the reason (the key never leaves it)
+        if (typeof b.msg !== "string" || typeof b.sig !== "string") return { r: "none" };
+        const want = await hmacHexKey(p.secret_hash, b.msg);
+        if (!safeEqStr(want, b.sig)) return { r: "badsig" };
+        if (gl !== "ok") return { r: "gated", gate: gl };   // valid signature, but the account is banned / waiting: the Worker tells it why
         const w = !!b.write;
         const V2 = { pc: 30, put: 120, get: 300, meta: 60, att: 10 };   // v2 per-account per-minute limits (docs/CLOUD_SAVES_V2.md 3.6)
         if (b.cls && V2[b.cls]) {
-          const ov = Number(this.env && this.env["SAVES_RATE_" + b.cls.toUpperCase()]);   // tests only; unset in production
+          const ov = testsAllowed(this.env) ? Number(this.env["SAVES_RATE_" + b.cls.toUpperCase()]) : 0;   // tests only: honoured only with ALLOW_TEST_FLAG=1, which production never sets
           if (!this.hit("saves2:" + b.cls, ov > 0 ? ov : V2[b.cls], 60000)) return { r: "limited" };
         }
         else if (!this.hit(w ? "saves:w" : "saves:r", w ? 120 : 600, 60000)) return { r: "limited" };
-        return { r: "ok", key: p.secret_hash };
+        return { r: "ok" };
       }
       case "attach_to": {   // DM attachments: which of these are my friends (the Worker asks before it accepts an upload)
         if (from !== p.uid || !Array.isArray(b.to)) return { r: "none" };
@@ -1963,7 +2011,7 @@ export class UserHub extends DurableObject {
           return this.err(ws, "bad-request", type, "text");
         }
         if (!this.isFriend(to)) return this.err(ws, "not-friends", type, to);
-        if (!this.hit("msg", 60, 60 * 1000)) return this.err(ws, "rate-limited", type, to);
+        if (!this.hit("msg", 60, 60 * 1000) || !this.dayHit("msg")) return this.err(ws, "rate-limited", type, to);
         let att = null;
         if (hasAtt) {
           if (!this.hit("attmsg", 20, 60 * 1000)) return this.err(ws, "rate-limited", type, to);
@@ -1984,7 +2032,7 @@ export class UserHub extends DurableObject {
         const target = typeof msg.target === "string" && msg.target.length > 0 && msg.target.length <= 64 ? msg.target : "";
         if (!to || !target || !REACTIONS.includes(msg.emoji)) return this.err(ws, "bad-request", type, "react");
         if (!this.isFriend(to)) return this.err(ws, "not-friends", type, to);
-        if (!this.hit("react", 60, 60 * 1000)) return this.err(ws, "rate-limited", type, to);
+        if (!this.hit("react", 60, 60 * 1000) || !this.dayHit("react")) return this.err(ws, "rate-limited", type, to);
         const m = { id: crypto.randomUUID(), from: p.uid, from_name: p.name, to, kind: "react", target, emoji: msg.emoji, on: msg.on !== false, at: now() };
         const r = await this.call(to, "msg", { uid: p.uid, msg: m });
         if (r.r === "notfriend") return this.err(ws, "not-friends", type, to);
@@ -2005,7 +2053,7 @@ export class UserHub extends DurableObject {
         const results = [];
         for (const to of targets) {
           if (!this.isFriend(to)) { this.err(ws, "not-friends", type, to); results.push({ uid: to, ok: false, reason: "not-friends" }); continue; }
-          if (!this.hit("invite", 20, 60 * 1000)) { this.err(ws, "rate-limited", type, to); results.push({ uid: to, ok: false, reason: "rate-limited" }); break; }
+          if (!this.hit("invite", 20, 60 * 1000) || !this.dayHit("invite")) { this.err(ws, "rate-limited", type, to); results.push({ uid: to, ok: false, reason: "rate-limited" }); break; }
           const m = { id: crypto.randomUUID(), from: p.uid, from_name: p.name, to, kind: "invite", invite, at: now() };
           // r:"ok" also covers a silent drop by a blocker (deliberately indistinguishable: privacy).
           let ok = false, reason = "undeliverable";

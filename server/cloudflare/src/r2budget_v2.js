@@ -17,7 +17,11 @@ import {
   globalEvictions, leaseHeld, secondsToUtcMidnight, cleanKey, cleanGame, cleanDeviceName,
 } from "./saves_pool.js";
 
-export const SCHEMA = 2;
+// Version switches (a commit/restore that makes an already-stored blob current again, no upload) are not paid for by the PUT cap but
+// each one writes several rows, so they get their own generous per-account daily cap. The count lives in accts.sw and is added in the
+// accts UPDATE every commit/restore already does (no extra statement, no extra rows written); rollDay resets it.
+const DAY_SWITCHES = 600;
+export const SCHEMA = 3;   // 3: accts.sw (version switches today)
 export const MAX_BLOB = 16 * 1024 * 1024;
 const TICKET_SECS = 600;
 const B64_RE = /^[A-Za-z0-9+/]{1,4096}={0,2}$/;
@@ -51,7 +55,7 @@ export function initV2(d) {
   if (!cur || Number(cur.v) < SCHEMA) {      // migration tag: one-time column adds on the pre-v2 tables
     const add = (t, def) => { try { s.exec(`ALTER TABLE ${t} ADD COLUMN ${def}`); } catch { /* already there */ } };
     for (const c of ["vused INTEGER NOT NULL DEFAULT 0", "vprot INTEGER NOT NULL DEFAULT 0", "rev INTEGER NOT NULL DEFAULT 0", "day TEXT NOT NULL DEFAULT ''",
-      "a_ops INTEGER NOT NULL DEFAULT 0", "b_ops INTEGER NOT NULL DEFAULT 0", "v2 INTEGER NOT NULL DEFAULT 0", "active INTEGER NOT NULL DEFAULT 0"]) add("accts", c);
+      "a_ops INTEGER NOT NULL DEFAULT 0", "b_ops INTEGER NOT NULL DEFAULT 0", "sw INTEGER NOT NULL DEFAULT 0", "v2 INTEGER NOT NULL DEFAULT 0", "active INTEGER NOT NULL DEFAULT 0"]) add("accts", c);
     add("files", "dead INTEGER");
     s.exec(`INSERT INTO meta(k,v) VALUES('schema',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`, String(SCHEMA));
   }
@@ -61,7 +65,7 @@ export function initV2(d) {
 export const cfg = (d) => ({
   accountCap: num(d.env.ACCOUNT_CAP, ACCOUNT_CAP), protCap: num(d.env.PROT_CAP, PROT_CAP),
   tight: num(d.env.POOL_TIGHT, POOL_TIGHT), full: num(d.env.POOL_FULL, POOL_FULL),
-  dayPuts: num(d.env.DAY_PUT_MAX, DAY_PUTS), dayGets: num(d.env.DAY_GET_MAX, DAY_GETS),
+  daySwitches: num(d.env.DAY_SWITCH_MAX, DAY_SWITCHES), dayPuts: num(d.env.DAY_PUT_MAX, DAY_PUTS), dayGets: num(d.env.DAY_GET_MAX, DAY_GETS),
   maxVers: num(d.env.MAX_VERS, 4000), maxPaths: num(d.env.MAX_PATHS, 600), maxGames: num(d.env.MAX_GAMES, 300),
 });
 const poolOf = (d, c) => {
@@ -77,7 +81,7 @@ export function getAcct(d, uid) {
   return a;
 }
 export function rollDay(d, a) {
-  if (a.day !== d.st.day) { d.q(`UPDATE accts SET day=?, a_ops=0, b_ops=0 WHERE uid=?`, d.st.day, a.uid); a.day = d.st.day; a.a_ops = 0; a.b_ops = 0; }
+  if (a.day !== d.st.day) { d.q(`UPDATE accts SET day=?, a_ops=0, b_ops=0, sw=0 WHERE uid=?`, d.st.day, a.uid); a.day = d.st.day; a.a_ops = 0; a.b_ops = 0; a.sw = 0; }
 }
 function liveRef(d, uid, rkey) { return d.q(`SELECT 1 FROM vers WHERE uid=? AND rkey=? AND state<>'evicted' LIMIT 1`, uid, rkey).length > 0; }
 function blobSize(d, rkey) { const r = d.q(`SELECT size FROM files WHERE rkey=?`, rkey)[0]; return r ? r.size : 0; }
@@ -174,12 +178,26 @@ function largeItems(d, uid) {
   return d.q(`SELECT v.gkey game, v.path, v.class cls, v.mtime, v.stored, COALESCE(g.played_at,0) playedAt, COALESCE(g.pin,0) pin
     FROM vers v LEFT JOIN games g ON g.uid=v.uid AND g.gkey=v.gkey WHERE v.uid=? AND v.state='cur' AND v.prot=0 AND v.rkey IS NOT NULL`, uid);
 }
+// Tombstones are not counted by the path / version caps (they hold no data), so they get their own hard ceiling: when an eviction
+// pushes an account past MAX_TOMBS the OLDEST tombstones are deleted right then (amortised inside the eviction that made them, no
+// timer, no extra request). Total vers rows per account therefore stay <= maxVers + MAX_TOMBS.
+export const MAX_TOMBS = 400;
+function pruneTombstones(d, uid) {
+  const max = num(d.env.MAX_TOMBS, MAX_TOMBS);
+  const n = d.q(`SELECT COUNT(*) n FROM vers WHERE uid=? AND state='evicted'`, uid)[0].n;
+  if (n > max) {
+    d.q(`DELETE FROM vers WHERE rowid IN (SELECT rowid FROM vers WHERE uid=? AND state='evicted' ORDER BY ts ASC, rowid ASC LIMIT ?)`, uid, n - max);
+    // a game left with no versions at all, no pin and no running lease is dead weight too
+    d.q(`DELETE FROM games WHERE uid=? AND pin=0 AND lease_until<? AND NOT EXISTS (SELECT 1 FROM vers v WHERE v.uid=games.uid AND v.gkey=games.gkey)`, uid, Math.floor(Date.now() / 1000));
+  }
+}
 // Turn the newest row of a path into a tombstone ("evicted": bytes gone, row kept so the client knows why).
 function evictPath(d, uid, gkey, path, nowS, dels) {
   const rows = d.q(`SELECT ver,rkey FROM vers WHERE uid=? AND gkey=? AND path=? ORDER BY ver DESC`, uid, gkey, path);
   if (!rows.length) return 0;
   d.q(`DELETE FROM vers WHERE uid=? AND gkey=? AND path=? AND ver<>?`, uid, gkey, path, rows[0].ver);
   d.q(`UPDATE vers SET state='evicted', rkey=NULL WHERE uid=? AND gkey=? AND path=? AND ver=?`, uid, gkey, path, rows[0].ver);
+  pruneTombstones(d, uid);
   let freed = 0;
   for (const rk of new Set(rows.map((r) => r.rkey).filter(Boolean))) freed += freeIfUnref(d, uid, rk, nowS, dels);
   return freed;
@@ -324,6 +342,8 @@ function parsePlan(b) {
   return { game, played, files };
 }
 
+const LIVE_GAME = `(g.pin=1 OR g.lease_until>? OR EXISTS (SELECT 1 FROM vers v WHERE v.uid=g.uid AND v.gkey=g.gkey AND v.state<>'evicted'))`;
+
 function curRow(d, uid, gkey, path) {
   return d.q(`SELECT * FROM vers WHERE uid=? AND gkey=? AND path=? ORDER BY ver DESC LIMIT 1`, uid, gkey, path)[0] || null;
 }
@@ -337,10 +357,14 @@ function opPlan(d, q, now) {
   const names = devNames(d, uid);
   const pool = poolOf(d, c);
   const lcap = largeCap(pool.state, a.vprot, c.accountCap, pool.frac);
-  const counts = d.q(`SELECT (SELECT COUNT(*) FROM vers WHERE uid=?) v, (SELECT COUNT(DISTINCT gkey||'/'||path) FROM vers WHERE uid=?) p, (SELECT COUNT(*) FROM games WHERE uid=?) g,
-    (SELECT COUNT(*) FROM games WHERE uid=? AND gkey=?) hg`, uid, uid, uid, uid, P.game)[0];
+  // Caps count LIVE data only: an evicted path keeps a tombstone row (so the client can tell why it is gone) and its game keeps
+  // a games row, but neither may keep blocking new saves. A game counts while it has a live version, a pin or a running lease.
+  const counts = d.q(`SELECT (SELECT COUNT(*) FROM vers WHERE uid=? AND state<>'evicted') v,
+    (SELECT COUNT(DISTINCT gkey||'/'||path) FROM vers WHERE uid=? AND state<>'evicted') p,
+    (SELECT COUNT(*) FROM games g WHERE g.uid=? AND ${LIVE_GAME}) g,
+    (SELECT COUNT(*) FROM games g WHERE g.uid=? AND g.gkey=? AND ${LIVE_GAME}) hg`, uid, uid, uid, nowS, uid, P.game, nowS)[0];
   const outs = P.files.map((f) => ({ path: f.path, f, cls: classifyPath(f.path, f.size) }));
-  let newPaths = 0;
+  let newPaths = 0, flipsPlanned = 0;
   const results = [], accepted = [], uploads = new Set();
   const evictable = largeItems(d, uid).filter((i) => i.game !== P.game).reduce((s, i) => s + i.stored, 0);
   let evictLeft = evictable, runUsed = a.vused, runProt = a.vprot, runLarge = a.vused - a.vprot;
@@ -359,7 +383,7 @@ function opPlan(d, q, now) {
     if (cur && cur.state !== "evicted" && cur.sha === f.sha) { Object.assign(res, { action: "same", ver: cur.ver }); other++; continue; }
     if ((cur ? cur.ver : 0) !== f.base) { Object.assign(res, { action: "conflict", current: curEntry(cur, names) }); other++; continue; }
     if (f.stored > MAX_BLOB) { Object.assign(res, { action: "skip", reason: "too-large" }); other++; continue; }
-    if (!cur) {
+    if (!cur || cur.state === "evicted") {   // a tombstone is not a live path
       if (counts.p + newPaths >= c.maxPaths) { Object.assign(res, { action: "skip", reason: "too-many-files" }); other++; continue; }
       newPaths++;
     }
@@ -369,6 +393,10 @@ function opPlan(d, q, now) {
     const refd = exists && liveRef(d, uid, rkey);
     const stored = exists ? row.size : f.stored;
     const added = refd || uploads.has(rkey) ? 0 : stored;   // bytes this file adds to the account
+    // A switch back to an already-stored version (no upload) uses the daily switch allowance. Only THOSE entries are refused when it
+    // is used up ("switch-limit"); real uploads in the same plan go through. The commit does not re-check the cap (the plan did), so
+    // two plans racing from one account can overshoot by a few; that is accepted, the cap is a runaway guard, not an exact meter.
+    if ((exists || uploads.has(rkey)) && cur && a.sw + flipsPlanned >= c.daySwitches) { Object.assign(res, { action: "skip", reason: "switch-limit" }); other++; continue; }
     if (prot) {
       let need = runUsed + added - c.accountCap;
       if (runProt + added > c.protCap || need > evictLeft) {
@@ -384,8 +412,9 @@ function opPlan(d, q, now) {
     runUsed += added; if (prot) runProt += added; else runLarge += added;
     const act = exists || uploads.has(rkey) ? "have" : "upload";
     if (act === "upload") uploads.add(rkey);
+    if (act === "have" && cur) flipsPlanned++;
     Object.assign(res, { action: act, sha: f.sha, stored, enc: rkey.endsWith(".z") ? "deflate" : "none" });
-    accepted.push({ path: f.path, sha: f.sha, size: f.size, stored, enc: res.enc, mtime: f.mtime, cls: o.cls, base: f.base, rkey, st: act });
+    accepted.push({ path: f.path, sha: f.sha, size: f.size, stored, enc: res.enc, mtime: f.mtime, cls: o.cls, base: f.base, rkey, st: act, flip: act === "have" && !!cur });
   }
   results.push(...P.files.map((f) => resMap.get(f.path)));
   if (protSkips && !other && !accepted.length) return E(507, "too-big-protected", { files: results });
@@ -446,7 +475,7 @@ function applyItem(d, uid, gkey, it, dev, nowS, keep, dels) {
   const rows = d.q(`SELECT ver,rkey,state FROM vers WHERE uid=? AND gkey=? AND path=? ORDER BY ver DESC`, uid, gkey, it.path);
   const ver = (rows[0] ? rows[0].ver : 0) + 1;
   const before = liveRef(d, uid, it.rkey);
-  d.q(`DELETE FROM vers WHERE uid=? AND gkey=? AND path=? AND state='evicted'`, uid, gkey, it.path);
+  if (rows.some((r) => r.state === "evicted")) d.q(`DELETE FROM vers WHERE uid=? AND gkey=? AND path=? AND state='evicted'`, uid, gkey, it.path);
   d.q(`UPDATE vers SET state='prev' WHERE uid=? AND gkey=? AND path=? AND state='cur'`, uid, gkey, it.path);
   d.q(`INSERT INTO vers(uid,gkey,path,ver,sha,size,stored,enc,mtime,dev,ts,class,rkey,state,prot) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'cur',?)`,
     uid, gkey, it.path, ver, it.sha, it.size, it.stored, it.enc, it.mtime, dev, nowS, it.cls, it.rkey, prot);
@@ -472,6 +501,7 @@ function opCommit(d, q, now) {
   if (body.done) return J({ r: "ok", ...body.done, replay: true });
   const gkey = body.game;
   let a = getAcct(d, uid);
+  rollDay(d, a);
   const names = devNames(d, uid);
   const dels = [], evicted = [], results = [];
   const items = [...body.items].sort((x, y) => {
@@ -479,7 +509,7 @@ function opCommit(d, q, now) {
     return px - py || y.mtime - x.mtime;
   });
   const rev = a.rev + 1;
-  let applied = 0;
+  let applied = 0, flips = 0;
   for (const it of items) {
     const cur = curRow(d, uid, gkey, it.path);
     if (cur && cur.state !== "evicted" && cur.sha === it.sha) { results.push({ path: it.path, ver: cur.ver, cloud: "synced", unchanged: true }); continue; }
@@ -513,7 +543,7 @@ function opCommit(d, q, now) {
         break;
       }
     }
-    if (done) { dels.push(...done.mine); applied++; results.push({ path: it.path, ver: done.ver, cloud: "synced" }); }
+    if (done) { dels.push(...done.mine); applied++; if (it.flip) flips++; results.push({ path: it.path, ver: done.ver, cloud: "synced" }); }
   }
   // enforcement: shrink this account's large pool to the pool state's cap, then global pressure
   a = getAcct(d, uid);
@@ -523,7 +553,7 @@ function opCommit(d, q, now) {
   if (pool.state === "full") globalPressure(d, c, uid, gkey, nowS, dels, rev);
   recomputeUsage(d, uid);
   touchGame(d, uid, gkey, rev, { played_at: Math.min(body.played, nowS + 86400), device: q.dev || "" });
-  if (applied || evicted.length) d.q(`UPDATE accts SET rev=?, active=? WHERE uid=?`, rev, nowS, uid);
+  if (applied || evicted.length) d.q(`UPDATE accts SET rev=?, active=?, sw=sw+? WHERE uid=?`, rev, nowS, flips, uid);
   else d.q(`UPDATE accts SET active=? WHERE uid=?`, nowS, uid);
   seen(d, uid, q.dev, nowS);
   gcOrphans(d, uid, nowS, dels);
@@ -640,12 +670,15 @@ function opRestore(d, q, now) {
   if ((cur ? cur.ver : 0) !== (b.base ?? 0)) return E(412, "conflict", { current: curEntry(cur, names) });
   const src = d.q(`SELECT * FROM vers WHERE uid=? AND gkey=? AND path=? AND ver=?`, uid, g, path, b.ver)[0];
   if (!src || src.state === "evicted" || !src.rkey) return E(404, "not-found");
+  if (cur && cur.ver === src.ver) return J({ r: "ok", rev: a.rev, ver: cur.ver, dels: [], unchanged: true });   // already the current version: nothing to write
+  rollDay(d, a);
+  if (a.sw + 1 > e.c.daySwitches) return E(429, "account-daily-limit", { retryAfter: secondsToUtcMidnight(now) });
   const dels = [];
   const rev = a.rev + 1;
   const it = { path, sha: src.sha, size: src.size, stored: src.stored, enc: src.enc, mtime: src.mtime, cls: src.class, rkey: src.rkey };
   d.ctx.storage.transactionSync(() => { applyItem(d, uid, g, it, q.dev || "", nowS, null, dels); });
   recomputeUsage(d, uid);
-  d.q(`UPDATE accts SET rev=? WHERE uid=?`, rev, uid);
+  d.q(`UPDATE accts SET rev=?, sw=sw+1 WHERE uid=?`, rev, uid);
   touchGame(d, uid, g, rev);
   const nv = curRow(d, uid, g, path);
   return J({ r: "ok", rev, ver: nv.ver, dels: outDels(d, uid, nowS, dels) });
@@ -698,7 +731,9 @@ function opLease(d, q, now) {
     return J({ r: "ok", until: nowS + LEASE_SECS });
   }
   if (row && leaseHeld(row, q.dev, nowS) && !b.take) return E(423, "lease-held", { held: held(row) });
-  if (!row && d.q(`SELECT COUNT(*) n FROM games WHERE uid=?`, uid)[0].n >= c.maxGames) return E(507, "too-many-files", { max: c.maxGames });
+  // live games only (see opPlan); the raw row count has a hard ceiling so expired leases cannot pile up rows without end
+  if (!row && (d.q(`SELECT COUNT(*) n FROM games g WHERE g.uid=? AND ${LIVE_GAME}`, uid, nowS)[0].n >= c.maxGames
+    || d.q(`SELECT COUNT(*) n FROM games WHERE uid=?`, uid)[0].n >= c.maxGames * 4)) return E(507, "too-many-files", { max: c.maxGames });
   const rev = bumpRev(d, uid);
   d.q(`INSERT INTO games(uid,gkey,played_at,device,lease_dev,lease_since,lease_until,rev) VALUES(?,?,?,?,?,?,?,?)
     ON CONFLICT(uid,gkey) DO UPDATE SET lease_dev=excluded.lease_dev, lease_since=excluded.lease_since, lease_until=excluded.lease_until, played_at=MAX(played_at,excluded.played_at), device=excluded.device, rev=excluded.rev`,

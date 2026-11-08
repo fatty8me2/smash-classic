@@ -34,6 +34,7 @@ const SUITE = [
   { file: "test_fix3.mjs", kind: "ws", vars: { TEST_ALIAS: "1", TEST_ALIAS_FAIL_ONCE: "1", TEST_FRIEND_CAP: "2" } },
   { file: "test_friends_dedupe.mjs", kind: "ws", vars: { ADMIN_UID: ADMIN } },
   { file: "test_friends_fixes.mjs", kind: "http" },
+  { file: "test_friends_daycap.mjs", kind: "http", vars: { ALLOW_TEST_FLAG: "1", DAYCAP_DAYMS: "12000", DAYCAP_MSG: "5", DAYCAP_REACT: "3", DAYCAP_INVITE: "2" } },
   { file: "test_hostmig.mjs", kind: "ws" },
   { file: "test_hostgrace.mjs", kind: "ws", vars: { HOST_GRACE_MS: "1500" } },
   { file: "test_hub_reasons.mjs", kind: "ws" },

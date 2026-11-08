@@ -1,4 +1,5 @@
 // Node test for server limits and presence selection.
+// Local vars (run_all_tests.mjs sets the same by default): --var REG_APPROVAL_DEFAULT:0 --var ALLOW_TEST_FLAG:1 --var TEST_REG:1 --var BUDGET_TEST:1
 // Run: npx wrangler dev --port 8771   (in another shell), then: node test_limits.mjs ws://127.0.0.1:8771
 // Pure checks import src/limits.js directly; the last check talks to a running
 // `wrangler dev`. Usage: node test_limits.mjs [ws://127.0.0.1:8771]
