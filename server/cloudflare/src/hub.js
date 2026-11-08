@@ -83,6 +83,7 @@ const MAX_TEXT_BYTES = 4096;
 const MAX_BINARY_BYTES = 1200;
 const SMASH_LINK_TTL_MS = 6 * 3600 * 1000;
 const isGameRoom = (room) => room.includes("-");
+const stripSecrets = (body) => { const { np_3ds, ...rest } = body; return rest; };   // eslint-disable-line no-unused-vars
 
 // Strict rooms (owner switch, default OFF; registry flag strict_rooms): EVERY seat (lobby and "-N" game rooms, spectators too) must prove a registered, approved
 // account with an ident within IDENT_WAIT_MS of its welcome, or it is closed (error ident-required, 4013). Spectators prove it too (they may
@@ -293,8 +294,11 @@ export class HubRoom extends DurableObject {
 
   broadcast(obj, except, list) {
     const text = JSON.stringify(obj);
+    let watchText = null;   // a launch's 3DS room password (np_3ds) is for seated players only: watchers get the message without it (onlineflow-M6)
     for (const m of list || this.members(except)) {
-      try { m.ws.send(text); } catch { /* closing */ }
+      let t = text;
+      if (m.spec && obj.type === "msg" && obj.body && obj.body.np_3ds !== undefined) t = watchText ??= JSON.stringify({ ...obj, body: stripSecrets(obj.body) });
+      try { m.ws.send(t); } catch { /* closing */ }
     }
   }
 
@@ -452,7 +456,7 @@ export class HubRoom extends DurableObject {
     if (spec && !isGameRoom(room)) {
       const l = dropRec || await this.getLaunch();
       if (l && l.body && Date.now() - l.at < SMASH_LINK_TTL_MS) {
-        try { pair[1].send(JSON.stringify({ type: "msg", from: 0, body: dropRec ? { ...l.body, watch: true, dropin_join: true } : { ...l.body, watch: true } })); } catch { /* closing */ }
+        try { pair[1].send(JSON.stringify({ type: "msg", from: 0, body: dropRec ? { ...stripSecrets(l.body), watch: true, dropin_join: true } : { ...stripSecrets(l.body), watch: true } })); } catch { /* closing */ }
       }
     }
     this.sendMembers();

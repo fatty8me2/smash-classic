@@ -64,9 +64,15 @@ await sleep(1500);
 check(!gb.closed && !gb.err(), "member: B keeps the seat after its proof is checked");
 check(!gh.closed && !gh.err(), "member: the host keeps its seat");
 
-// a non-member with the code is refused
-const gc = seat(G1, "join", { who: C, slot: 3 });
-check(await gc.until(() => gc.closed) && gc.err() === "not-in-lobby" && gc.closed.code === 4015, "non-member: C with the code on a missing slot -> not-in-lobby (4015)");
+// a non-member with the code is refused (a lobby that has only its host: no seat 1 there)
+const L2 = code();
+const l2h = seat(L2, "host", { who: A });
+await l2h.until(() => l2h.welcomed());
+await sleep(800);
+const g2h = seat(L2 + "-1", "host", { who: A });
+await g2h.until(() => g2h.welcomed());
+const gc = seat(L2 + "-1", "join", { who: C, slot: 1 });
+check(await gc.until(() => gc.closed) && gc.err() === "not-in-lobby" && gc.closed.code === 4015, "non-member: C with the code, lobby has no such slot -> not-in-lobby (4015)");
 const gc2 = seat(G1, "join", { who: C, slot: 2 });
 await gc2.until(() => gc2.welcomed());
 check(await gc2.until(() => gc2.closed) && gc2.err() === "slot-not-yours", "non-member: C on D's slot -> slot-not-yours");
@@ -103,8 +109,28 @@ const gh4 = seat(G4, "host", { who: A, caps: "reasons,gameauth" });
 await gh4.until(() => gh4.welcomed());
 const noProof = seat(G4, "join", { slot: 1, caps: "reasons,gameauth" });
 await noProof.until(() => noProof.welcomed());
-check(await noProof.until(() => noProof.closed, 6000) && noProof.err() === "ident-required", "gameauth: a seat that never proves its account is closed ident-required");
+await noProof.until(() => noProof.closed, 6000);
+check(noProof.err() === "ident-required", "gameauth: a seat that never proves its account is closed ident-required");
 check(!gh4.closed, "gameauth: the proven host stays");
+
+// onlineflow-M6: the 3DS room password in a launch is for seated players only
+{
+  const L3 = code();
+  const h = seat(L3, "host"), g = seat(L3, "join", { slot: 1 });
+  await h.until(() => h.welcomed()); await g.until(() => g.welcomed());
+  const w1 = seat(L3, "watch");
+  await w1.until(() => w1.welcomed());
+  h.ws.send(JSON.stringify({ type: "msg", body: { kind: "launch", game: "x", np_3ds: { password: "s3cret" } } }));
+  const got = (c) => c.text.find((m) => m.type === "msg" && m.body?.kind === "launch");
+  await g.until(() => got(g)); await w1.until(() => got(w1));
+  check(got(g)?.body.np_3ds?.password === "s3cret", "3ds password: a seated member gets np_3ds intact");
+  check(got(w1) && got(w1).body.np_3ds === undefined && !JSON.stringify(got(w1)).includes("s3cret"), "3ds password: a live watcher gets the launch without it");
+  await sleep(300);
+  const w2 = seat(L3, "watch");
+  await w2.until(() => got(w2));
+  check(got(w2) && got(w2).body.watch === true && !JSON.stringify(got(w2)).includes("s3cret"), "3ds password: a late watcher's replay has it stripped");
+  [h, g, w1, w2].forEach((s) => { try { s.ws.close(); } catch { /* closed */ } });
+}
 
 // a lobby blip: B's LOBBY socket drops, then B rejoins the game room: still a member; a stranger still is not
 lb.ws.close();
@@ -120,6 +146,6 @@ const gc5 = seat(G5, "join", { who: C, slot: 2 });
 await gc5.until(() => gc5.welcomed());
 check(await gc5.until(() => gc5.closed) && gc5.err() === "slot-not-yours", "lobby blip: a stranger still cannot take a member's slot");
 
-[lh, lb, ld, lo, gh, gb, gh2, gd2, gh3, old, f3, gh4, gh5, gb5].forEach((s) => { try { s.ws.close(); } catch { /* closed */ } });
+[lh, lb, ld, lo, gh, gb, gh2, gd2, gh3, old, f3, gh4, gh5, gb5, l2h, g2h].forEach((s) => { try { s.ws.close(); } catch { /* closed */ } });
 await sleep(200);
 process.exit(st.fails ? 1 : 0);
