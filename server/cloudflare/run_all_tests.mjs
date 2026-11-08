@@ -44,6 +44,8 @@ const SUITE = [
   { file: "test_link.mjs", kind: "http", vars: { LINK_TTL_SECONDS: "3", LINK_REDEEM_LIMIT: "5" } },
   { file: "test_link_bruteforce.mjs", kind: "http", vars: { LINK_REDEEM_LIMIT: "5", LINK_GLOBAL_LIMIT: "12" } },
   { file: "test_usernames.mjs", kind: "http" },
+  { file: "test_account_wipe.mjs", kind: "http", vars: { BUDGET_TEST: "1", ALLOW_TEST_FLAG: "1", REG_APPROVAL_DEFAULT: "0" } },
+  { file: "test_account_devices.mjs", kind: "ws", vars: { ALLOW_TEST_FLAG: "1", UNAME_HOLD_MS: "600000", REG_APPROVAL_DEFAULT: "0" } },
   { file: "test_presence.mjs", kind: "http" },
   { file: "test_playtime.mjs", kind: "ws", vars: { TEST_PT_STALE_MS: "0" } },
   { file: "test_relay.mjs", kind: "ws" },

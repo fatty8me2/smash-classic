@@ -17,10 +17,10 @@ class User {
     return new Promise((resolve) => {
       this.events = []; this.closeCode = null; this.welcome = null;
       const ws = this.ws = new WebSocket(`${base}/friends?uid=${this.uid}`);
-      ws.onopen = () => ws.send(JSON.stringify({ type: "hello", secret: this.secret, name: this.name }));
+      ws.onopen = () => ws.send(JSON.stringify({ type: "hello", secret: this.secret, name: this.name, dev: 1, pc: "pc-" + this.uid.slice(0, 14) }));
       ws.onmessage = (e) => {
         const m = JSON.parse(e.data);
-        if (m.type === "welcome") { this.welcome = m; resolve(m); }
+        if (m.type === "welcome") { if (m.device) this.secret = m.device.secret; this.welcome = m; resolve(m); }
         this.events.push(m);
       };
       ws.onclose = (e) => { this.closeCode = e.code; resolve(null); };
