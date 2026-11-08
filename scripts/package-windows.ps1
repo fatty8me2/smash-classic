@@ -43,7 +43,16 @@ param(
     # Ignore the "BattleShip sources unchanged" cache and rebuild BattleShip/torch/f3d.o2r anyway.
     [switch]$ForceBattleShip,
     # Build every RetroHub target (all tests included) like the old behaviour, instead of only the shipped ones.
-    [switch]$BuildAllHub
+    [switch]$BuildAllHub,
+    # Mark this release "hub-only" in SHA256SUMS.txt: Smash Classic's own files are unchanged since -SmashSince. An updater installs only
+    # RetroHub-windows.zip when the BattleShip.exe it already has is byte-identical to the one in this package (the marker carries its SHA-256);
+    # everyone else still gets the full BattleShip-windows.zip. Without the switch every updater installs the full zip (the safe default).
+    # Same as $env:RETROHUB_HUB_ONLY=1. Needs -SmashSince (or $env:RETROHUB_SMASH_SINCE): the release whose Smash Classic files are reused. This
+    # package then stamps BattleShip.exe with THAT version instead of the new one, so it is byte-identical to the earlier release's exe.
+    [switch]$HubOnlyRelease,
+    [string]$SmashSince = "",
+    # Local dev / QA packages only: skip signing SHA256SUMS.txt. Updaters that check signatures refuse an unsigned release, so never publish one.
+    [switch]$Unsigned
 )
 $ErrorActionPreference = "Stop"
 $script:PkgClock = [System.Diagnostics.Stopwatch]::StartNew()
@@ -87,6 +96,11 @@ $Jobs = if ($env:NUMBER_OF_PROCESSORS) { [int]$env:NUMBER_OF_PROCESSORS } else {
 
 # Per-step wall-clock timing: every Write-Step closes the previous step and prints its elapsed time;
 # Show-Timings prints the table (also written to <DistDir>\package-timings.txt) at the end or on failure.
+$HubOnlyRequested = $HubOnlyRelease -or ($env:RETROHUB_HUB_ONLY -eq "1")
+if (-not $SmashSince -and $env:RETROHUB_SMASH_SINCE) { $SmashSince = $env:RETROHUB_SMASH_SINCE }
+if ($HubOnlyRequested -and $SmashSince -notmatch '^v?\d+(\.\d+)*$') {
+    Write-Error "-HubOnlyRelease needs -SmashSince <version> (the release whose Smash Classic files this one reuses, e.g. v1.39.0)"; exit 1
+}
 $script:StepLog = New-Object System.Collections.ArrayList
 $script:StepName = $null
 $script:StepStart = 0.0
@@ -287,7 +301,8 @@ New-Item -ItemType Directory -Path $StageDir | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $StageDir "yamls\$Ver") | Out-Null
 
 Copy-Item $GameExe        (Join-Path $StageDir "$AppName.exe")
-Set-ExeVersion (Join-Path $StageDir "$AppName.exe") ((Get-Content (Join-Path $Root "VERSION") -Raw).Trim())
+# A hub-only release keeps Smash Classic exactly as it was at -SmashSince, so its exe carries THAT version stamp (see -HubOnlyRelease).
+Set-ExeVersion (Join-Path $StageDir "$AppName.exe") $(if ($HubOnlyRequested) { $SmashSince } else { (Get-Content (Join-Path $Root "VERSION") -Raw).Trim() })
 Copy-Item $TorchExe      (Join-Path $StageDir "torch.exe")
 Copy-Item $F3DO2R        (Join-Path $StageDir "f3d.o2r")
 Copy-Item (Join-Path $Root "gamecontrollerdb.txt") $StageDir
@@ -508,6 +523,42 @@ if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
 & (Join-Path $PSScriptRoot "zip-portable.ps1") -Source $StageDir -Destination $ZipPath -Level $ZipLevel
 if (-not (Test-Path $ZipPath)) { Fail "zip was not created" }
 
+# ── 5b. RetroHub-windows.zip: the RetroHub part of the install and nothing of Smash Classic's ──
+# What the hub build copies into the stage above (RetroHub.exe + the runners + helper, SDL2/CRT DLLs, data\, cores\, emu\, and the emulator
+# license notes) and NOTHING else: no BattleShip.exe, torch.exe, f3d.o2r, config.yml, yamls\, assets\, .tcc\, gamecontrollerdb.txt, icons,
+# LICENSE.txt or the libultraship/torch licenses. The updater (update_apply.cpp, is_smash_classic_file) drops those from a hub-only apply
+# as well, so a bad zip cannot touch them. BattleShip-windows.zip above is unchanged and still shipped: v1.39.0 and older only know that name.
+$HubZipPath = $null
+if ($Ver -eq "us" -and (Test-Path (Join-Path $StageDir "RetroHub.exe"))) {
+    Write-Step "Compressing RetroHub-windows.zip (RetroHub files only)"
+    $HubStage = Join-Path $DistDir "RetroHub-stage"
+    if (Test-Path $HubStage) { Remove-Item -Recurse -Force $HubStage }
+    New-Item -ItemType Directory -Path $HubStage | Out-Null
+    foreach ($n in @("RetroHub.exe", "RetroHub.pdb", "n64run.exe", "retrorun.exe", "streamrun.exe", "rh-helper.exe", "SDL2.dll",
+                     "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+        $src = Join-Path $StageDir $n
+        if (Test-Path $src) { Copy-Item $src $HubStage }
+    }
+    foreach ($d in @("data", "cores", "emu")) {
+        $src = Join-Path $StageDir $d
+        if (Test-Path $src) { Copy-Item $src (Join-Path $HubStage $d) -Recurse -Force }
+    }
+    $HubLic = Join-Path $HubStage "licenses"
+    New-Item -ItemType Directory -Path $HubLic -Force | Out-Null
+    foreach ($n in @("mupen64plus-LICENSES.txt", "emulator-README.txt")) {
+        $src = Join-Path $StageDir "licenses\$n"
+        if (Test-Path $src) { Copy-Item $src $HubLic }
+    }
+    foreach ($bad in @("BattleShip.exe", "torch.exe", "f3d.o2r", "config.yml", "gamecontrollerdb.txt", "LICENSE.txt", "yamls", "assets", ".tcc", "BattleShip.ico")) {
+        if (Test-Path (Join-Path $HubStage $bad)) { Fail "RetroHub-windows.zip must not contain Smash Classic's $bad" }
+    }
+    $HubZipPath = Join-Path $DistDir "RetroHub-windows.zip"
+    if (Test-Path $HubZipPath) { Remove-Item $HubZipPath -Force }
+    & (Join-Path $PSScriptRoot "zip-portable.ps1") -Source $HubStage -Destination $HubZipPath -Level $ZipLevel
+    if (-not (Test-Path $HubZipPath)) { Fail "RetroHub-windows.zip was not created" }
+    Remove-Item -Recurse -Force $HubStage
+}
+
 # ── 6. Setup exe (Inno Setup 6) from the same staged files ──
 # US only: RetroHub-Setup.exe is the RetroHub installer. Requires Inno Setup 6:
 #   winget install --id JRSoftware.InnoSetup -e --silent
@@ -540,15 +591,69 @@ if ($Iscc) {
 # lowercase hex, LF endings, no BOM (sha256sum -c compatible). JP gets its own file name so variants never collide.
 Write-Step "Writing checksums"
 $SumsPath = Join-Path $DistDir $(if ($Ver -eq "jp") { "SHA256SUMS-JP.txt" } else { "SHA256SUMS.txt" })
-$SumLines = foreach ($f in @($ZipPath, $SetupPath)) {
+# Every release asset is listed here (release.ps1 uploads every file listed). A "# retrohub-only smash-sha256 <hash> smash-since <ver>"
+# comment line (-HubOnlyRelease) names the exact BattleShip.exe this release's RetroHub files assume; an updater uses RetroHub-windows.zip
+# only when its installed BattleShip.exe hashes to that. sha256sum -c and older updaters ignore the comment. The file is signed below.
+$IsHubOnly = $HubZipPath -and $HubOnlyRequested
+if ($HubOnlyRequested -and -not $HubZipPath) { Fail "-HubOnlyRelease needs RetroHub-windows.zip (US package with RetroHub built in)" }
+$SumLines = @()
+if ($IsHubOnly) {
+    $bsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $StageDir "$AppName.exe")).Hash.ToLower()
+    $SumLines += "# retrohub-only smash-sha256 $bsHash smash-since $SmashSince"
+}
+$SumLines += foreach ($f in @($ZipPath, $HubZipPath, $SetupPath)) {
     if ($f -and (Test-Path $f)) {
         $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower()
         "$h  $(Split-Path -Leaf $f)"
     }
 }
 [System.IO.File]::WriteAllText($SumsPath, (($SumLines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
-Write-Host "Checksums ready: $SumsPath" -ForegroundColor Green
+Write-Host "Checksums ready: $SumsPath$(if ($IsHubOnly) { ' (marked hub-only)' })" -ForegroundColor Green
 $SumLines | ForEach-Object { Write-Host "   $_" }
+
+# ── 7b. Sign SHA256SUMS.txt (ECDSA P-256 / SHA-256, DER signature -> SHA256SUMS.txt.sig) ──
+# The in-app updater (from the release that adds signature checking) refuses any release whose SHA256SUMS.txt.sig does not verify against the public key built into RetroHub
+# (src/hub/updater.cpp, kReleasePubKeyHex). The PRIVATE key stays on the release PC: this script only hands its path to openssl.
+# It is never copied, printed or logged.
+$ReleasePubKeyHex = "658c1b016ebdc2a00f89baf7a7b510026baa7da3b1515e14b6e6bf07f17a307ae2a7b0011d070804b8621e2462fa64a0ea806932b6573a13cf7db747f42fdb73"
+$SigPath = "$SumsPath.sig"
+if (Test-Path $SigPath) { Remove-Item $SigPath -Force }
+if ($Unsigned) {
+    Write-Host ""
+    Write-Host "################################################################" -ForegroundColor Red
+    Write-Host "#  UNSIGNED PACKAGE (-Unsigned): for local dev / QA ONLY.       #" -ForegroundColor Red
+    Write-Host "#  Signature-checking updaters REFUSE it. NEVER publish it.     #" -ForegroundColor Red
+    Write-Host "################################################################" -ForegroundColor Red
+} else {
+    Write-Step "Signing $(Split-Path -Leaf $SumsPath)"
+    $KeyPath = if ($env:RETROHUB_SIGNING_KEY) { $env:RETROHUB_SIGNING_KEY } else { Join-Path $env:USERPROFILE ".retrohub-release\release-signing-key.pem" }
+    if (-not (Test-Path -LiteralPath $KeyPath)) {
+        Fail "release signing key not found at $KeyPath. Set RETROHUB_SIGNING_KEY to its path, or pass -Unsigned for a local dev/QA package (never publishable)."
+    }
+    $Openssl = $null
+    $cmd = Get-Command openssl -ErrorAction SilentlyContinue
+    if ($cmd) { $Openssl = $cmd.Source }
+    foreach ($c in @("C:\Program Files\Git\usr\bin\openssl.exe", "C:\Program Files (x86)\Git\usr\bin\openssl.exe")) {
+        if (-not $Openssl -and (Test-Path $c)) { $Openssl = $c }
+    }
+    if (-not $Openssl) { Fail "openssl not found (it ships with Git for Windows: C:\Program Files\Git\usr\bin\openssl.exe)" }
+    $PubDer = Join-Path $DistDir "release-signing-pub.der"
+    & $Openssl pkey -in $KeyPath -pubout -outform DER -out $PubDer
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $PubDer)) { Fail "openssl could not read the signing key (is it a P-256 EC key?)" }
+    $pubBytes = [System.IO.File]::ReadAllBytes($PubDer)
+    if ($pubBytes.Length -ne 91) { Remove-Item $PubDer -Force; Fail "the signing key is not an ECDSA P-256 key" }
+    $gotHex = (($pubBytes[27..90] | ForEach-Object { $_.ToString("x2") }) -join "")
+    if ($gotHex -ne $ReleasePubKeyHex) { Remove-Item $PubDer -Force; Fail "the signing key does not match the public key built into RetroHub; a release signed with it would be refused by every updater" }
+    & $Openssl dgst -sha256 -sign $KeyPath -out $SigPath $SumsPath
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $SigPath)) { Remove-Item $PubDer -Force; Fail "signing SHA256SUMS failed" }
+    $PubPem = Join-Path $DistDir "release-signing-pub.pem"
+    & $Openssl pkey -pubin -inform DER -in $PubDer -outform PEM -out $PubPem
+    & $Openssl dgst -sha256 -verify $PubPem -signature $SigPath $SumsPath | Out-Null
+    $verifyRc = $LASTEXITCODE
+    Remove-Item $PubDer, $PubPem -Force -ErrorAction SilentlyContinue
+    if ($verifyRc -ne 0) { Remove-Item $SigPath -Force -ErrorAction SilentlyContinue; Fail "the new signature does not verify against the public key; not publishing a bad signature" }
+    Write-Host "Signed and verified: $SigPath" -ForegroundColor Green
+}
 
 $ZipKB = [int]((Get-Item $ZipPath).Length / 1024)
 Show-Timings
