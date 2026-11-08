@@ -292,7 +292,7 @@ const keep = (c) => { all.push(c); return c; };
   await C.ask({ type: "set_username", name: n2 });
   const err = await C.ask({ type: "delete_account" }, "error");
   check("delete_account needs confirm", err && err.detail === "confirm-required");
-  C.send({ type: "delete_account", confirm: true });
+  C.send({ type: "delete_account", confirm: true, typed: "RH-" + C.acct.uid.slice(0, 4).toUpperCase() + "-" + C.acct.uid.slice(4, 8).toUpperCase() });
   await sleep(500);
   check("delete_account closes the socket (4005)", C.closed === 4005, `closed=${C.closed}`);
   check("deleted account's name is free immediately (no hold)", (await B.ask({ type: "set_username", name: n2 })).ok);
