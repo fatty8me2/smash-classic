@@ -88,7 +88,7 @@ await reg("t_failpush", { n: 0 });
 
 // a retired / deleted account has no hub to push to: its "none" answer counts as done (no endless retry loop)
 const D = await mk(base, nm("Deleted"));
-D.send({ type: "delete_account", confirm: true });
+D.send({ type: "delete_account", confirm: true, typed: "RH-" + D.uid.slice(0, 4).toUpperCase() + "-" + D.uid.slice(4, 8).toUpperCase() });
 await untilTrue(() => D.closed === 4005, 4000);
 const bd = await ask(adm, { type: "admin_ban", uid: D.uid }, "admin_result");
 check(bd && bd.ok && bd.applied === true, "banning a deleted account: its 'none' reply counts as done (applied)");

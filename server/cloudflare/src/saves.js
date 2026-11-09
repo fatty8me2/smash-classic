@@ -52,26 +52,49 @@ export { cleanKey };
 
 export const gateReason = (g) => (g === "pending" ? "pending-approval" : g === "held" ? "server-busy" : "account-unavailable");
 
+const badAuth = new Map();   // ip -> { start, n } failed-auth counter, per isolate (best effort, resets on restart: fine for a flood guard)
+const BAD_AUTH_MAX = 120, BAD_AUTH_WINDOW_MS = 60000;
+const badMax = (env) => { const v = env && env.ALLOW_TEST_FLAG === "1" ? Number(env.SAVES_BADAUTH_MAX) : 0; return v > 0 ? v : BAD_AUTH_MAX; };   // env override: tests only (ALLOW_TEST_FLAG=1, never set in production)
+function badAuthBlocked(env, ip) {
+  const e = badAuth.get(ip);
+  return !!e && Date.now() - e.start < BAD_AUTH_WINDOW_MS && e.n >= badMax(env);
+}
+function noteBadAuth(ip) {
+  const t = Date.now(), e = badAuth.get(ip);
+  if (!e || t - e.start >= BAD_AUTH_WINDOW_MS) {
+    if (badAuth.size > 5000) badAuth.clear();
+    badAuth.set(ip, { start: t, n: 1 });
+  } else e.n++;
+}
+
 export async function authenticate(request, env, url, write, cls) {
   const h = request.headers.get("Authorization") || "";
   const m = /^RHSIG uid=([a-z2-7]{26}),ts=(\d{10,16}),sig=([0-9a-f]{64})$/.exec(h);
   if (!m) return { res: err(401, "unauthorized") };
   const [, uid, ts, sig] = m;
   if (Math.abs(Date.now() - Number(ts)) > SKEW_MS) return { res: err(401, "stale-timestamp", { serverTime: Date.now() }) };
+  // Known residual: the per-IP block below runs BEFORE the signature check (so a flood never reaches the Durable Object), which means
+  // that once an IP has passed the failure threshold, real players behind that same IP get 429 until the minute is up. That only
+  // affects people sharing the flooding address; nobody elsewhere can lock out an account any more. Every request, forged or not,
+  // is still counted by the Worker-wide REQ_BUDGET (index.js noteRequest, and the userhub call meters a "do" request), so a spread-out
+  // flood degrades service through the global guard instead of costing money.
+  // Requests that fail authentication are counted against the caller's IP here (this isolate's memory, no storage write), never
+  // against the account they claim to be: otherwise anyone who knows a uid could make that player's saves answer "rate-limited".
+  const ip = request.headers.get("CF-Connecting-IP") || "-";
+  if (badAuthBlocked(env, ip)) return { res: err(429, "rate-limited", { retryAfter: 60 }) };
+  const hv = (n) => request.headers.get(n) || "-";
+  const msgS = `${request.method}\n${url.pathname}${url.search}\n${ts}\n${hv("X-RH-Sha")}\n${hv("If-Match")}\n${hv("If-None-Match")}\n${request.method === "PUT" ? hv("Content-Length") : "-"}\n${hv("X-RH-Mtime")}`;
   const hub = env.USER_HUBS.get(env.USER_HUBS.idFromName(uid));
   const r = await hub.fetch("https://userhub/i/saves_auth", {
     method: "POST",
     headers: { "x-rh-internal": "1", "content-type": "application/json" },
-    body: JSON.stringify({ uid, write, cls }),
+    body: JSON.stringify({ uid, write, cls, msg: msgS, sig }),
   });
   const a = await r.json();
+  // The hub checked the signature before counting anything; only a valid signature is rate limited (against the account).
   if (a.r === "limited") return { res: err(429, "rate-limited", { retryAfter: 60 }) };
-  if ((a.r !== "ok" && a.r !== "gated") || typeof a.key !== "string") return { res: err(401, "unauthorized") };
-  const hv = (n) => request.headers.get(n) || "-";
-  const msgS = `${request.method}\n${url.pathname}${url.search}\n${ts}\n${hv("X-RH-Sha")}\n${hv("If-Match")}\n${hv("If-None-Match")}\n${request.method === "PUT" ? hv("Content-Length") : "-"}\n${hv("X-RH-Mtime")}`; const want = await hmacHex(a.key, msgS);
-  if (!safeEq(want, sig)) return { res: err(401, "unauthorized") };
-  // A banned / denied / waiting account: refused, and only the holder of the account secret (a valid signature) is told why.
-  if (a.r === "gated") { const reason = gateReason(a.gate); return { res: err(403, reason, { reason }) }; }
+  if (a.r === "gated") { const reason = gateReason(a.gate); return { res: err(403, reason, { reason }) }; }   // a banned / denied / waiting account: only the holder of the secret (a valid signature) is told why
+  if (a.r !== "ok") { noteBadAuth(ip); return { res: err(401, "unauthorized") }; }
   return { uid };
 }
 
