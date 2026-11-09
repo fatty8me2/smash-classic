@@ -1766,7 +1766,6 @@ export class UserHub extends DurableObject {
     // The shared root secret keeps working for every PC that has not updated.
     let device = null, devId = cred.kind === "d" ? cred.dev : undefined;
     const pcOk = typeof msg.pc === "string" && PC_RE.test(msg.pc) ? msg.pc : "";
-    if (cred.kind === "root" && msg.dev !== 1 && this.kvGet("legacy_seen") !== "1") this.kvSet("legacy_seen", "1");   // a PC that has not updated is on the shared secret
     if (msg.dev === 1 && pcOk) {
       const row = cred.kind === "d" ? this.one("SELECT pc, cdev, seen FROM devices WHERE id=?", cred.dev) : null;
       const otherPc = !!(row && pcOk && row.pc && row.pc !== pcOk);   // someone else's device secret (shared vault copy): this PC gets its own
@@ -1779,6 +1778,9 @@ export class UserHub extends DurableObject {
         if (t - row.seen > DEVICE_SEEN_MS || cdev !== row.cdev) this.run("UPDATE devices SET seen=?, cdev=? WHERE id=?", t, cdev, cred.dev);
       }
     }
+    // A PC that is still on a shared secret (the root secret or an account-code secret) after this hello counts as "another PC": one that has not
+    // updated, OR one whose enrolment just failed (no valid label, account full). That keeps "unsure means shared" true for every account.
+    if ((cred.kind === "root" || cred.kind === "r") && !(device && device.secret) && this.kvGet("legacy_seen") !== "1") this.kvSet("legacy_seen", "1");
     ws.serializeAttachment({ uid, authed: true, dc: msg.dev === 1 ? 1 : 0, ck: cred.kind, ...(devId ? { dev: devId } : {}), status: { state: "online", updated: now() } });
     if (this.wantsTest(msg, name)) this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('is_test', '1')");
     if (typeof msg.auto_friend === "boolean") this.run("INSERT OR REPLACE INTO kv (k, v) VALUES ('auto_friend', ?)", msg.auto_friend ? "1" : "0");

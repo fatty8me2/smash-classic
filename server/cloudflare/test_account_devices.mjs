@@ -157,6 +157,17 @@ const a5 = await newAccount();
 a5.send({ type: "retire_old", uid: mUid, secret: mNew.secret });
 check(await a5.wait(() => a5.has("retire_skipped")), "an up-to-date account is shared as soon as a PC on the shared secret connects");
 
+// ...also when a PC on the shared secret only FAILED to enrol (no valid PC label): it is still on the account
+const nRoot = rnd(52), nUid = rnd(26);
+const nOk = new Pc(nUid, nRoot, { pc: "pc-n-ok-0001" }); all.push(nOk); await nOk.connectAdopt();
+const nBad = new Pc(nUid, nRoot, { pc: "x" }); all.push(nBad);
+const nw = await nBad.connect();
+check(nw && !nw.device, "setup: a PC whose enrolment fails stays on the shared secret");
+const a6 = await newAccount();
+a6.send({ type: "retire_old", uid: nUid, secret: nOk.secret });
+check(await a6.wait(() => a6.has("retire_skipped")), "a PC whose enrolment failed counts as another PC: the account is not retired under it");
+check((await nBad.connect()) !== null, "...and that PC keeps working");
+
 // ---- 6. account codes seal a recovery secret ------------------------------------------------------------------------
 const eRoot = rnd(52), eUid = rnd(26);
 const e0 = new Pc(eUid, eRoot, { dev: false }); all.push(e0); await e0.connect();
