@@ -4,6 +4,13 @@
 #   .\scripts\release.ps1 -Version 1.27.3 -DryRun         # everything except push/release/deploy (scratch output dir, simulated GitHub)
 #   .\scripts\release.ps1 -Version 1.27.3 -DeployWorker   # also `wrangler deploy` the netplay Worker (just before publishing)
 #   .\scripts\release.ps1 -Version 1.27.3 -Notes notes.md # custom release notes (file path or literal text)
+#   .\scripts\release.ps1 -Version 1.27.3 -NotesFile notes.md   # hand-written notes from a UTF-8 file (wins over -Notes)
+#   .\scripts\release.ps1 -Version 1.27.3 -HubDir C:\path\to\RetroHub-worktree   # release the commit checked out in a RetroHub
+#       worktree (any branch/detached HEAD): VERSION, build dir, RETROHUB_DIR and the push source (HEAD:main) all use it.
+#       origin/main of RetroHub must be an ancestor of that HEAD or the script stops. -HubDir is an alias of -RetroHubDir.
+# Before building, testing and packaging the script waits (checks every 60 s) while a game/emulator is running
+# (lichii, eden-cli, hookshot, Dolphin, Cemu, azahar, pcsx2-qt, PPSSPPWindows64, retrorun, n64run). The build runs at
+# BelowNormal priority with --parallel 2. The GitHub release title is "RetroHub X.Y.Z"; notes are uploaded as a UTF-8 file.
 #   .\scripts\release.ps1 -Version 1.27.3 -AlsoSmashClassic  # RARE: also publish to fatty8me2/smash-classic (Smash Classic's own releases)
 #
 # Releases go to fatty8me2/retrohub ONLY (the updater reads that repo since v1.27.3). smash-classic only gets
@@ -32,7 +39,8 @@ param(
     [switch]$DryRun,
     [switch]$DeployWorker,
     [string]$OutDir = "",                # asset output dir (default: <BattleShip>\dist, or a scratch dir for -DryRun)
-    [string]$RetroHubDir = "",           # default: sibling ..\RetroHub
+    [string]$NotesFile = "",             # hand-written release notes: path to a UTF-8 .md file (takes precedence over -Notes)
+    [Alias("HubDir")][string]$RetroHubDir = "",   # default: sibling ..\RetroHub; may be a worktree (its HEAD is what is released)
     [string]$BattleShipBranch = "rollback-synctest",
     [string]$RetroHubBranch = "main",    # branch pushed to RetroHub origin
     [string]$CmakeBin = "C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin",
@@ -52,6 +60,7 @@ $Hub = if ($RetroHubDir) { $RetroHubDir } else { Join-Path (Split-Path $Root -Pa
 $Decomp = Join-Path $Root "decomp"
 $Tag = "v" + $Version.TrimStart('v', 'V')
 $Bare = $Tag.Substring(1)
+$Title = "RetroHub $Bare"
 $BsRepo = "fatty8me2/smash-classic"
 $HubRepo = "fatty8me2/retrohub"
 $RequiredAssets = @("RetroHub-Setup.exe", "BattleShip-windows.zip", "SHA256SUMS.txt", "SHA256SUMS.txt.sig")
@@ -88,6 +97,15 @@ function Run([string]$what, [scriptblock]$b) {
     if ($DryRun) { Write-Host "[dry-run] would: $what" -ForegroundColor Yellow } else { Write-Host "> $what"; & $b; if ($LASTEXITCODE -ne 0) { Die "$what failed (exit $LASTEXITCODE)" } }
 }
 function GitC($repo) { $a = @($args); $ErrorActionPreference = "Continue"; $o = & git -C $repo @a 2>&1; if ($LASTEXITCODE -ne 0) { Die "git -C $repo $($a -join ' ') failed: $o" }; return ($o | Out-String).Trim() }
+$GameProcesses = @("lichii", "eden-cli", "hookshot", "Dolphin", "Cemu", "azahar", "pcsx2-qt", "PPSSPPWindows64", "retrorun", "n64run")
+function Wait-Games([string]$before) {   # never build/test/package while the user is playing
+    while ($true) {
+        $g = @(Get-Process -Name $GameProcesses -ErrorAction SilentlyContinue)
+        if ($g.Count -eq 0) { return }
+        Write-Host "waiting: a game is running ($((($g | ForEach-Object { $_.ProcessName }) | Sort-Object -Unique) -join ', ')); holding before $before, rechecking in 60 s" -ForegroundColor Yellow
+        Start-Sleep -Seconds 60
+    }
+}
 function Sha($p) { return (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLower() }
 
 # ── SHA256SUMS: strict parse + verify. Returns ordered name->hash for every file to upload. ──
@@ -142,12 +160,14 @@ function New-DraftRelease([string]$repo, [string[]]$files) {
             Copy-Item -LiteralPath $f -Destination (Join-Path $d $n) -Force
             if ($fault -eq "corrupt:$n") { Add-Content -LiteralPath (Join-Path $d $n) -Value ([byte[]]@(120)) -Encoding Byte; Write-Host "[dry-run] FAULT: corrupting $n" -ForegroundColor Yellow }
         }
-        Write-Host "[dry-run] would: gh release create $Tag -R $repo --draft --target main --title $Tag -F $NotesFile <$($files.Count) assets>" -ForegroundColor Yellow
+        Write-Host "[dry-run] would: gh release create $Tag -R $repo --draft --target main --title `"$Title`" -F $NotesPath <$($files.Count) assets>" -ForegroundColor Yellow
         return "DRY-$($repo -replace '/', '_')"
     }
-    & gh release create $Tag @files -R $repo --draft --target main --title $Tag -F $NotesFile
+    # Discard gh's stdout (the release URL): anything written here would be returned to the caller and corrupt the id.
+    & gh release create $Tag @files -R $repo --draft --target main --title $Title -F $NotesPath | Out-Null
     if ($LASTEXITCODE -ne 0) { return $null }
-    return (Find-Release $repo)
+    # Drafts are not reachable by tag: look the id up in the releases list.
+    return [string](Find-Release $repo)
 }
 function Get-RemoteAssets([string]$repo, [string]$id) {   # -> @{ name = @{id=..; size=..} }
     $m = @{}
@@ -202,21 +222,29 @@ Step "Preflight ($Tag$(if ($DryRun) { ', DRY RUN' }))"
 if ($LASTEXITCODE -ne 0) { Die "gh is not authenticated (run: gh auth login)" }
 
 $NotesScript = Join-Path $Hub "scripts\release_notes.ps1"
-$NotesFile = Join-Path ([System.IO.Path]::GetTempPath()) "release-notes-$Tag.md"
-if ($Notes) {
+$NotesPath = Join-Path ([System.IO.Path]::GetTempPath()) "release-notes-$Tag.md"
+if ($NotesFile) {
+    if (-not (Test-Path -LiteralPath $NotesFile)) { Die "-NotesFile not found: $NotesFile" }
+    $text = Get-Content -Raw -Encoding UTF8 -LiteralPath $NotesFile
+    if (-not $text -or -not $text.Trim()) { Die "-NotesFile is empty: $NotesFile" }
+} elseif ($Notes) {
     $text = if (Test-Path -LiteralPath $Notes) { Get-Content -Raw -Encoding UTF8 -LiteralPath $Notes } else { $Notes }
 } else {
     # Throws (exit 1) when data\changelog.json has no entry for this version: write the changelog first.
-    $text = (& powershell -NoProfile -ExecutionPolicy Bypass -File $NotesScript -Version $Bare) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or -not $text) { Die "no changelog entry for $Bare in $Hub\data\changelog.json (add it and commit, or pass -Notes)" }
+    # The child prints UTF-8; decode it as UTF-8 here (the default OEM codepage garbled non-ASCII notes).
+    $prevEnc = [Console]::OutputEncoding
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    try { $text = (& powershell -NoProfile -ExecutionPolicy Bypass -File $NotesScript -Version $Bare) -join "`n" }
+    finally { [Console]::OutputEncoding = $prevEnc }
+    if ($LASTEXITCODE -ne 0 -or -not $text) { Die "no changelog entry for $Bare in $Hub\data\changelog.json (add it and commit, or pass -Notes / -NotesFile)" }
 }
-[System.IO.File]::WriteAllText($NotesFile, $text.TrimEnd() + "`n", (New-Object System.Text.UTF8Encoding($false)))
-Write-Host "Release notes ($NotesFile):"; Get-Content $NotesFile | Select-Object -First 12 | ForEach-Object { Write-Host "   $_" }
+[System.IO.File]::WriteAllText($NotesPath, $text.TrimEnd() + "`n", (New-Object System.Text.UTF8Encoding($false)))
+Write-Host "Release notes ($NotesPath, title '$Title'):"; Get-Content -Encoding UTF8 $NotesPath | Select-Object -First 12 | ForEach-Object { Write-Host "   $_" }
 
 $bsBranch = GitC $Root rev-parse --abbrev-ref HEAD
 $hubBranch = GitC $Hub rev-parse --abbrev-ref HEAD
 if ($bsBranch -ne $BattleShipBranch) { Die "BattleShip is on '$bsBranch', expected '$BattleShipBranch' (use -BattleShipBranch)" }
-if ($hubBranch -ne $RetroHubBranch) { Die "RetroHub is on '$hubBranch', expected '$RetroHubBranch' (use -RetroHubBranch)" }
+if (-not $RetroHubDir -and $hubBranch -ne $RetroHubBranch) { Die "RetroHub is on '$hubBranch', expected '$RetroHubBranch' (use -RetroHubBranch)" }
 if (-not $AllowDirty) {
     foreach ($r in @($Root, $Hub)) {
         $dirty = (GitC $r status --porcelain --ignore-submodules=dirty) -split "`n" | Where-Object { $_ -and $_ -notmatch '^\s*M\s+VERSION$' -and $_ -notmatch '^\?\? (dist|build)' }
@@ -229,7 +257,7 @@ GitC $Hub fetch origin main | Out-Null
 & git -C $Root merge-base --is-ancestor fatty/main HEAD
 if ($LASTEXITCODE -ne 0) { if ($DryRun) { Write-Host "WARNING: fatty/main has commits that $BattleShipBranch lacks (a real run would stop here)" -ForegroundColor Yellow } else { Die "fatty/main has commits that $BattleShipBranch lacks (merge/rebase first)" } }
 & git -C $Hub merge-base --is-ancestor origin/main HEAD
-if ($LASTEXITCODE -ne 0) { if ($DryRun) { Write-Host "WARNING: origin/main has commits that RetroHub $RetroHubBranch lacks (a real run would stop here)" -ForegroundColor Yellow } else { Die "origin/main has commits that RetroHub $RetroHubBranch lacks (pull first)" } }
+if ($LASTEXITCODE -ne 0) { if ($DryRun) { Write-Host "WARNING: origin/main is not an ancestor of the RetroHub commit being released, $Hub HEAD (a real run would stop here)" -ForegroundColor Yellow } else { Die "origin/main of RetroHub is not an ancestor of the commit being released ($Hub HEAD): rebase/merge onto origin/main first" } }
 $targets = @(@{ repo = $HubRepo; latest = $true })
 if ($AlsoSmashClassic) { $targets += @{ repo = $BsRepo; latest = $false } }
 foreach ($t in $targets) {
@@ -238,6 +266,9 @@ foreach ($t in $targets) {
 if (-not $DryRun) {
     & git -C $Hub rev-parse -q --verify "refs/tags/$Tag" *> $null
     if ($LASTEXITCODE -eq 0) { Die "tag $Tag already exists in $Hub" }
+    $rt = (& git -C $Hub ls-remote --tags origin "refs/tags/$Tag" 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { Die "could not query tags on RetroHub origin: $rt" }
+    if ($rt) { Die "tag $Tag already exists on RetroHub origin" }
 }
 
 # ── 2. Bump VERSION in both repos ──
@@ -257,15 +288,20 @@ Step "Test gate: build + ctest -LE online (RETROHUB_QA=1)"
 $cmakeExe = Join-Path $CmakeBin "cmake.exe"; $ctestExe = Join-Path $CmakeBin "ctest.exe"
 if (-not (Test-Path -LiteralPath $cmakeExe)) { $cmakeExe = "cmake" }
 if (-not (Test-Path -LiteralPath $ctestExe)) { $ctestExe = "ctest" }
-$env:PATH = "$CmakeBin;C:\msys64\mingw64\bin;$env:PATH"
+foreach ($pd in @("C:\Program Files\Git\usr\bin", "C:\msys64\mingw64\bin", $CmakeBin)) { if (Test-Path -LiteralPath $pd) { $env:PATH = "$pd;$env:PATH" } }
 $env:RETROHUB_QA = "1"; $env:SSB64_MUTE = "1"; $env:RETRORUN_MUTE = "1"; $env:N64RUN_MUTE = "1"
+$env:RETROHUB_DIR = $Hub
+if (-not $env:_CL_) { $env:_CL_ = "/MP4" }
+try { (Get-Process -Id $PID).PriorityClass = "BelowNormal" } catch { Write-Host "could not lower priority: $_" -ForegroundColor Yellow }
 $HubBuild = Join-Path $Hub "build"
+Wait-Games "building"
 if (-not (Test-Path (Join-Path $HubBuild "CMakeCache.txt"))) {
     & $cmakeExe -S $Hub -B $HubBuild
     if ($LASTEXITCODE -ne 0) { Die "TEST GATE: cmake configure failed (exit $LASTEXITCODE); nothing was packaged or published" }
 }
-& $cmakeExe --build $HubBuild --config Release --parallel 4
+& $cmakeExe --build $HubBuild --config Release --parallel 2
 if ($LASTEXITCODE -ne 0) { Die "TEST GATE: build failed (exit $LASTEXITCODE); nothing was packaged or published" }
+Wait-Games "testing"
 & $ctestExe --test-dir $HubBuild -C Release -LE online --output-on-failure
 if ($LASTEXITCODE -ne 0) { Die "TEST GATE: ctest failed (exit $LASTEXITCODE); nothing was packaged or published" }
 [void]$script:done.Add("test gate passed")
@@ -273,6 +309,7 @@ if ($LASTEXITCODE -ne 0) { Die "TEST GATE: ctest failed (exit $LASTEXITCODE); no
 # ── 4. Package (fast path) and validate SHA256SUMS ──
 $Dist = if ($OutDir) { $OutDir } elseif ($DryRun) { Join-Path ([System.IO.Path]::GetTempPath()) "release-dryrun-$Tag" } else { Join-Path $Root "dist" }
 if (-not $SkipPackage) {
+    Wait-Games "packaging"
     Step "Packaging into $Dist"
     $pkgArgs = @{ OutDir = $Dist; RetroHubDir = $Hub }
     if ($ForceBattleShip) { $pkgArgs.ForceBattleShip = $true }
@@ -326,10 +363,10 @@ foreach ($t in $targets) {
 
 # ── 7. Push (fast-forward only, never force) ──
 Step "Pushing"
-Run "git -C $Hub push origin ${RetroHubBranch}:main" { & git -C $Hub push origin "${RetroHubBranch}:main" }
+Run "git -C $Hub push origin HEAD:main" { & git -C $Hub push origin "HEAD:main" }
 Run "git -C $Hub push origin $Tag" { & git -C $Hub push origin $Tag }
 if (-not $DryRun) {
-    [void]$script:done.Add("pushed RetroHub $RetroHubBranch and tag $Tag to origin")
+    [void]$script:done.Add("pushed RetroHub HEAD to main and tag $Tag to origin")
     [void]$script:undo.Insert(0, "git -C `"$Hub`" push origin :refs/tags/$Tag     # remove the pushed tag; main stays (revert the VERSION commit with git revert if you must)")
 }
 Run "git -C $Decomp push fatty HEAD:smash-classic" { & git -C $Decomp push fatty HEAD:smash-classic }
