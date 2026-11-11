@@ -16,7 +16,8 @@
 # Releases go to fatty8me2/retrohub ONLY (the updater reads that repo since v1.27.3). smash-classic only gets
 # Smash Classic's own releases, via -AlsoSmashClassic.
 #
-# Order (nothing public changes until the last step; every failure prints the exact state and the undo commands):
+# Order (the release stays a DRAFT until the last step, but steps 7-8 already make main, the tag and BattleShip public;
+# every failure prints the exact state, the undo commands and, once a draft is verified, the commands to finish by id):
 #   1. Preflight: version format, changelog entry, gh auth, branches clean and fast-forward, no existing release/draft.
 #   2. Bump BattleShip\VERSION and RetroHub\VERSION to vX.Y.Z.
 #   3. TEST GATE: build RetroHub, then `ctest -LE online` with RETROHUB_QA=1. Failure stops here (nothing packaged).
@@ -24,12 +25,15 @@
 #      assets, and match the files. Every file it names (plus SHA256SUMS.txt and its REQUIRED .sig, verified with openssl against the release public key) is uploaded.
 #   5. Commit VERSION in both repos, tag the RetroHub commit locally.
 #   6. Create the GitHub release as a DRAFT with all assets, then download every asset back and verify its SHA-256.
-#   7. Push RetroHub main + the tag, then decomp, then the BattleShip VERSION commit.
+#   7. Push RetroHub HEAD to main + the tag, then decomp, then the BattleShip VERSION commit (PUBLIC from here, release still draft).
 #   8. (-DeployWorker) deploy the Worker.
-#   9. Publish the draft (retrohub as --latest).
+#   9. Publish the draft (retrohub as --latest): the only step that makes the release itself public.
 #
-# -DryRun never commits, pushes, deploys or touches GitHub: those calls are simulated against a scratch folder (so the
-# download-back verification still runs). It restores both VERSION files afterwards.
+# -DryRun makes no commits, pushes, deploys or GitHub writes (those are simulated against a scratch folder, so the
+# download-back verification still runs), BUT it does: read GitHub (auth status, release list), `git fetch` both repos,
+# edit VERSION in both repos temporarily (restored afterwards), write a temp notes file, wait for games, REALLY build RetroHub
+# into <hub>\build and run ctest, and REALLY run package-windows.ps1 (including signing) into a scratch dir (or -OutDir).
+# With -DeployWorker it runs `npx wrangler deploy --dry-run`.
 # Test hooks: -CmakeBin <dir with cmake/ctest>, env RELEASE_DRYRUN_FAULT = "corrupt:<asset>" | "drop:<asset>" (dry run only).
 [CmdletBinding()]
 param(
@@ -69,7 +73,8 @@ $script:bumped = $false
 $script:committed = $false
 $script:done = New-Object System.Collections.ArrayList     # human-readable list of completed steps
 $script:undo = New-Object System.Collections.ArrayList      # commands that undo them (in the order to run)
-$script:remote = ""                                         # dry-run simulated GitHub store
+$script:finish = New-Object System.Collections.ArrayList    # commands that publish the verified draft(s) by id
+$script:remote = ""                                      # dry-run simulated GitHub store
 
 function Step($m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 $script:origVersion = @{}   # path -> original bytes (or $null if the file did not exist), saved before the bump
@@ -86,6 +91,10 @@ function Die($m) {
         Write-Host "`nState at failure (completed steps):" -ForegroundColor Yellow
         $script:done | ForEach-Object { Write-Host "   - $_" }
         Write-Host "Nothing is published as Latest unless the last line above says 'published'." -ForegroundColor Yellow
+    }
+    if ($script:finish.Count -gt 0) {
+        Write-Host "`nTo FINISH the release by hand instead (only once main/tag are pushed and the draft is verified):" -ForegroundColor Yellow
+        $script:finish | ForEach-Object { Write-Host "   $_" }
     }
     if ($script:undo.Count -gt 0) {
         Write-Host "`nTo undo (run in this order), or fix the problem and finish by hand:" -ForegroundColor Yellow
@@ -232,10 +241,11 @@ if ($NotesFile) {
 } else {
     # Throws (exit 1) when data\changelog.json has no entry for this version: write the changelog first.
     # The child prints UTF-8; decode it as UTF-8 here (the default OEM codepage garbled non-ASCII notes).
-    $prevEnc = [Console]::OutputEncoding
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    try { $text = (& powershell -NoProfile -ExecutionPolicy Bypass -File $NotesScript -Version $Bare) -join "`n" }
-    finally { [Console]::OutputEncoding = $prevEnc }
+    $prevEnc = $null
+    try {
+        try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { $prevEnc = $null }   # no console (non-console host): carry on
+        $text = (& powershell -NoProfile -ExecutionPolicy Bypass -File $NotesScript -Version $Bare) -join "`n"
+    } finally { if ($prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch {} } }
     if ($LASTEXITCODE -ne 0 -or -not $text) { Die "no changelog entry for $Bare in $Hub\data\changelog.json (add it and commit, or pass -Notes / -NotesFile)" }
 }
 [System.IO.File]::WriteAllText($NotesPath, $text.TrimEnd() + "`n", (New-Object System.Text.UTF8Encoding($false)))
@@ -314,7 +324,9 @@ if (-not $SkipPackage) {
     $pkgArgs = @{ OutDir = $Dist; RetroHubDir = $Hub }
     if ($ForceBattleShip) { $pkgArgs.ForceBattleShip = $true }
     if ($hubOnly) { $pkgArgs.HubOnlyRelease = $true; $pkgArgs.SmashSince = $SmashSince }
-    & (Join-Path $PSScriptRoot "package-windows.ps1") @pkgArgs
+    $global:LASTEXITCODE = 0
+    try { & (Join-Path $PSScriptRoot "package-windows.ps1") @pkgArgs }
+    catch { Die "package-windows.ps1 threw: $_" }
     if ($LASTEXITCODE -ne 0) { Die "package-windows.ps1 failed (exit $LASTEXITCODE)" }
 }
 foreach ($req in $RequiredAssets) { if (-not (Test-Path -LiteralPath (Join-Path $Dist $req))) { Die "missing required release asset $req in $Dist" } }
@@ -334,17 +346,19 @@ if ($DryRun) {
 } else {
     $pre = @{}
     foreach ($r in @($Root, $Hub)) { $pre[$r] = GitC $r rev-parse HEAD }
+    # Each undo entry is registered BEFORE the action it undoes (newest first = the order to run), so a failure
+    # part-way (e.g. the RetroHub commit failing after the BattleShip one) still prints the right undo.
     foreach ($r in @($Root, $Hub)) {
+        [void]$script:undo.Insert(0, "git -C `"$r`" reset --soft $($pre[$r])      # local VERSION commit")
         GitC $r add VERSION | Out-Null
         GitC $r commit -m $Tag -- VERSION | Out-Null
         $script:committed = $true
+        [void]$script:done.Add("committed VERSION locally in $r")
         Write-Host "$r -> $(GitC $r rev-parse --short HEAD)"
     }
+    [void]$script:undo.Insert(0, "git -C `"$Hub`" tag -d $Tag")
     GitC $Hub tag $Tag | Out-Null
-    [void]$script:done.Add("committed VERSION in BattleShip and RetroHub, tagged RetroHub $Tag (all local)")
-    [void]$script:undo.Add("git -C `"$Hub`" tag -d $Tag")
-    [void]$script:undo.Add("git -C `"$Hub`" reset --soft $($pre[$Hub])      # local VERSION commit")
-    [void]$script:undo.Add("git -C `"$Root`" reset --soft $($pre[$Root])    # local VERSION commit")
+    [void]$script:done.Add("tagged RetroHub $Tag (local)")
 }
 
 # ── 6. Draft release(s) with all assets, then download every asset back and verify ──
@@ -352,26 +366,39 @@ Step "Creating DRAFT release(s) and verifying the uploaded assets"
 $drafts = @()
 foreach ($t in $targets) {
     $repo = $t.repo
-    [void]$script:undo.Insert(0, "gh release delete $Tag -R $repo --yes     # removes the draft (or run: gh api -X DELETE repos/$repo/releases/<id>)")
     $id = New-DraftRelease $repo $assets
-    if (-not $id) { Die "creating the draft release on $repo failed (a partial draft may exist; see the undo list)" }
+    if (-not $id) { Die "creating the draft release on $repo failed or its id could not be found; a partial draft may exist. Find it with: gh api `"repos/$repo/releases?per_page=20`" --jq '.[] | [.id, .tag_name, .draft] | @tsv'   then delete it by id (drafts are not reachable by tag): gh api -X DELETE repos/$repo/releases/<id>" }
+    if (-not $DryRun) {
+        [void]$script:undo.Insert(0, "gh api -X DELETE repos/$repo/releases/$id     # removes the draft (drafts are not reachable by tag)")
+    }
     [void]$script:done.Add("draft release $Tag created on $repo with $($assets.Count) assets (id $id)")
     try { Confirm-Remote $repo $id $expected } catch { Die "verification of the uploaded assets failed: $_ . The draft on $repo is NOT published." }
     [void]$script:done.Add("downloaded every asset back from $repo and verified its SHA-256")
     $drafts += @{ repo = $repo; id = $id; latest = $t.latest }
+    if (-not $DryRun) { [void]$script:finish.Add("gh api -X PATCH repos/$repo/releases/$id -F draft=false -f make_latest=$(if ($t.latest) { 'true' } else { 'false' })") }   # only a verified draft may be finished by hand
 }
 
 # ── 7. Push (fast-forward only, never force) ──
 Step "Pushing"
+# From here on things ARE public (main, the tag, the BattleShip commit), although the release itself is still a draft.
+# Every failure below prints the exact commands to finish (publish the drafts by id) and to back out.
 Run "git -C $Hub push origin HEAD:main" { & git -C $Hub push origin "HEAD:main" }
+if (-not $DryRun) {
+    [void]$script:done.Add("pushed RetroHub HEAD to main on origin (PUBLIC; the release is still a draft)")
+    [void]$script:undo.Insert(0, "git -C `"$Hub`" revert --no-edit $(GitC $Hub rev-parse HEAD) ; git -C `"$Hub`" push origin HEAD:main     # ONLY if main must be rolled back (never force-push)")
+}
 Run "git -C $Hub push origin $Tag" { & git -C $Hub push origin $Tag }
 if (-not $DryRun) {
-    [void]$script:done.Add("pushed RetroHub HEAD to main and tag $Tag to origin")
-    [void]$script:undo.Insert(0, "git -C `"$Hub`" push origin :refs/tags/$Tag     # remove the pushed tag; main stays (revert the VERSION commit with git revert if you must)")
+    [void]$script:done.Add("pushed tag $Tag to RetroHub origin")
+    [void]$script:undo.Insert(0, "git -C `"$Hub`" push origin :refs/tags/$Tag     # remove the pushed tag")
 }
 Run "git -C $Decomp push fatty HEAD:smash-classic" { & git -C $Decomp push fatty HEAD:smash-classic }
+if (-not $DryRun) { [void]$script:done.Add("pushed decomp HEAD to fatty smash-classic (no VERSION change there; nothing to undo)") }
 Run "git -C $Root push fatty ${BattleShipBranch}:main" { & git -C $Root push fatty "${BattleShipBranch}:main" }
-if (-not $DryRun) { [void]$script:done.Add("pushed decomp and BattleShip $BattleShipBranch to fatty main") }
+if (-not $DryRun) {
+    [void]$script:done.Add("pushed BattleShip $BattleShipBranch to fatty main (PUBLIC)")
+    [void]$script:undo.Insert(0, "git -C `"$Root`" revert --no-edit $(GitC $Root rev-parse HEAD) ; git -C `"$Root`" push fatty ${BattleShipBranch}:main     # ONLY if BattleShip main must be rolled back (never force-push)")
+}
 
 # ── 8. Worker ──
 if ($DeployWorker) {
@@ -379,7 +406,7 @@ if ($DeployWorker) {
     Push-Location (Join-Path $Root "server\cloudflare")
     try {
         if ($DryRun) { & npx wrangler deploy --dry-run; if ($LASTEXITCODE -ne 0) { Write-Host "wrangler dry-run failed" -ForegroundColor Yellow } }
-        else { & npx wrangler deploy; if ($LASTEXITCODE -ne 0) { Die "wrangler deploy failed (the release is still a DRAFT; fix and publish with: gh api -X PATCH repos/$HubRepo/releases/<id> -F draft=false -f make_latest=true)" } }
+        else { & npx wrangler deploy; if ($LASTEXITCODE -ne 0) { Die "wrangler deploy failed. main, the tag and the BattleShip commit are already pushed; the release is still a DRAFT. Fix the Worker (run 'npx wrangler deploy' in $Root\server\cloudflare) and then run the finish commands below, or back out with the undo commands" } }
     } finally { Pop-Location }
 }
 
@@ -387,7 +414,7 @@ if ($DeployWorker) {
 Step "Publishing"
 foreach ($d in $drafts) {
     Publish-Release $d.repo $d.id $d.latest
-    if (-not $DryRun) { [void]$script:done.Add("published $Tag on $($d.repo)"); $script:undo.Clear() }
+    if (-not $DryRun) { [void]$script:done.Add("published $Tag on $($d.repo)"); $script:undo.Clear(); $script:finish.Clear() }
 }
 
 if ($DryRun) {
